@@ -1,0 +1,250 @@
+"""FastMCP server exposing read-only ElastiCache operations tools."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+from functools import lru_cache
+from typing import Annotated, Literal
+
+from fastmcp import FastMCP
+from mcp.types import ToolAnnotations
+from pydantic import Field
+
+from . import dataplane, memcached
+from .config import ControlPlaneConfig, DataPlaneConfig, MemcachedConfig
+from .controlplane import ControlPlane
+from .safe_client import SafeRedis
+
+log = logging.getLogger("mcp_elasticache_ops")
+
+INSTRUCTIONS = """\
+Read-only operations and monitoring for Amazon ElastiCache (Redis OSS, Valkey,
+Memcached) and self-hosted Redis/Valkey. Data-plane tools (prefix `node_`) talk
+to one endpoint over RESP; control-plane tools (prefix `aws_`) use the
+ElastiCache/CloudWatch APIs and are optional. Start with `node_health` and
+`aws_replication_groups`, then drill down. No tool writes, flushes or reads values.
+"""
+
+READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True)
+
+mcp = FastMCP("mcp-elasticache-ops", instructions=INSTRUCTIONS)
+
+
+@lru_cache(maxsize=1)
+def redis_client() -> SafeRedis:
+    cfg = DataPlaneConfig.from_env()
+    kwargs = dict(
+        host=cfg.host,
+        port=cfg.port,
+        db=cfg.db,
+        username=cfg.username,
+        password=cfg.password,
+        socket_timeout=cfg.socket_timeout,
+        socket_connect_timeout=cfg.socket_timeout,
+        decode_responses=True,
+        encoding_errors="backslashreplace",
+        client_name="mcp-elasticache-ops",
+    )
+    if cfg.tls:
+        kwargs.update(ssl=True, ssl_cert_reqs="required" if cfg.tls_verify else "none")
+    return SafeRedis(**kwargs)
+
+
+@lru_cache(maxsize=1)
+def control_plane() -> ControlPlane:
+    return ControlPlane(ControlPlaneConfig.from_env())
+
+
+def _memcached_target() -> MemcachedConfig:
+    cfg = MemcachedConfig.from_env()
+    if not cfg.host:
+        raise ValueError("MEMCACHED_HOST is not set")
+    return cfg
+
+
+# ------------------------------------------------------------------ data plane
+
+
+@mcp.tool(annotations=READ_ONLY)
+def node_health() -> dict:
+    """One-shot health summary of the configured Redis/Valkey endpoint: engine and
+    version, role, clients, hit ratio, memory vs maxmemory, fragmentation,
+    evictions and a list of findings."""
+    return dataplane.health_summary(redis_client())
+
+
+@mcp.tool(annotations=READ_ONLY)
+def node_info(
+    section: Annotated[
+        str | None,
+        Field(
+            description="INFO section: server, clients, memory, persistence, stats, replication, cpu, commandstats, errorstats, cluster, keyspace. Omit for default."
+        ),
+    ] = None,
+) -> dict:
+    """Raw INFO output, optionally for a single section."""
+    return dataplane.server_info(redis_client(), section)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def node_memory() -> dict:
+    """Memory breakdown: used/RSS/peak/dataset/overhead, maxmemory and policy,
+    fragmentation ratio with a verdict, evictions, MEMORY STATS and MEMORY DOCTOR
+    when the engine allows them."""
+    return dataplane.memory_report(redis_client())
+
+
+@mcp.tool(annotations=READ_ONLY)
+def node_slowlog(
+    count: Annotated[int, Field(ge=1, le=1024, description="Entries to fetch")] = 25,
+    include_args: Annotated[bool, Field(description="Return full command arguments (may expose values)")] = False,
+) -> dict:
+    """SLOWLOG entries plus per-command totals. Arguments beyond the key are hidden
+    unless include_args is true."""
+    return dataplane.slowlog(redis_client(), count, include_args)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def node_clients(top: Annotated[int, Field(ge=1, le=500)] = 20) -> dict:
+    """CLIENT LIST aggregated by source IP, client name, ACL user and last command,
+    idle-time stats and the clients holding the most buffer memory."""
+    return dataplane.client_list(redis_client(), top)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def node_latency(ping_samples: Annotated[int, Field(ge=1, le=500)] = 20) -> dict:
+    """Client-side PING RTT percentiles plus LATENCY LATEST events from the server
+    latency monitor (needs latency-monitor-threshold > 0)."""
+    return dataplane.latency(redis_client(), ping_samples)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def node_commandstats(top: Annotated[int, Field(ge=1, le=500)] = 20) -> dict:
+    """Commands ranked by total CPU time (INFO commandstats), with calls, usec per
+    call, rejected and failed calls."""
+    return dataplane.commandstats(redis_client(), top)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def node_keyspace_sample(
+    sample_size: Annotated[int, Field(ge=1, le=100_000, description="Max keys to inspect")] = 1000,
+    match: Annotated[str | None, Field(description="SCAN MATCH glob, e.g. 'session:*'")] = None,
+    top: Annotated[int, Field(ge=1, le=500)] = 20,
+    scan_count: Annotated[int, Field(ge=10, le=5000, description="SCAN COUNT hint")] = 250,
+    pause_ms: Annotated[int, Field(ge=0, le=1000, description="Sleep between SCAN batches")] = 0,
+) -> dict:
+    """Big keys (bytes and element count), hot keys (LFU policies) or coldest keys,
+    type distribution and TTL coverage from a bounded SCAN. Metadata only; values
+    are never read. On cluster-mode-enabled groups this samples the connected node only."""
+    return dataplane.keyspace_sample(redis_client(), sample_size, match, top, scan_count, pause_ms)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def node_replication() -> dict:
+    """Replication role, replicas with byte lag, link status and backlog size."""
+    return dataplane.replication(redis_client())
+
+
+@mcp.tool(annotations=READ_ONLY)
+def node_cluster() -> dict:
+    """Cluster-mode view: CLUSTER INFO, slots per primary and CLUSTER SHARDS when
+    available. Reports cluster mode disabled otherwise."""
+    return dataplane.cluster(redis_client())
+
+
+@mcp.tool(annotations=READ_ONLY)
+def memcached_stats(
+    group: Annotated[
+        Literal["", "settings", "slabs", "items", "conns"], Field(description="stats group; empty for general")
+    ] = "",
+) -> dict:
+    """Memcached summary (hit ratio, memory, evictions, connections) or a raw
+    `stats <group>` output. Uses MEMCACHED_HOST/MEMCACHED_PORT."""
+    cfg = _memcached_target()
+    if group:
+        return {"group": group, "stats": memcached.stats(cfg.host, cfg.port, group, cfg.timeout)}
+    return memcached.summary(cfg.host, cfg.port, cfg.timeout)
+
+
+# --------------------------------------------------------------- control plane
+
+
+@mcp.tool(annotations=READ_ONLY)
+def aws_replication_groups(replication_group_id: str | None = None) -> dict:
+    """DescribeReplicationGroups: status, engine, cluster mode, node type, Multi-AZ,
+    failover, encryption, shards with primary/reader endpoints and member roles."""
+    return control_plane().replication_groups(replication_group_id)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def aws_cache_clusters(cache_cluster_id: str | None = None, show_nodes: bool = True) -> dict:
+    """DescribeCacheClusters: per-node-cluster engine version, node type, parameter
+    group and apply status, maintenance window, pending changes and node endpoints."""
+    return control_plane().cache_clusters(cache_cluster_id, show_nodes)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def aws_serverless_caches() -> dict:
+    """DescribeServerlessCaches for ElastiCache Serverless (Valkey/Redis OSS/Memcached)."""
+    return control_plane().serverless_caches()
+
+
+@mcp.tool(annotations=READ_ONLY)
+def aws_events(
+    source_identifier: str | None = None,
+    source_type: Annotated[
+        str | None,
+        Field(
+            description="cache-cluster, cache-parameter-group, cache-security-group, cache-subnet-group, replication-group, serverless-cache, user, user-group"
+        ),
+    ] = None,
+    hours: Annotated[int, Field(ge=1, le=336)] = 24,
+) -> dict:
+    """DescribeEvents: failovers, node replacements, maintenance, snapshots."""
+    return control_plane().events(source_identifier, source_type, hours)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def aws_parameters(parameter_group: str, only_modified: bool = True) -> dict:
+    """DescribeCacheParameters for a parameter group; by default only values changed
+    from the engine defaults (Source=user)."""
+    return control_plane().parameters(parameter_group, only_modified)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def aws_metrics(
+    cache_cluster_id: Annotated[
+        str, Field(description="CacheClusterId (node cluster, e.g. 'my-rg-0001-001') or serverless cache name")
+    ],
+    metrics: Annotated[list[str] | None, Field(description="CloudWatch metric names; default set if omitted")] = None,
+    minutes: Annotated[int, Field(ge=1, le=20160)] = 60,
+    period_seconds: Annotated[int, Field(ge=60, le=86400)] = 60,
+    node_id: str | None = None,
+    serverless: bool = False,
+) -> dict:
+    """CloudWatch AWS/ElastiCache metrics (EngineCPUUtilization, memory %, Evictions,
+    CurrConnections, CacheHitRate, ReplicationLag, ...) with latest/max/avg summary."""
+    return control_plane().metrics(cache_cluster_id, metrics, minutes, period_seconds, node_id, serverless)
+
+
+# ------------------------------------------------------------------------ main
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(prog="mcp-elasticache-ops", description=INSTRUCTIONS)
+    parser.add_argument("--transport", choices=["stdio", "http"], default=os.getenv("MCP_TRANSPORT", "stdio"))
+    parser.add_argument("--host", default=os.getenv("MCP_HOST", "127.0.0.1"), help="bind address for http")
+    parser.add_argument("--port", type=int, default=int(os.getenv("MCP_PORT", "8000")), help="port for http")
+    parser.add_argument("--log-level", default=os.getenv("MCP_LOG_LEVEL", "INFO"))
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=args.log_level.upper())
+    if args.transport == "http":
+        mcp.run(transport="http", host=args.host, port=args.port, show_banner=False)
+    else:
+        mcp.run(transport="stdio", show_banner=False)
+
+
+if __name__ == "__main__":
+    main()

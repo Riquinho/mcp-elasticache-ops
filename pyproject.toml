@@ -1,0 +1,50 @@
+[project]
+name = "mcp-elasticache-ops"
+version = "0.1.0"
+description = "Read-only MCP server for Amazon ElastiCache (Redis OSS, Valkey, Memcached) operations and monitoring"
+readme = "README.md"
+license = "MIT"
+keywords = ["mcp", "elasticache", "redis", "valkey", "memcached", "sre", "dbre"]
+authors = [
+    { name = "João Rito", email = "16895040+ritojoao@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "boto3>=1.44.1",
+    "fastmcp>=4.1.8",
+    "redis>=8.1.0",
+]
+
+[project.scripts]
+mcp-elasticache-ops = "mcp_elasticache_ops.server:main"
+
+[build-system]
+requires = ["uv_build>=0.11.21,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "moto[cloudwatch]>=5.2.5",
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1.post1",
+    "ruff>=0.17.4",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = [
+    "integration: needs a live Redis/Valkey (REDIS_TEST_URL) or Memcached (MEMCACHED_TEST_HOST)",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM"]
+ignore = ["C408"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/mcp_elasticache_ops/server.py" = ["E501"]
