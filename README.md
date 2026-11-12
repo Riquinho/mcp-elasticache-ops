@@ -10,7 +10,7 @@ written from scratch for ElastiCache.
 
 ## Tools
 
-All 49 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
+All 51 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 
 **Data plane** (redis-py, talks to the node endpoint)
 
@@ -27,6 +27,7 @@ All 49 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `node_slowlog` | `SLOWLOG GET` with per-command totals; arguments beyond the key are hidden |
 | `node_clients` | `CLIENT LIST` aggregated by IP, name, user and last command; idle and buffer outliers |
 | `node_latency` | Client-side PING RTT percentiles + `LATENCY LATEST` |
+| `node_latency_events` | `LATENCY LATEST` plus `LATENCY HISTORY` for the top 3 events (bounded samples), trimmed `LATENCY DOCTOR` / `MEMORY DOCTOR` text. Findings: fork or aof-fsync events over 100 ms, an expire-cycle spike, and an actionable finding when `latency-monitor-threshold` is 0 and nothing is recorded |
 | `node_commandstats` | Commands ranked by total CPU time (`INFO commandstats`) |
 | `node_keyspace_sample` | Bounded `SCAN` sample: big keys by bytes and by element count, hot keys (LFU) or coldest keys, TTL coverage, `ttl_histogram` (no TTL, < 1m, < 1h, < 1d, >= 1d; overall, per prefix and per type, from the same sample so no extra round trips) with `keyspace_hit_rate` from the one `INFO` reply, and `prefixes` (keys grouped by normalised prefix such as `user:*:cart`, with estimated bytes scaled to dbsize, % without TTL; large no-TTL prefixes are flagged under `noeviction` or memory pressure; `top_prefixes`, default 10, max 50). Stops at `max_seconds` (default 10, hard cap 60) and returns `partial=true` |
 | `node_replication` | Role, replicas with byte lag, link status, backlog; findings for lagging or link-down replicas, offset gap vs the primary, `replica-read-only`, `min-replicas-to-write`, `cluster-allow-reads-when-down`. Engine-version quirks (no `CLUSTER SHARDS` before 7.0, ...) come back as `notes`, not errors |
@@ -49,7 +50,8 @@ All 49 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `aws_cache_clusters` | `DescribeCacheClusters`: engine version, parameter group apply status, nodes |
 | `aws_serverless_caches` | `DescribeServerlessCaches` |
 | `aws_events` | `DescribeEvents`, findings-first: failover/failure events are critical, replacement/reboot/maintenance warning, the rest info. Newest first, grouped by severity and source; `source_type` is validated before any call; at most 100 raw events (`truncated` says when more exist) |
-| `aws_parameters` | `DescribeCacheParameters` (user-modified by default) |
+| `aws_parameters` | `DescribeCacheParameters` (user-modified by default). `diff_engine_defaults=true` adds `DescribeEngineDefaultParameters` and lists only non-default values with their default. Findings flag risky settings: `maxmemory-policy noeviction`, tiny `client-output-buffer-limit-*`, `timeout 0`, lowered `maxmemory-samples` |
+| `aws_shard_balance` | Per-shard skew from CloudWatch only (one `GetMetricData` call per node-group member; no data-plane connection): EngineCPUUtilization, DatabaseMemoryUsagePercentage, NetworkBytesIn/Out, CurrItems. Findings first: hot shard (over 2x the median and above 50% CPU), memory skew, one primary pinned near 100% CPU while the others idle (hot-key signature) |
 | `aws_metrics` | CloudWatch `AWS/ElastiCache` metrics: findings first, then min/avg/max/latest; series only with `include_series`; `replication_group_id` queries every member node |
 | `aws_snapshots` | `DescribeSnapshots`: retention gaps, failed and missing automatic backups, old manual snapshots |
 | `aws_serverless_snapshots` | `DescribeServerlessCacheSnapshots` + `DescribeServerlessCaches`: caches with no available snapshot in `stale_hours` (default 24), failed snapshots, newest snapshot about to expire, snapshots without a customer KMS key, unset per-cache retention; a failing cache listing degrades to `partial` |
@@ -60,8 +62,8 @@ All 49 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `aws_reserved_offerings` | `DescribeReservedCacheNodesOfferings` for a `node_type` and `engine` (opt-in, capped at 20): 1y/3y offerings, uncovered running nodes and the cheapest offering per term (upfront + hourly). Never purchases |
 | `aws_service_updates` | `DescribeServiceUpdates`: pending updates, past or near apply-by dates |
 | `aws_subnet_groups` | `DescribeCacheSubnetGroups`: AZ spread (Multi-AZ needs 2+) |
-| `aws_triage` | One call per replication group: status/Multi-AZ/failover, last 6h events, CloudWatch peaks per member (EngineCPU, memory %, Evictions, ReplicationLag, CurrConnections), pending service updates, newest snapshot. Worst-first findings (max 30); a failing section is reported `unavailable` |
-| `aws_serverless_triage` | One call per serverless cache: status and usage limits, snapshot health, 6h `ThrottledCmds`, ECPU and storage against the limits. Worst-first findings (max 30); a failing section (for example `AccessDenied`) is reported `unavailable`. Describe/GetMetricData calls only |
+| `aws_triage` | One call per replication group: status/Multi-AZ/failover, last 6h events, CloudWatch peaks per member (EngineCPU, memory %, Evictions, ReplicationLag, CurrConnections), pending service updates, newest snapshot. Worst-first findings (max 30); a failing section is reported `unavailable`. Adds a `recent failover/maintenance` finding: 24h of `Failover complete`, `Replication group primary changed` and `Cache cluster node replaced` events (one extra `DescribeEvents` call) with time deltas against ReplicationLag and CurrConnections drops |
+| `aws_serverless_triage` | One call per serverless cache: status and usage limits, snapshot health, 6h `ThrottledCmds`, ECPU and storage against the limits. Worst-first findings (max 30); a failing section (for example `AccessDenied`) is reported `unavailable`. Describe/GetMetricData calls only. Adds a `recent failover/maintenance` finding (24h of `Failover complete`, `Replication group primary changed`, `Cache cluster node replaced` events with time deltas against ReplicationLag and CurrConnections drops) and limit findings that state the limit, the observed p95 and a numeric recommendation (near limit, tight p95, over-provisioned, minimum set but unused, throttling below the cap) |
 | `aws_cluster_overview` | One findings-first call per replication group: shards, replicas per shard, AZ spread, failover, engine version joined with per-node CloudWatch (EngineCPU, memory %, ReplicationLag, Evictions, CurrConnections, NewConnections). Flags nodes above 1.5x the peer median, reader endpoint gaps and right-sizing (memory p95 < 30% and CPU p95 < 20%; data tiering for r6gd). Worst-first, bounded; `GetMetricData` denied gives `status: partial` |
 | `aws_alarms` | `DescribeAlarms` (AWS/ElastiCache, paginated, optional `replication_group_id`): alarms in ALARM, INSUFFICIENT_DATA or with actions disabled, and members with no alarm on EngineCPUUtilization, DatabaseMemoryUsagePercentage, Evictions, ReplicationLag, CurrConnections, SwapUsage (plus ThrottledCmds on Serverless). Denied `DescribeAlarms` gives `partial: true`. Without `replication_group_id` it fans out over every configured region with per-region error isolation (`region_errors`) and a shared deadline |
 | `aws_maintenance` | `DescribeUpdateActions`, `DescribeServiceUpdates` and `DescribeCacheClusters` (read-only, optional `replication_group_id`): pending service-update actions grouped per update, required updates past their apply-by date (critical), a `PreferredMaintenanceWindow` that overlaps the `SnapshotWindow` of the same node, and end-of-life engines (Redis OSS <= 6.x, Memcached < 1.6). A denied call gives `partial: true`. Without a group id it fans out over every configured region with per-region error isolation (`region_errors`) |
@@ -213,6 +215,7 @@ Generated from `safe_client.py`; the tests fail if this drifts from the code.
         "elasticache:DescribeServerlessCaches",
         "elasticache:DescribeEvents",
         "elasticache:DescribeCacheParameters",
+        "elasticache:DescribeEngineDefaultParameters",
         "elasticache:DescribeCacheParameterGroups",
         "elasticache:DescribeCacheEngineVersions",
         "elasticache:DescribeSnapshots",

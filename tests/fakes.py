@@ -237,7 +237,11 @@ class AwsAudit:
 
 def _audit_reply(args: tuple) -> Any:
     name = str(args[0]).upper()
-    key = f"{name} {args[1]}".upper() if len(args) > 1 and name in {"CONFIG", "CLIENT", "SLOWLOG", "ACL"} else name
+    key = (
+        f"{name} {args[1]}".upper()
+        if len(args) > 1 and name in {"CONFIG", "CLIENT", "SLOWLOG", "ACL", "LATENCY"}
+        else name
+    )
     if name == "INFO":
         return {
             "redis_version": "7.1.0",
@@ -271,6 +275,8 @@ def _audit_reply(args: tuple) -> Any:
         "CLIENT LIST": [],
         "ACL LOG": [],
         "LATENCY LATEST": [],
+        "LATENCY HISTORY": [],
+        "LATENCY DOCTOR": "Dave, no latency spikes.",
         "CONFIG GET": {},
         "CLUSTER INFO": {"cluster_state": "ok"},
         "CLUSTER NODES": {},

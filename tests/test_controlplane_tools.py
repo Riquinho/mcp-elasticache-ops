@@ -1629,7 +1629,7 @@ def _sl_cache(name="sc", **over):
     return {**_scache(name), "Status": "available", "Engine": "valkey", "UserGroupId": "ug", **over}
 
 
-def _sl_plane(cache_resp, snaps=None, metrics=None):
+def _sl_plane(cache_resp, snaps=None, metrics=None, events=None):
     """Plane whose elasticache/cloudwatch clients return canned data or raise the given ClientError."""
     calls = {"ec": [], "cw": []}
 
@@ -1645,6 +1645,10 @@ def _sl_plane(cache_resp, snaps=None, metrics=None):
             if isinstance(snaps, Exception):
                 raise snaps
             return snaps if snaps is not None else {"ServerlessCacheSnapshots": []}
+
+        def describe_events(self, **kw):
+            calls["ec"].append(("describe_events", kw))
+            return {"Events": events or []}
 
     class CW:
         def get_metric_data(self, **kw):
@@ -2052,3 +2056,221 @@ async def test_security_audit_tool_is_read_only_and_capped():
     tools = {t.name: t for t in await server.mcp.list_tools()}
     assert tools["aws_security_audit"].annotations.read_only_hint is True
     assert getattr(tools["aws_security_audit"].fn, "__capped__", False)
+
+
+# ------------------------------------------------------------- round 14: shard balance
+
+
+class _CountingCW(_Recorder):
+    def __init__(self, values=None, error=None):
+        super().__init__(values=values)
+        self.metric_calls = 0
+        self.error = error
+
+    def get_metric_data(self, **kwargs):
+        self.metric_calls += 1
+        if self.error:
+            raise self.error
+        self.queries.extend(kwargs["MetricDataQueries"])
+        return {
+            "MetricDataResults": [
+                _result(q["Label"], _pts(*self.values[q["Label"]]))
+                for q in kwargs["MetricDataQueries"]
+                if q["Label"] in self.values
+            ]
+        }
+
+
+def _sharded_rg(n):
+    groups = [
+        {
+            "NodeGroupId": f"000{i}",
+            "NodeGroupMembers": [
+                {"CacheClusterId": f"rg1-000{i}-001", "CurrentRole": "primary"},
+                {"CacheClusterId": f"rg1-000{i}-002", "CurrentRole": "replica"},
+            ],
+        }
+        for i in range(1, n + 1)
+    ]
+    return {"ReplicationGroupId": "rg1", "Status": "available", "NodeGroups": groups}
+
+
+def _shard_plane(n, per_shard, rg_error=None, cw_error=None):
+    """per_shard: {shard index: {metric: [values]}} applied to that shard primary."""
+    values = {}
+    for i, metrics in per_shard.items():
+        for metric, vals in metrics.items():
+            values[f"rg1-000{i}-001|{metric}"] = vals
+    cw = _CountingCW(values, error=cw_error)
+    ec = _Recorder({"describe_replication_groups": {"ReplicationGroups": [_sharded_rg(n)]}})
+    if rg_error:
+
+        class Boom:
+            def describe_replication_groups(self, **kw):
+                raise rg_error
+
+        ec = Boom()
+
+    class Session:
+        def client(self, service, region_name=None, config=None):
+            return {"elasticache": ec, "cloudwatch": cw}[service]
+
+    return ControlPlane(ControlPlaneConfig(region=REGION), session_factory=Session, clock=lambda: NOW), cw
+
+
+def test_shard_balance_skewed_pinned_primary_is_the_hot_key_signature():
+    idle = {"EngineCPUUtilization": [8.0, 9.0], "DatabaseMemoryUsagePercentage": [40.0, 41.0]}
+    cp, cw = _shard_plane(
+        3,
+        {
+            1: {"EngineCPUUtilization": [100.0, 99.0, 100.0], "DatabaseMemoryUsagePercentage": [41.0, 40.0]},
+            2: idle,
+            3: idle,
+        },
+    )
+    out = cp.shard_balance("rg1", 60)
+    assert cw.metric_calls == 6  # one GetMetricData call per node-group member
+    assert out["shards_total"] == 3 and out["shards"][0]["shard"] == "0001"
+    first = out["findings"][0]
+    assert first["severity"] == "critical" and first["category"] == "hot-key"
+    assert "rg1-0001-001" in first["message"] and "pinned" in first["message"]
+    assert out["overall"] == "critical"
+    assert not any(f.get("category") == "hot-shard" for f in out["findings"])
+
+
+def test_shard_balance_skewed_hot_shard_and_memory_skew():
+    cp, _ = _shard_plane(
+        4,
+        {
+            1: {"EngineCPUUtilization": [70.0, 72.0], "DatabaseMemoryUsagePercentage": [85.0, 86.0]},
+            2: {"EngineCPUUtilization": [30.0, 30.0], "DatabaseMemoryUsagePercentage": [40.0, 40.0]},
+            3: {"EngineCPUUtilization": [28.0, 30.0], "DatabaseMemoryUsagePercentage": [41.0, 40.0]},
+            4: {"EngineCPUUtilization": [32.0, 30.0], "DatabaseMemoryUsagePercentage": [39.0, 40.0]},
+        },
+    )
+    out = cp.shard_balance("rg1")
+    cats = {f.get("category") for f in out["findings"]}
+    assert {"hot-shard", "memory-skew"} <= cats
+    hot = next(f for f in out["findings"] if f.get("category") == "hot-shard")
+    assert hot["severity"] == "warning" and "shard 0001" in hot["message"] and "median" in hot["message"]
+
+
+def test_shard_balance_balanced_group_has_no_findings():
+    same = {"EngineCPUUtilization": [30.0, 31.0], "DatabaseMemoryUsagePercentage": [50.0, 51.0], "CurrItems": [1000.0]}
+    cp, _ = _shard_plane(3, {1: same, 2: same, 3: same})
+    out = cp.shard_balance("rg1")
+    assert out["findings"] == [] and out["overall"] == "ok" and out["status"] == "ok"
+
+
+def test_shard_balance_single_shard_says_skew_cannot_be_assessed():
+    cp, cw = _shard_plane(1, {1: {"EngineCPUUtilization": [95.0, 96.0]}})
+    out = cp.shard_balance("rg1")
+    assert cw.metric_calls == 2
+    assert len(out["findings"]) == 1 and "single-shard" in out["findings"][0]["message"]
+    assert out["findings"][0]["severity"] == "info"
+
+
+def test_shard_balance_access_denied_on_describe_is_an_error_dict():
+    cp, _ = _shard_plane(2, {}, rg_error=_denied("DescribeReplicationGroups"))
+    assert cp.shard_balance("rg1")["error"] == "AccessDenied"
+
+
+def test_shard_balance_access_denied_on_metrics_keeps_the_layout_as_partial():
+    cp, _ = _shard_plane(2, {}, cw_error=_denied("GetMetricData"))
+    out = cp.shard_balance("rg1")
+    assert out["status"] == "partial" and out["shards_total"] == 2
+    assert any("GetMetricData failed (AccessDenied)" in f["message"] for f in out["findings"])
+
+
+def test_shard_balance_unknown_group_and_bad_window():
+    ec = _Recorder({"describe_replication_groups": {"ReplicationGroups": []}})
+
+    class Session:
+        def client(self, service, region_name=None, config=None):
+            return {"elasticache": ec, "cloudwatch": _CountingCW()}[service]
+
+    cp = ControlPlane(ControlPlaneConfig(region=REGION), session_factory=Session, clock=lambda: NOW)
+    assert cp.shard_balance("ghost")["error"] == "NotFound"
+    assert cp.shard_balance("rg1", 0)["error"] == "InvalidArgument"
+
+
+# ------------------------------------------------------------- round 14: serverless limits
+
+
+def _limits_run(limits, values):
+    cp, _ = _sl_plane(
+        {"ServerlessCaches": [_sl_cache(CacheUsageLimits=limits)]},
+        {"ServerlessCacheSnapshots": [_ssnap("s1", "sc", 3, expires_in=100)]},
+        values,
+    )
+    return cp.serverless_triage("sc")
+
+
+def _limit_findings(out):
+    return [f for f in out["findings"] if f.get("category") == "serverless-limits"]
+
+
+def test_serverless_limits_near_limit_states_limit_p95_and_recommendation():
+    limits = {"DataStorage": {"Maximum": 1, "Unit": "GB"}, "ECPUPerSecond": {"Maximum": 1000}}
+    out = _limits_run(
+        limits,
+        {
+            "sc|BytesUsedForCache": [1024.0**3 * 0.95] * 4,
+            "sc|ElastiCacheProcessingUnits": [300.0 * 900, 300.0 * 880, 300.0 * 850, 300.0 * 400],
+        },
+    )
+    found = {("storage" if "DataStorage" in f["message"] else "ecpu"): f for f in _limit_findings(out)}
+    ecpu = found["ecpu"]
+    assert "peaked at 90% of the ECPUPerSecond maximum (1000)" in ecpu["message"]
+    assert "Observed p95" in ecpu["message"]
+    # peak 900 ECPU/s / 0.6 = 1500, rounded up to the 1000 step
+    assert ecpu["recommendation"]["ecpu_per_second_max"] == 2000 and ecpu["severity"] == "warning"
+    storage = found["storage"]
+    assert storage["severity"] == "critical" and storage["recommendation"]["unit"] == "GB"
+    assert storage["recommendation"]["data_storage_max"] == 2
+    assert "Observed p95" in storage["message"]
+
+
+def test_serverless_limits_tight_p95_recommends_more_headroom():
+    out = _limits_run(
+        {"ECPUPerSecond": {"Maximum": 1000}},
+        {"sc|ElastiCacheProcessingUnits": [300.0 * 700] * 6},
+    )
+    (f,) = _limit_findings(out)
+    assert "tight" in f["message"] and "p95 700" in f["message"] and f["severity"] == "warning"
+    assert f["recommendation"]["ecpu_per_second_max"] == 2000
+
+
+def test_serverless_limits_over_provisioned_and_unused_minimum():
+    out = _limits_run(
+        {"ECPUPerSecond": {"Minimum": 2000, "Maximum": 100000}},
+        {"sc|ElastiCacheProcessingUnits": [300.0 * 40, 300.0 * 50, 300.0 * 30]},
+    )
+    found = _limit_findings(out)
+    over = next(f for f in found if "over-provisioned" in f["message"])
+    assert over["recommendation"]["ecpu_per_second_max"] == 1000 and over["severity"] == "info"
+    assert "100000" in over["message"] and "p95" in over["message"]
+    unused = next(f for f in found if "minimum is set but unused" in f["message"])
+    assert unused["recommendation"]["ecpu_per_second_min"] == 0
+
+
+def test_serverless_limits_healthy_cache_stays_quiet():
+    out = _limits_run(
+        {"DataStorage": {"Maximum": 10, "Unit": "GB"}, "ECPUPerSecond": {"Maximum": 1000}},
+        {
+            "sc|BytesUsedForCache": [1024.0**3 * 3] * 3,
+            "sc|ElastiCacheProcessingUnits": [300.0 * 300] * 4,
+            "sc|ThrottledCmds": [0.0, 0.0],
+        },
+    )
+    assert _limit_findings(out) == [] and out["findings_total"] == 0
+
+
+def test_serverless_limits_throttling_below_the_cap_is_called_out():
+    out = _limits_run(
+        {"ECPUPerSecond": {"Maximum": 1000}},
+        {"sc|ElastiCacheProcessingUnits": [300.0 * 300] * 3, "sc|ThrottledCmds": [0.0, 40.0]},
+    )
+    f = next(x for x in _limit_findings(out) if "ThrottledCmds" in x["message"])
+    assert "40 ThrottledCmds" in f["message"] and "30%" in f["message"]
+    assert "ecpu_per_second_max" in f["recommendation"]

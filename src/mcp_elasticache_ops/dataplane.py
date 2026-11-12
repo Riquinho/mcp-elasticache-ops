@@ -581,6 +581,150 @@ def latency(r: redis.Redis, ping_samples: int = 20) -> dict:
     }
 
 
+LATENCY_EVENTS_HISTORY = 3  # events whose LATENCY HISTORY is fetched (highest max first)
+LATENCY_HISTORY_SAMPLES = 20  # newest samples kept per event (the server keeps up to 160)
+LATENCY_DOCTOR_CHARS = 1500  # cap for each DOCTOR text
+LATENCY_SLOW_MS = 100  # a fork or aof-fsync event this slow blocks every client for that long
+LATENCY_FORK_CRIT_MS = 1000
+LATENCY_SPIKE_MS = 25  # an expire-cycle must also exceed this to count as a spike
+LATENCY_SPIKE_FACTOR = 4.0  # ... and be this many times its median history sample
+
+
+def _doctor_text(r: redis.Redis, *command: str) -> tuple[str | None, str | None]:
+    """DOCTOR output trimmed to LATENCY_DOCTOR_CHARS; ``(text, None)`` or ``(None, reason)``."""
+    reply, err = _try(r.execute_command, *command)
+    if err is not None:
+        return None, err
+    text = _s(reply) if isinstance(_s(reply), str) else ""
+    text = text.strip()
+    if len(text) > LATENCY_DOCTOR_CHARS:
+        text = text[:LATENCY_DOCTOR_CHARS] + f"... [trimmed, {len(text) - LATENCY_DOCTOR_CHARS} more characters]"
+    return text, None
+
+
+def _latency_history(r: redis.Redis, event: str) -> tuple[list[dict], str | None]:
+    reply, err = _try(r.execute_command, "LATENCY", "HISTORY", event)
+    if err is not None:
+        return [], err
+    samples = []
+    for row in reply if isinstance(reply, list | tuple) else []:
+        if isinstance(row, list | tuple) and len(row) >= 2:
+            samples.append({"timestamp": int(_num(row[0])), "ms": _num(row[1])})
+    return samples[-LATENCY_HISTORY_SAMPLES:], None
+
+
+def _latency_event_findings(events: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for e in events:
+        name, peak, latest = str(e["event"]), _num(e["max_ms"]), _num(e["latest_ms"])
+        history = [h["ms"] for h in e.get("history", [])]
+        if name == "fork" and peak >= LATENCY_SLOW_MS:
+            out.append(
+                _finding(
+                    "critical" if peak >= LATENCY_FORK_CRIT_MS else "warning",
+                    f"fork took up to {peak:.0f} ms (latest {latest:.0f} ms): the main thread is blocked while "
+                    "forking for a snapshot, AOF rewrite or replica sync; a large heap makes it worse. Move backups "
+                    "away from peak traffic or spread data over more shards",
+                    event=name,
+                )
+            )
+        elif name.startswith("aof-") and peak >= LATENCY_SLOW_MS:
+            out.append(
+                _finding(
+                    "warning",
+                    f"{name} took up to {peak:.0f} ms (latest {latest:.0f} ms): slow disk writes stall the main "
+                    "thread; check AOF/appendfsync settings and storage pressure",
+                    event=name,
+                )
+            )
+        elif name == "expire-cycle":
+            median = statistics.median(history) if history else 0.0
+            spike = peak >= LATENCY_SPIKE_MS and (peak >= LATENCY_SPIKE_FACTOR * median if history else peak >= 100)
+            if spike:
+                out.append(
+                    _finding(
+                        "warning",
+                        f"expire-cycle spiked to {peak:.0f} ms (median sample {median:.0f} ms): many keys expired "
+                        "together; add jitter to TTLs so they do not expire at the same second",
+                        event=name,
+                    )
+                )
+        elif peak >= LATENCY_SLOW_MS:
+            out.append(
+                _finding("info", f"latency event {name} reached {peak:.0f} ms (latest {latest:.0f} ms)", event=name)
+            )
+    return out
+
+
+def latency_events(r: redis.Redis) -> dict:
+    """LATENCY LATEST, LATENCY HISTORY for the worst events and the DOCTOR texts, findings first.
+
+    ElastiCache ships ``latency-monitor-threshold 0``, which records nothing: an empty LATEST then gets an
+    actionable finding that names the parameter."""
+    notes: list[str] = []
+    latest, latest_err = _try(r.execute_command, "LATENCY", "LATEST")
+    threshold_cfg, _ = _try(r.config_get, "latency-monitor-threshold")
+    raw_threshold = (threshold_cfg or {}).get("latency-monitor-threshold")
+    threshold = int(_num(raw_threshold)) if raw_threshold is not None else None
+    events: list[dict] = []
+    for row in latest if isinstance(latest, list | tuple) else []:
+        if isinstance(row, list | tuple) and len(row) >= 4:
+            events.append(
+                {
+                    "event": str(_s(row[0])),
+                    "timestamp": int(_num(row[1])),
+                    "latest_ms": _num(row[2]),
+                    "max_ms": _num(row[3]),
+                }
+            )
+    events.sort(key=lambda e: -e["max_ms"])
+    for e in events[:LATENCY_EVENTS_HISTORY]:
+        e["history"], history_err = _latency_history(r, e["event"])
+        if history_err:
+            notes.append(f"LATENCY HISTORY {e['event']}: unavailable ({history_err})")
+    findings = _latency_event_findings(events)
+    if latest_err is not None:
+        notes.append(f"LATENCY LATEST: unavailable ({latest_err})")
+    elif not events:
+        if threshold == 0:
+            findings.append(
+                _finding(
+                    "warning",
+                    "latency monitor is off: latency-monitor-threshold is 0 (the ElastiCache default), so LATENCY "
+                    "LATEST is empty and spikes are not recorded. Set latency-monitor-threshold (milliseconds, for "
+                    "example 100) in the parameter group (`aws_parameters`), then run this tool after the next spike",
+                    parameter="latency-monitor-threshold",
+                )
+            )
+        elif threshold is None:
+            findings.append(
+                _finding(
+                    "info",
+                    "LATENCY LATEST is empty and CONFIG GET is refused, so latency-monitor-threshold is unknown; "
+                    "if it is 0 nothing is recorded (set it in the parameter group)",
+                    parameter="latency-monitor-threshold",
+                )
+            )
+        else:
+            findings.append(
+                _finding("info", f"no event crossed the {threshold} ms latency-monitor-threshold since the last reset")
+            )
+    latency_doctor, ldoc_err = (None, None) if not events else _doctor_text(r, "LATENCY", "DOCTOR")
+    memory_doctor, mdoc_err = _doctor_text(r, "MEMORY", "DOCTOR")
+    for label, err in (("LATENCY DOCTOR", ldoc_err), ("MEMORY DOCTOR", mdoc_err)):
+        if err:
+            notes.append(f"{label}: unavailable ({err})")
+    return {
+        "findings": _sorted_findings(findings),
+        "latency_monitor_threshold_ms": threshold,
+        "events_total": len(events),
+        "events": events,
+        "latency_doctor": latency_doctor,
+        "memory_doctor": memory_doctor,
+        "notes": notes,
+    }
+
+
 COMMANDSTATS_P99_WARN_USEC = 10_000  # a top-by-time command whose p99 exceeds 10 ms is worth a look
 MAX_ERROR_PREFIXES = 20  # errorstats rows returned
 # Error prefixes that point at a specific, fixable cause (INFO errorstats, Redis 6.2+/Valkey).

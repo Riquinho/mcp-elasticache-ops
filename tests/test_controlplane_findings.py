@@ -1703,3 +1703,105 @@ def test_cost_valkey_hint_gates_and_caps():
     out = plane(Fake({"describe_cache_clusters": {"CacheClusters": many}}), Fake()).cost_overview()
     (f,) = _valkey_finding(out)
     assert f["candidates_total"] == 9 and len(f["top_candidates"]) == controlplane.MAX_VALKEY_CANDIDATES
+
+
+# ------------------------------------------------------------------ round 14: failover correlation
+
+
+def _failover_event(minutes_ago, message="Failover complete", source="prod"):
+    return {
+        "SourceIdentifier": source,
+        "SourceType": "replication-group",
+        "Message": message,
+        "Date": NOW - dt.timedelta(minutes=minutes_ago),
+    }
+
+
+def _correlation_triage(events, metrics=None):
+    ec = Fake(
+        {
+            "describe_replication_groups": {"ReplicationGroups": [rg()]},
+            "describe_events": {"Events": events},
+        }
+    )
+    cw = Fake({"get_metric_data": metric_result(metrics or {})})
+    return plane(ec, cw).triage("prod"), ec
+
+
+def _correlation_findings(out):
+    return [f for f in out["findings"] if f.get("category") == "failover-correlation"]
+
+
+def test_failover_correlation_names_event_timestamp_and_impact():
+    event = _failover_event(20)
+    metrics = {
+        # index 0 is NOW, each step is 5 minutes older; the event is 20 minutes ago
+        "prod-002|ReplicationLag": [0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0],
+        "prod-001|CurrConnections": [90.0, 80.0, 10.0, 60.0, 90.0, 100.0, 100.0, 100.0, 100.0, 100.0],
+    }
+    out, ec = _correlation_triage([event], metrics)
+    (f,) = _correlation_findings(out)
+    stamp = event["Date"].isoformat()
+    assert "Failover complete" in f["message"] and stamp in f["message"] and "20 min ago" in f["message"]
+    assert f["severity"] == "warning" and f["section"] == "events"
+    assert "ReplicationLag peaked at 4.0s 5 min after the event" in f["message"]
+    assert "CurrConnections dropped" in f["message"]
+    assert [s["section"] for s in out["sections"]] == [
+        "replication_group",
+        "events",
+        "metrics",
+        "service_updates",
+        "snapshots",
+    ]
+    durations = [kw["Duration"] for name, kw in ec.calls if name == "describe_events"]
+    assert durations == [360, 24 * 60]
+
+
+def test_failover_correlation_no_events_yields_no_such_finding():
+    out, _ = _correlation_triage([])
+    assert _correlation_findings(out) == []
+    assert not any("recent failover/maintenance" in f["message"] for f in out["findings"])
+
+
+def test_failover_correlation_ignores_other_events_and_reports_quiet_impact():
+    unrelated = _failover_event(10, message="Snapshot succeeded")
+    out, _ = _correlation_triage([unrelated])
+    assert _correlation_findings(out) == []
+    quiet, _ = _correlation_triage([_failover_event(60, message="Replication group primary changed")])
+    (f,) = _correlation_findings(quiet)
+    assert "no ReplicationLag or CurrConnections impact visible" in f["message"]
+
+
+def test_failover_correlation_old_event_is_info_and_flags_the_metric_window():
+    out, _ = _correlation_triage([_failover_event(20 * 60, message="Cache cluster node replaced")])
+    (f,) = _correlation_findings(out)
+    assert f["severity"] == "info" and "predates the 6h metric window" in f["message"]
+
+
+def test_failover_correlation_extra_call_denied_degrades_to_info():
+    ec = Fake(
+        {
+            "describe_replication_groups": {"ReplicationGroups": [rg()]},
+            "describe_events": lambda kw: (
+                {"Events": []} if kw["Duration"] == 360 else (_ for _ in ()).throw(denied("DescribeEvents"))
+            ),
+        }
+    )
+    out = plane(ec, Fake({"get_metric_data": metric_result({})})).triage("prod")
+    assert any("correlation skipped (AccessDenied)" in f["message"] for f in out["findings"])
+
+
+def test_failover_correlation_serverless_uses_serverless_source_type():
+    ec = Fake(
+        {
+            "describe_serverless_caches": {
+                "ServerlessCaches": [{"ServerlessCacheName": "sc", "Status": "available", "Engine": "valkey"}]
+            },
+            "describe_events": {"Events": [_failover_event(30, source="sc")]},
+        }
+    )
+    out = plane(ec, Fake({"get_metric_data": metric_result({})})).serverless_triage("sc")
+    (f,) = _correlation_findings(out)
+    assert "Failover complete" in f["message"] and "30 min ago" in f["message"]
+    kwargs = next(kw for name, kw in ec.calls if name == "describe_events")
+    assert kwargs["SourceType"] == "serverless-cache" and kwargs["Duration"] == 24 * 60

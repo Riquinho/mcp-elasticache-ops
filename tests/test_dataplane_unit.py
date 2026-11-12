@@ -1677,3 +1677,87 @@ def test_valkey_config_findings_flag_single_io_thread_and_lazyfree_off():
     redis_server = {"redis_version": "7.2.4"}
     assert dataplane.config_findings(cfg, None, redis_server) == []
     assert dataplane.config_findings({"io-threads": "1"}, None, {"valkey_version": "7.2.6"}) == []
+
+
+# ------------------------------------------------------------- round 14: node_latency_events
+
+
+class _LatencyRedis(FakeRedis):
+    def __init__(self, threshold="100", config_error=False):
+        super().__init__()
+        self.threshold = threshold
+        self.config_error = config_error
+
+    def config_get(self, pattern):
+        if self.config_error:
+            raise redis.ResponseError("unknown command CONFIG")
+        return {"latency-monitor-threshold": self.threshold}
+
+
+def _latency_redis(latest, history=None, threshold="100"):
+    r = _LatencyRedis(threshold)
+    r.commands["LATENCY LATEST"] = latest
+    for event, rows in (history or {}).items():
+        r.commands[f"LATENCY HISTORY {event}"] = rows
+    r.commands["LATENCY DOCTOR"] = "Dave, I have observed latency spikes. " + "x" * 5000
+    r.commands["MEMORY DOCTOR"] = "Hi Sam, all is fine."
+    return r
+
+
+def test_latency_events_slow_fork_and_aof_are_findings_with_history():
+    r = _latency_redis(
+        [["fork", 1700000100, 450, 1500], ["aof-fsync-always", 1700000200, 120, 130], ["command", 1700000300, 5, 9]],
+        {"fork": [[1700000000 + i, 10 + i] for i in range(30)], "aof-fsync-always": [[1700000200, 130]]},
+    )
+    out = dataplane.latency_events(r)
+    assert out["events_total"] == 3 and out["events"][0]["event"] == "fork"
+    assert len(out["events"][0]["history"]) == dataplane.LATENCY_HISTORY_SAMPLES  # bounded
+    assert out["events"][0]["history"][-1] == {"timestamp": 1700000029, "ms": 39.0}
+    sev = {f["event"]: f["severity"] for f in out["findings"] if "event" in f}
+    assert sev["fork"] == "critical" and sev["aof-fsync-always"] == "warning"
+    assert out["findings"][0]["severity"] == "critical"
+    assert len(out["latency_doctor"]) <= dataplane.LATENCY_DOCTOR_CHARS + 60
+    assert out["memory_doctor"] == "Hi Sam, all is fine."
+
+
+def test_latency_events_expire_cycle_spike_against_its_own_history():
+    spiky = [[1700000000 + i, 3] for i in range(10)] + [[1700000100, 90]]
+    r = _latency_redis([["expire-cycle", 1700000100, 90, 90]], {"expire-cycle": spiky})
+    out = dataplane.latency_events(r)
+    assert any(f.get("event") == "expire-cycle" and "spike" in f["message"] for f in out["findings"])
+    calm = [[1700000000 + i, 40] for i in range(10)] + [[1700000100, 45]]
+    quiet = dataplane.latency_events(_latency_redis([["expire-cycle", 1700000100, 45, 45]], {"expire-cycle": calm}))
+    assert not any(f.get("event") == "expire-cycle" for f in quiet["findings"])
+
+
+def test_latency_events_empty_with_threshold_zero_names_the_parameter():
+    out = dataplane.latency_events(_latency_redis([], threshold="0"))
+    (f,) = out["findings"]
+    assert f["severity"] == "warning" and f["parameter"] == "latency-monitor-threshold"
+    assert "aws_parameters" in f["message"] and out["latency_doctor"] is None
+    assert out["latency_monitor_threshold_ms"] == 0 and out["events_total"] == 0
+
+
+def test_latency_events_empty_with_threshold_set_or_unknown_is_informational():
+    out = dataplane.latency_events(_latency_redis([], threshold="100"))
+    assert [f["severity"] for f in out["findings"]] == ["info"] and "100 ms" in out["findings"][0]["message"]
+    r = _latency_redis([])
+    r.config_error = True
+    unknown = dataplane.latency_events(r)
+    assert unknown["latency_monitor_threshold_ms"] is None
+    assert "unknown" in unknown["findings"][0]["message"]
+
+
+def test_latency_events_tolerates_refused_commands_and_odd_replies():
+    r = _LatencyRedis()
+    r.commands["LATENCY LATEST"] = redis.ResponseError("unknown command LATENCY")
+    out = dataplane.latency_events(r)
+    assert any("LATENCY LATEST: unavailable" in n for n in out["notes"])
+    assert any("MEMORY DOCTOR: unavailable" in n for n in out["notes"])
+    r2 = _latency_redis([["fork", 1, 150, 150], "junk", [b"x"]], {"fork": "not-a-list"})
+    odd = dataplane.latency_events(r2)
+    assert odd["events_total"] == 1 and odd["events"][0]["history"] == []
+    r3 = _latency_redis([[b"command", 1, 150, 150]], {"command": redis.ResponseError("nope")})
+    err = dataplane.latency_events(r3)
+    assert any("LATENCY HISTORY command: unavailable" in n for n in err["notes"])
+    assert any(f["severity"] == "info" and f.get("event") == "command" for f in err["findings"])

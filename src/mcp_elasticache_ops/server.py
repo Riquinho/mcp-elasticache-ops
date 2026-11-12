@@ -318,6 +318,14 @@ def node_latency(ping_samples: Annotated[int, Field(ge=1, le=500)] = 20) -> dict
 
 
 @read_tool
+def node_latency_events() -> dict:
+    """LATENCY LATEST, then LATENCY HISTORY for the 3 worst events (newest 20 samples), findings first: fork or
+    aof-fsync events over 100 ms, expire-cycle spikes, plus trimmed LATENCY DOCTOR and MEMORY DOCTOR text.
+    When latency-monitor-threshold is 0 (the ElastiCache default) the finding points at that parameter."""
+    return dataplane.latency_events(redis_client())
+
+
+@read_tool
 def node_commandstats(top: Annotated[int, Field(ge=1, le=500)] = 20) -> dict:
     """Commands ranked by total CPU time (INFO commandstats), with calls, usec per call, rejected and
     failed calls, plus error prefix counts (errorstats) and p50/p99/p99.9 per command (latencystats)
@@ -550,10 +558,17 @@ def aws_events(
 
 
 @read_tool
-def aws_parameters(parameter_group: str, only_modified: bool = True, region: Region = None) -> dict:
-    """DescribeCacheParameters for a parameter group; by default only values changed
-    from the engine defaults (Source=user)."""
-    return _cp(region).parameters(parameter_group, only_modified)
+def aws_parameters(
+    parameter_group: str,
+    only_modified: bool = True,
+    diff_engine_defaults: Annotated[
+        bool, Field(description="Compare with DescribeEngineDefaultParameters and list only non-default values")
+    ] = False,
+    region: Region = None,
+) -> dict:
+    """DescribeCacheParameters for a parameter group; by default only values changed (Source=user).
+    Findings flag risky settings (noeviction, tiny output buffers, timeout 0, low maxmemory-samples)."""
+    return _cp(region).parameters(parameter_group, only_modified, diff_engine_defaults)
 
 
 @read_tool
@@ -713,6 +728,18 @@ def aws_serverless_triage(
     6h ThrottledCmds/ECPU/storage against the limits. Findings are worst-first (max 30); a section that
     fails (for example AccessDenied) is reported as unavailable instead of failing the call."""
     return _cp(region).serverless_triage(serverless_cache_name)
+
+
+@read_tool
+def aws_shard_balance(
+    replication_group_id: Annotated[str, Field(description="ReplicationGroupId to check for shard skew")],
+    minutes: Annotated[int, Field(ge=5, le=20160, description="CloudWatch window in minutes")] = 60,
+    region: Region = None,
+) -> dict:
+    """Per-shard skew from CloudWatch only (one GetMetricData call per member; works without a data-plane
+    connection). Findings first: hot shard (over 2x the median and above 50% CPU), memory skew, and one
+    primary pinned near 100% CPU while the rest idle (hot-key signature)."""
+    return _cp(region).shard_balance(replication_group_id, minutes)
 
 
 @read_tool

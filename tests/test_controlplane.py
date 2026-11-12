@@ -155,3 +155,117 @@ def test_no_credentials_is_unavailable(monkeypatch):
 def test_disabled():
     cp = ControlPlane(ControlPlaneConfig(region=REGION, enabled=False))
     assert "unavailable" in cp.metrics("a-001")
+
+
+# ------------------------------------------------------------- round 14: engine default parameters
+
+
+def _param(name, value, source="system"):
+    return {"ParameterName": name, "ParameterValue": value, "Source": source, "IsModifiable": True}
+
+
+def _diff_stub(stub, actual, defaults, family="redis7"):
+    stub.add_response(
+        "describe_cache_parameter_groups",
+        {"CacheParameterGroups": [{"CacheParameterGroupName": "pg1", "CacheParameterGroupFamily": family}]},
+        {"CacheParameterGroupName": "pg1"},
+    )
+    stub.add_response(
+        "describe_engine_default_parameters",
+        {"EngineDefaults": {"CacheParameterGroupFamily": family, "Marker": "m1", "Parameters": defaults[:1]}},
+        {"CacheParameterGroupFamily": family},
+    )
+    stub.add_response(
+        "describe_engine_default_parameters",
+        {"EngineDefaults": {"CacheParameterGroupFamily": family, "Parameters": defaults[1:]}},
+        {"CacheParameterGroupFamily": family, "Marker": "m1"},
+    )
+    stub.add_response("describe_cache_parameters", {"Parameters": actual}, {"CacheParameterGroupName": "pg1"})
+
+
+DEFAULTS = [
+    _param("maxmemory-policy", "volatile-lru"),
+    _param("timeout", "0"),
+    _param("maxmemory-samples", "3"),
+    _param("client-output-buffer-limit-replica-hard-limit", "268435456"),
+    _param("tcp-keepalive", "300"),
+]
+
+
+def test_parameters_engine_default_diff_lists_only_non_default_values(stubbed):
+    cp, stub = stubbed
+    actual = [
+        _param("maxmemory-policy", "allkeys-lru", "user"),
+        _param("timeout", "0"),
+        _param("maxmemory-samples", "3"),
+        _param("client-output-buffer-limit-replica-hard-limit", "268435456"),
+        _param("tcp-keepalive", "60", "user"),
+    ]
+    _diff_stub(stub, actual, DEFAULTS)
+    out = cp.parameters("pg1", diff_engine_defaults=True)
+    assert [(p["name"], p["value"], p["default"]) for p in out["parameters"]] == [
+        ("maxmemory-policy", "allkeys-lru", "volatile-lru"),
+        ("tcp-keepalive", "60", "300"),
+    ]
+    assert out["engine_defaults"] == {"family": "redis7", "compared": 5, "non_default": 2}
+
+
+def test_parameters_flags_risky_settings(stubbed):
+    cp, stub = stubbed
+    actual = [
+        _param("maxmemory-policy", "noeviction", "user"),
+        _param("timeout", "0"),
+        _param("maxmemory-samples", "1", "user"),
+        _param("client-output-buffer-limit-replica-hard-limit", "1024", "user"),
+        _param("tcp-keepalive", "300"),
+    ]
+    _diff_stub(stub, actual, DEFAULTS)
+    out = cp.parameters("pg1", diff_engine_defaults=True)
+    by_param = {f["parameter"]: f for f in out["findings"]}
+    assert set(by_param) == {
+        "maxmemory-policy",
+        "timeout",
+        "maxmemory-samples",
+        "client-output-buffer-limit-replica-hard-limit",
+    }
+    assert (
+        by_param["maxmemory-policy"]["severity"] == "warning"
+        and "noeviction" in by_param["maxmemory-policy"]["message"]
+    )
+    assert by_param["timeout"]["severity"] == "info"
+    assert "below the engine default (3)" in by_param["maxmemory-samples"]["message"]
+    assert "1024 bytes" in by_param["client-output-buffer-limit-replica-hard-limit"]["message"]
+
+
+def test_parameters_without_diff_still_reports_risky_values(stubbed):
+    cp, stub = stubbed
+    stub.add_response(
+        "describe_cache_parameters",
+        {"Parameters": [_param("maxmemory-policy", "noeviction", "user")]},
+        {"CacheParameterGroupName": "pg1", "Source": "user"},
+    )
+    out = cp.parameters("pg1")
+    assert [f["parameter"] for f in out["findings"]] == ["maxmemory-policy"]
+    assert "engine_defaults" not in out
+
+
+def test_every_boto3_call_in_controlplane_has_a_matching_action_in_the_readme_policy():
+    import ast
+    import json
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    block = re.search(r"```json\n(\{.*?\})\n```", readme, re.S).group(1)
+    actions = {a.split(":", 1)[1] for st in json.loads(block)["Statement"] for a in st["Action"]}
+    tree = ast.parse((root / "src" / "mcp_elasticache_ops" / "controlplane.py").read_text(encoding="utf-8"))
+    names = set()
+    for node in ast.walk(tree):
+        text = node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+        text = node.attr if isinstance(node, ast.Attribute) else text
+        if text and re.fullmatch(r"(describe|list)_[a-z_]+|get_metric_data", text):
+            names.add(text)
+    assert "describe_engine_default_parameters" in names and "get_metric_data" in names
+    missing = {n for n in names if "".join(p.capitalize() for p in n.split("_")) not in actions}
+    assert not missing, f"calls without a README IAM action: {sorted(missing)}"

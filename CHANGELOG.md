@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Round 14: `aws_shard_balance` (per-shard CPU/memory/items/traffic skew, hot-key and hot-shard findings); failover/event correlation in `aws_triage` and `aws_serverless_triage` (category `failover-correlation`); serverless limits/throttling findings with p95 and a recommendation; `aws_parameters(diff_engine_defaults=True)` plus risky-setting findings (README IAM adds `elasticache:DescribeEngineDefaultParameters`, guarded by a README-policy test); `node_latency_events` (LATENCY LATEST/HISTORY/DOCTOR, MEMORY DOCTOR). 51 tools. Local integration run skipped: only 3.6G free on C: (gate needs 5G), docker cleanup freed 0B and fstrim is unavailable in the WSL distro; gate not weakened.
 - Round 13: `node_connectivity` (staged DNS, TCP, TLS with plaintext fallback probe, PING, AUTH; stops at the first
   failure, findings first, secrets never echoed); `aws_security_audit` (fleet hardening roll-up with region fan-out:
   severity counts, findings grouped by category, capped pass/fail matrix; AccessDenied degrades to `partial`);

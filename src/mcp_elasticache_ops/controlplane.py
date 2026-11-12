@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import math
 import re
 import time
 from collections import Counter, defaultdict
@@ -158,6 +159,41 @@ MAX_AUDIT_MATRIX_ROWS = 25  # rows of the aws_security_audit pass/fail matrix
 MAX_AUDIT_FINDINGS = 100
 _monotonic = time.monotonic  # patched by tests; never patch the time module itself
 MAX_OVERVIEW_SHARDS = 50
+# aws_shard_balance: one GetMetricData call per node-group member, nothing from the data plane.
+SHARD_METRICS = [
+    "EngineCPUUtilization",
+    "DatabaseMemoryUsagePercentage",
+    "NetworkBytesIn",
+    "NetworkBytesOut",
+    "CurrItems",
+]
+SHARD_WINDOW_MINUTES = 60
+MAX_SHARD_MEMBERS = 100  # members queried (one call each); primaries first
+MAX_HOT_SHARD_FINDINGS = 5
+SHARD_HOT_RATIO = 2.0  # hot shard: CPU above this multiple of the median shard ...
+SHARD_HOT_CPU = 50.0  # ... and above this absolute EngineCPUUtilization (percent)
+SHARD_PINNED_CPU = 90.0  # a primary at or above this ...
+SHARD_IDLE_CPU = 20.0  # ... while every other shard stays under this is a hot-key signature
+SHARD_MEMORY_RATIO = 1.5
+SHARD_MEMORY_POINTS = 20.0  # memory skew needs this many percentage points over the median shard
+SHARD_ITEMS_RATIO = 2.0
+SHARD_TRAFFIC_RATIO = 3.0
+# Failover/maintenance events matched against the metric window in the triage tools.
+CORRELATION_HOURS = 24
+CORRELATION_MINUTES = 30  # metrics are compared this long before and after an event
+CORRELATION_LAG_SECONDS = 1.0
+CORRELATION_CONN_DROP = 0.5  # CurrConnections falling by this fraction counts as a drop
+MAX_CORRELATED_EVENTS = 3
+_FAILOVER_EVENT = re.compile(r"failover.*complet|primary.*changed|node.*replaced|replaced.*node", re.IGNORECASE)
+# Serverless limits: thresholds on usage versus the configured CacheUsageLimits.
+SERVERLESS_NEAR_LIMIT_PCT = 80.0
+SERVERLESS_P95_TIGHT_PCT = 60.0  # p95 above this share of the max leaves no burst headroom
+SERVERLESS_OVERSIZED_PCT = 10.0  # peak under this share of the max: the max is far above use
+SERVERLESS_TARGET_PCT = 50.0  # recommended max puts the p95 at this share
+ECPU_STEP = 1000  # ECPUPerSecond maximums are set in steps of 1000
+# aws_parameters --diff: values that deserve a finding.
+RISKY_MAXMEMORY_SAMPLES_FLOOR = 3.0  # ElastiCache default; lower evicts a worse sample of keys
+TINY_BUFFER_BYTES = 1024 * 1024
 OUTLIER_RATIO = 1.5
 # Ignore outliers below these floors: 3x of almost nothing is still almost nothing.
 OUTLIER_FLOORS = {
@@ -1229,23 +1265,74 @@ class ControlPlane:
 
         return self._guard(run)
 
-    def parameters(self, parameter_group: str, only_modified: bool = True) -> dict:
+    def _engine_defaults(self, parameter_group: str) -> tuple[str | None, dict[str, str]]:
+        """(family, {parameter: default}) from DescribeEngineDefaultParameters, paged with the usual cap."""
+        groups = self._paginate(
+            "describe_cache_parameter_groups", "CacheParameterGroups", CacheParameterGroupName=parameter_group
+        )
+        family = (groups[0].get("CacheParameterGroupFamily") if groups else None) or None
+        if not family:
+            return None, {}
+        ec = self.client("elasticache")
+
+        def fetch(marker: str | None) -> dict:
+            kwargs: dict[str, Any] = {"CacheParameterGroupFamily": family}
+            if marker:
+                kwargs["Marker"] = marker
+            return ec.describe_engine_default_parameters(**kwargs).get("EngineDefaults") or {}
+
+        defaults: dict[str, str] = {}
+        for page in self._pages("describe_engine_default_parameters", fetch, "Marker"):
+            for prm in page.get("Parameters", []):
+                if prm.get("ParameterName") is not None:
+                    defaults[str(prm["ParameterName"])] = str(prm.get("ParameterValue", ""))
+        return family, defaults
+
+    def parameters(self, parameter_group: str, only_modified: bool = True, diff_engine_defaults: bool = False) -> dict:
         def run() -> dict:
             kwargs: dict[str, Any] = {"CacheParameterGroupName": parameter_group}
-            if only_modified:
+            if only_modified and not diff_engine_defaults:
                 kwargs["Source"] = "user"
+            family, defaults = self._engine_defaults(parameter_group) if diff_engine_defaults else (None, {})
             params = self._paginate("describe_cache_parameters", "Parameters", **kwargs)
-            view = [
-                {
+            values = {str(p.get("ParameterName")): str(p.get("ParameterValue", "")) for p in params}
+            shown = params
+            if diff_engine_defaults and defaults:
+                shown = [
+                    p
+                    for p in params
+                    if str(p.get("ParameterName")) in defaults
+                    and str(p.get("ParameterValue", "")) != defaults[str(p.get("ParameterName"))]
+                ]
+            view = []
+            for p in shown:
+                item = {
                     "name": p.get("ParameterName"),
                     "value": p.get("ParameterValue"),
                     "source": p.get("Source"),
                     "modifiable": p.get("IsModifiable"),
                     "change_type": p.get("ChangeType"),
                 }
-                for p in params
-            ]
-            return {"parameter_group": parameter_group, "only_modified": only_modified, "parameters": view}
+                if diff_engine_defaults and defaults:
+                    item["default"] = defaults.get(str(p.get("ParameterName")))
+                view.append(item)
+            out: dict[str, Any] = {
+                "parameter_group": parameter_group,
+                "only_modified": only_modified,
+                "findings": _sorted_findings(_risky_parameter_findings(values, defaults, parameter_group)),
+                "parameters": view,
+            }
+            if diff_engine_defaults:
+                out["engine_defaults"] = {
+                    "family": family,
+                    "compared": len(defaults),
+                    "non_default": len(view) if defaults else None,
+                }
+                if not defaults:
+                    out["findings"].append(
+                        finding("info", "engine defaults unavailable for this group; showing every returned value")
+                    )
+            return out
 
         return self._guard(run)
 
@@ -2178,6 +2265,7 @@ class ControlPlane:
             sections: list[dict] = []
             findings: list[dict] = []
             cache_box: list[dict] = []
+            series_box: list[dict[str, dict[str, dict]]] = []
             section = self._section_runner(serverless_cache_name, sections, findings, SERVERLESS_TRIAGE_FATAL)
 
             def cache_section() -> tuple[str, list[dict]]:
@@ -2218,7 +2306,7 @@ class ControlPlane:
 
             def limits_section() -> tuple[str, list[dict]]:
                 period = 300
-                summary, _, found = self._collect_metrics(
+                summary, series, found = self._collect_metrics(
                     [serverless_cache_name],
                     SERVERLESS_METRICS,
                     TRIAGE_WINDOW_HOURS * 60,
@@ -2227,6 +2315,7 @@ class ControlPlane:
                     True,
                     rightsizing=False,
                 )
+                series_box.append(series)
                 metrics = summary[serverless_cache_name]
                 limits = cache_box[0].get("CacheUsageLimits") if cache_box else None
                 found += _serverless_limit_findings(serverless_cache_name, metrics, limits, period)
@@ -2241,6 +2330,26 @@ class ControlPlane:
             section("cache", cache_section)
             section("snapshots", snapshots_section)
             section("limits", limits_section)
+            try:  # one describe_events call for the 24h failover/maintenance correlation
+                events = self._paginate(
+                    "describe_events",
+                    "Events",
+                    SourceIdentifier=serverless_cache_name,
+                    SourceType="serverless-cache",
+                    Duration=CORRELATION_HOURS * 60,
+                )
+                findings += _failover_findings(
+                    events, now, series_box[0] if series_box else {}, serverless_cache_name, TRIAGE_WINDOW_HOURS
+                )
+            except (ClientError, BotoCoreError) as exc:
+                findings.append(
+                    finding(
+                        "info",
+                        f"{CORRELATION_HOURS}h failover/maintenance correlation skipped ({_error_code(exc)})",
+                        resource=serverless_cache_name,
+                        section="events",
+                    )
+                )
             tag_view, tag_findings = self._tag_context(
                 serverless_cache_name, [cache_box[0].get("ARN")] if cache_box else []
             )
@@ -2272,6 +2381,8 @@ class ControlPlane:
             findings: list[dict] = []
 
             section = self._section_runner(replication_group_id, sections, findings)
+            long_events: list[dict] = []
+            series_box: list[dict[str, dict[str, dict]]] = []
 
             def rg_section() -> tuple[str, list[dict]]:
                 groups = self._paginate(
@@ -2299,15 +2410,33 @@ class ControlPlane:
                     Duration=TRIAGE_WINDOW_HOURS * 60,
                 )
                 found, notable = _triage_event_findings(events)
+                try:  # one extra call for the 24h failover/maintenance correlation
+                    long_events.extend(
+                        self._paginate(
+                            "describe_events",
+                            "Events",
+                            SourceIdentifier=replication_group_id,
+                            SourceType="replication-group",
+                            Duration=CORRELATION_HOURS * 60,
+                        )
+                    )
+                except (ClientError, BotoCoreError) as exc:
+                    found.append(
+                        finding(
+                            "info",
+                            f"{CORRELATION_HOURS}h failover/maintenance correlation skipped ({_error_code(exc)})",
+                        )
+                    )
                 return f"{len(events)} event(s) in the last {TRIAGE_WINDOW_HOURS}h, {notable} notable", found
 
             def metrics_section() -> tuple[str, list[dict]]:
                 if not members:
                     raise _TriageEmpty("no member clusters known (replication group section failed)")
                 names = TRIAGE_METRICS + (BURSTABLE_METRICS if any(is_burstable(t) for t in node_types) else [])
-                summary, _, found = self._collect_metrics(
+                summary, series, found = self._collect_metrics(
                     members, names, TRIAGE_WINDOW_HOURS * 60, 300, None, False, rightsizing=False
                 )
+                series_box.append(series)
                 peaks = _triage_peaks(summary)
                 text = ", ".join(f"{k} {v['value']:.4g} on {v['member']}" for k, v in peaks.items())
                 return f"peaks over {TRIAGE_WINDOW_HOURS}h: {text or 'no datapoints'}", found
@@ -2337,6 +2466,9 @@ class ControlPlane:
             section("metrics", metrics_section)
             section("service_updates", updates_section)
             section("snapshots", snapshots_section)
+            findings += _failover_findings(
+                long_events, now, series_box[0] if series_box else {}, replication_group_id, TRIAGE_WINDOW_HOURS
+            )
             ordered = _sorted_findings(findings)
             return {
                 "replication_group_id": replication_group_id,
@@ -2422,6 +2554,70 @@ class ControlPlane:
                 "truncated": len(ordered) > MAX_OVERVIEW_FINDINGS,
                 "shards": ordered_shards[:MAX_OVERVIEW_SHARDS],
                 "shards_total": len(ordered_shards),
+            }
+
+        return self._guard(run)
+
+    def shard_balance(self, replication_group_id: str, minutes: int = SHARD_WINDOW_MINUTES) -> dict:
+        """Per-shard skew from CloudWatch alone: one GetMetricData call per node-group member, findings first.
+
+        Never touches the data plane, so it still answers when the endpoint is unreachable."""
+        problem = _validate_window(minutes, 300)
+        if problem:
+            return {"error": "InvalidArgument", "message": problem}
+
+        def run() -> dict:
+            groups = self._paginate(
+                "describe_replication_groups", "ReplicationGroups", ReplicationGroupId=replication_group_id
+            )
+            if not groups:
+                return {"error": "NotFound", "message": f"replication group {replication_group_id} not found"}
+            shards = _shard_layout(groups[0])
+            members = [sh["members"][0] for sh in shards if sh["members"]]
+            members += [m for sh in shards for m in sh["members"][1:]]
+            queried = members[:MAX_SHARD_MEMBERS]
+            notes: list[str] = []
+            if len(members) > len(queried):
+                notes.append(f"metrics cover {len(queried)} of {len(members)} members (primaries first)")
+            summary: dict[str, dict[str, dict]] = {}
+            status = "ok"
+            findings: list[dict] = []
+            try:
+                for member in queried:
+                    one, _, _ = self._collect_metrics(
+                        [member], SHARD_METRICS, int(minutes), 300, None, False, rightsizing=False
+                    )
+                    summary.update(one)
+            except ClientError as exc:
+                status = "partial"
+                findings.append(
+                    finding(
+                        "warning",
+                        f"CloudWatch GetMetricData failed ({_error_code(exc)}): shard skew cannot be computed; "
+                        "the layout is shown without metrics",
+                    )
+                )
+            stats = [_shard_stats(sh, summary) for sh in shards]
+            if summary:
+                findings += _shard_balance_findings(stats)
+            ordered = _sorted_findings(findings)
+            cpu = [x["cpu_avg"] for x in stats if x["cpu_avg"] is not None]
+            memory = [x["memory_avg"] for x in stats if x["memory_avg"] is not None]
+            ranked = sorted(stats, key=lambda x: -(x["cpu_avg"] if x["cpu_avg"] is not None else -1.0))
+            return {
+                "replication_group_id": replication_group_id,
+                "status": status,
+                "window_minutes": int(minutes),
+                "overall": _worst_status(ordered) if ordered else "ok",
+                "findings": ordered[:MAX_OVERVIEW_FINDINGS],
+                "findings_total": len(ordered),
+                "median": {
+                    "cpu_avg": _median(cpu) if cpu else None,
+                    "memory_avg": _median(memory) if memory else None,
+                },
+                "shards": ranked[:MAX_OVERVIEW_SHARDS],
+                "shards_total": len(ranked),
+                **({"notes": notes} if notes else {}),
             }
 
         return self._guard(run)
@@ -3392,25 +3588,40 @@ _STORAGE_UNIT = {"GB": 1024**3, "TB": 1024**4}
 
 def _limits_view(limits: dict | None, summary: dict[str, dict], period_seconds: int) -> dict:
     limits = limits or {}
-    storage_max = (limits.get("DataStorage") or {}).get("Maximum")
-    unit = (limits.get("DataStorage") or {}).get("Unit", "GB")
+    storage = limits.get("DataStorage") or {}
+    storage_max = storage.get("Maximum")
+    unit = storage.get("Unit", "GB")
     ecpu_max = (limits.get("ECPUPerSecond") or {}).get("Maximum")
     used = summary.get("BytesUsedForCache") or {}
     ecpu = summary.get("ElastiCacheProcessingUnits") or {}
     view: dict[str, Any] = {
         "data_storage_max": storage_max,
+        "data_storage_min": storage.get("Minimum"),
         "data_storage_unit": unit,
         "ecpu_per_second_max": ecpu_max,
+        "ecpu_per_second_min": (limits.get("ECPUPerSecond") or {}).get("Minimum"),
         "bytes_used_max": used.get("max") if used.get("points") else None,
+        "bytes_used_p95": used.get("p95") if used.get("points") else None,
         "ecpu_per_second_peak": ecpu["max"] / period_seconds if ecpu.get("points") else None,
+        "ecpu_per_second_p95": ecpu["p95"] / period_seconds
+        if ecpu.get("points") and ecpu.get("p95") is not None
+        else None,
     }
+    scale = _STORAGE_UNIT.get(unit, 1024**3)
     if storage_max and view["bytes_used_max"] is not None:
-        view["data_storage_used_pct"] = round(
-            100 * view["bytes_used_max"] / (storage_max * _STORAGE_UNIT.get(unit, 1024**3)), 1
-        )
+        view["data_storage_used_pct"] = round(100 * view["bytes_used_max"] / (storage_max * scale), 1)
+    if storage_max and view["bytes_used_p95"] is not None:
+        view["data_storage_p95_pct"] = round(100 * view["bytes_used_p95"] / (storage_max * scale), 1)
     if ecpu_max and view["ecpu_per_second_peak"] is not None:
         view["ecpu_used_pct"] = round(100 * view["ecpu_per_second_peak"] / ecpu_max, 1)
+    if ecpu_max and view["ecpu_per_second_p95"] is not None:
+        view["ecpu_p95_pct"] = round(100 * view["ecpu_per_second_p95"] / ecpu_max, 1)
     return view
+
+
+def _ecpu_round(value: float) -> int:
+    """Round an ECPU/s figure up to the next ECPU_STEP so the recommendation is a settable number."""
+    return int(-(-value // ECPU_STEP) * ECPU_STEP)
 
 
 def _serverless_limit_findings(
@@ -3420,24 +3631,123 @@ def _serverless_limit_findings(
         return []
     view = _limits_view(limits, summary, period_seconds)
     out: list[dict] = []
-    pct = view.get("data_storage_used_pct")
-    if pct is not None and pct > 80:
-        out.append(
-            finding(
-                "critical" if pct > 90 else "warning",
-                f"BytesUsedForCache peaked at {pct:.0f}% of the DataStorage maximum ({view['data_storage_max']} {view['data_storage_unit']}); writes are rejected at the limit",
-                resource=resource,
+    unit = view["data_storage_unit"]
+    scale = _STORAGE_UNIT.get(unit, 1024**3)
+    target = SERVERLESS_TARGET_PCT / 100
+    tight = SERVERLESS_P95_TIGHT_PCT
+    near = SERVERLESS_NEAR_LIMIT_PCT
+
+    # storage ------------------------------------------------------------------------------------------
+    pct, p95_pct, smax = view.get("data_storage_used_pct"), view.get("data_storage_p95_pct"), view["data_storage_max"]
+    if pct is not None and smax:
+        p95_gb = view["bytes_used_p95"] / scale
+        peak_gb = view["bytes_used_max"] / scale
+        if pct > near:
+            want = max(1, math.ceil(peak_gb / (tight / 100)))
+            out.append(
+                finding(
+                    "critical" if pct > 90 else "warning",
+                    f"BytesUsedForCache peaked at {pct:.0f}% of the DataStorage maximum ({smax} {unit}); "
+                    f"writes are rejected at the limit. Observed p95 {p95_gb:.2f} {unit}; "
+                    f"raise the maximum to about {want} {unit}",
+                    resource=resource,
+                    category="serverless-limits",
+                    recommendation={"data_storage_max": want, "unit": unit, "observed_p95": round(p95_gb, 3)},
+                )
             )
-        )
-    pct = view.get("ecpu_used_pct")
-    if pct is not None and pct > 80:
-        out.append(
-            finding(
-                "critical" if pct >= 100 else "warning",
-                f"ElastiCacheProcessingUnits peaked at {pct:.0f}% of the ECPUPerSecond maximum ({view['ecpu_per_second_max']}); requests are throttled at the limit",
-                resource=resource,
+        elif p95_pct is not None and p95_pct >= tight:
+            want = max(1, math.ceil(p95_gb / target))
+            out.append(
+                finding(
+                    "warning",
+                    f"DataStorage maximum ({smax} {unit}) is tight: observed p95 {p95_gb:.2f} {unit} is "
+                    f"{p95_pct:.0f}% of it; raise the maximum to about {want} {unit} for headroom",
+                    resource=resource,
+                    category="serverless-limits",
+                    recommendation={"data_storage_max": want, "unit": unit, "observed_p95": round(p95_gb, 3)},
+                )
             )
-        )
+        smin = view["data_storage_min"]
+        if smin and peak_gb < smin:
+            out.append(
+                finding(
+                    "info",
+                    f"DataStorage minimum is {smin} {unit} but usage peaked at {peak_gb:.2f} {unit} "
+                    f"(p95 {p95_gb:.2f}): the minimum is set but unused, you pay for it; lower or remove it",
+                    resource=resource,
+                    category="serverless-limits",
+                    recommendation={"data_storage_min": 0, "unit": unit, "observed_p95": round(p95_gb, 3)},
+                )
+            )
+
+    # ECPU ---------------------------------------------------------------------------------------------
+    pct, p95_pct, emax = view.get("ecpu_used_pct"), view.get("ecpu_p95_pct"), view["ecpu_per_second_max"]
+    if pct is not None and emax:
+        peak, p95 = view["ecpu_per_second_peak"], view["ecpu_per_second_p95"]
+        p95_text = f"{p95:.0f}" if p95 is not None else "n/a"
+        if pct > near:
+            want = _ecpu_round(peak / (tight / 100))
+            out.append(
+                finding(
+                    "critical" if pct >= 100 else "warning",
+                    f"ElastiCacheProcessingUnits peaked at {pct:.0f}% of the ECPUPerSecond maximum ({emax}); "
+                    f"requests are throttled at the limit. Observed p95 {p95_text} ECPU/s; "
+                    f"raise the maximum to about {want}",
+                    resource=resource,
+                    category="serverless-limits",
+                    recommendation={"ecpu_per_second_max": want, "observed_p95": round(p95, 1) if p95 else None},
+                )
+            )
+        elif p95_pct is not None and p95_pct >= tight:
+            want = _ecpu_round(p95 / target)
+            out.append(
+                finding(
+                    "warning",
+                    f"ECPUPerSecond maximum ({emax}) is tight: observed p95 {p95:.0f} ECPU/s is {p95_pct:.0f}% of "
+                    f"it; raise the maximum to about {want} for headroom",
+                    resource=resource,
+                    category="serverless-limits",
+                    recommendation={"ecpu_per_second_max": want, "observed_p95": round(p95, 1)},
+                )
+            )
+        elif pct < SERVERLESS_OVERSIZED_PCT:
+            want = max(ECPU_STEP, _ecpu_round(peak * 3))
+            if want < emax:
+                out.append(
+                    finding(
+                        "info",
+                        f"ECPUPerSecond maximum ({emax}) is over-provisioned: usage peaked at {peak:.0f} ECPU/s "
+                        f"({pct:.1f}%), p95 {p95_text}; a maximum of about {want} still leaves 3x headroom",
+                        resource=resource,
+                        category="serverless-limits",
+                        recommendation={"ecpu_per_second_max": want, "observed_p95": round(p95, 1) if p95 else None},
+                    )
+                )
+        emin = view["ecpu_per_second_min"]
+        if emin and peak < emin:
+            out.append(
+                finding(
+                    "info",
+                    f"ECPUPerSecond minimum is {emin} but usage peaked at {peak:.0f} ECPU/s (p95 {p95_text}): "
+                    "the minimum is set but unused, you pay for it; lower or remove it",
+                    resource=resource,
+                    category="serverless-limits",
+                    recommendation={"ecpu_per_second_min": 0, "observed_p95": round(p95, 1) if p95 else None},
+                )
+            )
+        throttled = (summary.get("ThrottledCmds") or {}).get("sum") or 0
+        if throttled > 0 and pct <= near:
+            out.append(
+                finding(
+                    "warning",
+                    f"{throttled:.0f} ThrottledCmds while ECPU peaked at only {pct:.0f}% of the maximum ({emax}, "
+                    f"p95 {p95_text} ECPU/s): throttling is not the ECPU cap; look for a hot slot or bursts "
+                    "shorter than the metric period",
+                    resource=resource,
+                    category="serverless-limits",
+                    recommendation={"ecpu_per_second_max": _ecpu_round(max(emax, peak / target))},
+                )
+            )
     return out
 
 
@@ -4119,4 +4429,301 @@ def _audit_report(findings: list[dict], rows: list[dict], notes: list[str], top:
     if partial or notes:
         out["partial"] = True
         out["notes"] = notes
+    return out
+
+
+# ------------------------------------------------------------------ shard balance
+
+
+def _shard_layout(g: dict) -> list[dict]:
+    """Shards of a replication group as shard/members dicts, the primary first in each member list."""
+    out = []
+    for ng in g.get("NodeGroups", []):
+        found = [(m.get("CacheClusterId"), m.get("CurrentRole")) for m in ng.get("NodeGroupMembers", [])]
+        ids = [str(cid) for cid, _ in found if cid]
+        primary = next((str(cid) for cid, role in found if cid and role == "primary"), None)
+        ordered = ([primary] if primary else []) + [cid for cid in ids if cid != primary]
+        out.append({"shard": str(ng.get("NodeGroupId", "")), "members": ordered, "has_primary": primary is not None})
+    return out
+
+
+def _shard_stats(shard: dict, summary: dict[str, dict[str, dict]]) -> dict:
+    """One shard's signals, read from its primary (the first member); replicas add the read-side CPU peak."""
+    members = shard["members"]
+    primary = members[0] if members else None
+
+    def pick(member: str | None, name: str, key: str) -> float | None:
+        s = (summary.get(member or "") or {}).get(name) or {}
+        return s.get(key) if s.get("points") else None
+
+    replica_cpu = [pick(m, "EngineCPUUtilization", "max") for m in members[1:]]
+    return {
+        "shard": shard["shard"],
+        "primary": primary if shard["has_primary"] else None,
+        "members": members,
+        "cpu_avg": pick(primary, "EngineCPUUtilization", "avg"),
+        "cpu_p95": pick(primary, "EngineCPUUtilization", "p95"),
+        "cpu_max": pick(primary, "EngineCPUUtilization", "max"),
+        "memory_avg": pick(primary, "DatabaseMemoryUsagePercentage", "avg"),
+        "memory_max": pick(primary, "DatabaseMemoryUsagePercentage", "max"),
+        "network_in_avg_bytes": pick(primary, "NetworkBytesIn", "avg"),
+        "network_out_avg_bytes": pick(primary, "NetworkBytesOut", "avg"),
+        "curr_items": pick(primary, "CurrItems", "latest"),
+        "replica_cpu_max": max((v for v in replica_cpu if v is not None), default=None),
+    }
+
+
+def _shard_balance_findings(stats: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    label = {x["shard"]: x["primary"] or (x["members"][0] if x["members"] else "?") for x in stats}
+    if len(stats) < 2:
+        out.append(
+            finding(
+                "info",
+                "single-shard group: skew between shards cannot be assessed; for a hot key on one primary use "
+                "node_clients, node_commandstats and node_keyspace_sample",
+                category="shard-balance",
+            )
+        )
+        return out
+    for x in stats:
+        if x["cpu_avg"] is None and x["memory_avg"] is None:
+            out.append(finding("info", f"shard {x['shard']}: no datapoints returned for {label[x['shard']]}"))
+    cpu = [x for x in stats if x["cpu_avg"] is not None]
+    pinned: str | None = None
+    if len(cpu) >= 2:
+        median = _median([x["cpu_avg"] for x in cpu])
+        hottest = max(cpu, key=lambda x: x["cpu_avg"])
+        others = [x["cpu_avg"] for x in cpu if x is not hottest]
+        if hottest["cpu_avg"] >= SHARD_PINNED_CPU and all(v < SHARD_IDLE_CPU for v in others):
+            pinned = hottest["shard"]
+            out.append(
+                finding(
+                    "critical",
+                    f"shard {pinned} primary {label[pinned]} is pinned at {hottest['cpu_avg']:.0f}% "
+                    f"EngineCPUUtilization (p95 {hottest['cpu_p95']:.0f}%) while the other {len(others)} shard(s) "
+                    f"stay under {max(others):.0f}%: the hot-key signature (one key or hash slot), not a capacity "
+                    "problem, so more shards will not help. Find the key with node_clients, node_commandstats and "
+                    "node_keyspace_sample, then split it or cache it in the client",
+                    category="hot-key",
+                    shard=pinned,
+                )
+            )
+        hot = [x for x in cpu if x["cpu_avg"] > SHARD_HOT_RATIO * median and x["cpu_avg"] > SHARD_HOT_CPU]
+        for x in sorted(hot, key=lambda x: -x["cpu_avg"])[:MAX_HOT_SHARD_FINDINGS]:
+            if x["shard"] == pinned:
+                continue
+            ratio = f"{x['cpu_avg'] / median:.1f}x" if median > 0 else "far above"
+            out.append(
+                finding(
+                    "warning",
+                    f"hot shard {x['shard']} ({label[x['shard']]}): EngineCPUUtilization avg {x['cpu_avg']:.0f}% is "
+                    f"{ratio} the median shard ({median:.0f}%) and above {SHARD_HOT_CPU:.0f}%",
+                    category="hot-shard",
+                    shard=x["shard"],
+                )
+            )
+    memory = [x for x in stats if x["memory_avg"] is not None]
+    if len(memory) >= 2:
+        median = _median([x["memory_avg"] for x in memory])
+        for x in sorted(memory, key=lambda x: -x["memory_avg"]):
+            value = x["memory_avg"]
+            if value >= SHARD_MEMORY_RATIO * median and value - median >= SHARD_MEMORY_POINTS:
+                out.append(
+                    finding(
+                        "critical" if value >= 90 else "warning",
+                        f"memory skew: shard {x['shard']} ({label[x['shard']]}) uses {value:.0f}% against a median "
+                        f"of {median:.0f}%: uneven key distribution (large keys or hash tags); rebalance slots or "
+                        "review the key design before this shard starts evicting",
+                        category="memory-skew",
+                        shard=x["shard"],
+                    )
+                )
+    items = [x for x in stats if x["curr_items"] is not None]
+    if len(items) >= 2:
+        median = _median([x["curr_items"] for x in items])
+        for x in items:
+            if median > 0 and x["curr_items"] > SHARD_ITEMS_RATIO * median:
+                out.append(
+                    finding(
+                        "info",
+                        f"shard {x['shard']} holds {x['curr_items']:.0f} items, {x['curr_items'] / median:.1f}x the "
+                        f"median shard ({median:.0f}): uneven key counts per shard",
+                        category="item-skew",
+                        shard=x["shard"],
+                    )
+                )
+    traffic = [
+        (x, (x["network_in_avg_bytes"] or 0) + (x["network_out_avg_bytes"] or 0))
+        for x in stats
+        if x["network_in_avg_bytes"] is not None or x["network_out_avg_bytes"] is not None
+    ]
+    if len(traffic) >= 2:
+        median = _median([t for _, t in traffic])
+        for x, total in traffic:
+            if median > 0 and total > SHARD_TRAFFIC_RATIO * median:
+                out.append(
+                    finding(
+                        "info",
+                        f"shard {x['shard']} moves {total / median:.1f}x the median shard's network bytes: "
+                        "traffic is concentrated on one shard",
+                        category="traffic-skew",
+                        shard=x["shard"],
+                    )
+                )
+    return out
+
+
+# ------------------------------------------------------------------ failover correlation
+
+
+def _as_utc(value: Any) -> dt.datetime | None:
+    if isinstance(value, str):
+        try:
+            value = dt.datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if not isinstance(value, dt.datetime):
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=dt.UTC)
+
+
+def _series_points(series: dict[str, dict[str, dict]], metric: str) -> dict[dt.datetime, list[float]]:
+    """Datapoints of one metric across every member, grouped by timestamp."""
+    out: dict[dt.datetime, list[float]] = defaultdict(list)
+    for per_member in series.values():
+        data = per_member.get(metric) or {}
+        for ts, value in zip(data.get("timestamps", []), data.get("values", []), strict=False):
+            when = _as_utc(ts)
+            if when is not None and isinstance(value, (int, float)):
+                out[when].append(float(value))
+    return out
+
+
+def _failover_findings(
+    events: list[dict],
+    now: dt.datetime,
+    series: dict[str, dict[str, dict]],
+    resource: str,
+    metric_hours: int,
+) -> list[dict]:
+    """Recent failover/maintenance events (last 24h) lined up against ReplicationLag and CurrConnections."""
+    horizon = now - dt.timedelta(hours=CORRELATION_HOURS)
+    recent: list[tuple[dt.datetime, dict]] = []
+    for e in events:
+        when = _as_utc(e.get("Date"))
+        if when is None or when < horizon or when > now + dt.timedelta(minutes=5):
+            continue
+        if _FAILOVER_EVENT.search(str(e.get("Message", ""))):
+            recent.append((when, e))
+    recent.sort(key=lambda t: t[0], reverse=True)
+    lag = _series_points(series, "ReplicationLag")
+    conns = _series_points(series, "CurrConnections")
+    covered_from = now - dt.timedelta(hours=metric_hours)
+    after = dt.timedelta(minutes=CORRELATION_MINUTES)
+    out: list[dict] = []
+    for when, e in recent[:MAX_CORRELATED_EVENTS]:
+        age_min = max(0.0, (now - when).total_seconds() / 60)
+        stamp = when.isoformat()
+        parts: list[str] = []
+        lag_peak = max(
+            ((max(v), t) for t, v in lag.items() if when <= t <= when + after and max(v) >= CORRELATION_LAG_SECONDS),
+            default=None,
+        )
+        if lag_peak:
+            parts.append(
+                f"ReplicationLag peaked at {lag_peak[0]:.1f}s {(lag_peak[1] - when).total_seconds() / 60:.0f} min "
+                "after the event"
+            )
+        before = [sum(v) for t, v in conns.items() if when - after <= t < when]
+        later = [(sum(v), t) for t, v in conns.items() if when <= t <= when + after]
+        if before and later:
+            baseline = sum(before) / len(before)
+            trough = min(later, key=lambda x: x[0])
+            if baseline > 0 and trough[0] <= baseline * (1 - CORRELATION_CONN_DROP):
+                parts.append(
+                    f"CurrConnections dropped {100 * (1 - trough[0] / baseline):.0f}% (from about {baseline:.0f} to "
+                    f"{trough[0]:.0f}) {(trough[1] - when).total_seconds() / 60:.0f} min after the event: "
+                    "clients lost their connections and had to reconnect"
+                )
+        if parts:
+            impact = "; ".join(parts)
+        elif when < covered_from:
+            impact = f"the event predates the {metric_hours}h metric window, so impact cannot be checked here"
+        else:
+            impact = "no ReplicationLag or CurrConnections impact visible in the metrics"
+        recent_window = age_min <= metric_hours * 60
+        out.append(
+            finding(
+                "warning" if recent_window else "info",
+                f"recent failover/maintenance: '{str(e.get('Message', '')).strip()}' at {stamp} "
+                f"({age_min:.0f} min ago): {impact}",
+                resource=e.get("SourceIdentifier") or resource,
+                section="events",
+                category="failover-correlation",
+                event_time=stamp,
+            )
+        )
+    return out
+
+
+# ------------------------------------------------------------------ risky parameters
+
+
+def _risky_parameter_findings(values: dict[str, str], defaults: dict[str, str], group: str) -> list[dict]:
+    """Settings that hurt in production, judged on the values returned (and the engine default when known)."""
+    out: list[dict] = []
+
+    def add(severity: str, message: str, name: str) -> None:
+        out.append(finding(severity, message, resource=group, category="parameter-risk", parameter=name))
+
+    if values.get("maxmemory-policy") == "noeviction":
+        add(
+            "warning",
+            "maxmemory-policy is noeviction: once memory is full every write fails with an OOM error; use "
+            "volatile-lru or allkeys-lru for a cache, or size memory for the full dataset",
+            "maxmemory-policy",
+        )
+    for name, raw in sorted(values.items()):
+        if name.startswith("client-output-buffer-limit-") and name.endswith(("hard-limit", "soft-limit")):
+            try:
+                size = int(raw)
+            except ValueError:
+                continue
+            if 0 < size < TINY_BUFFER_BYTES:
+                add(
+                    "warning",
+                    f"{name} is {size} bytes (under 1 MiB): clients that read slowly (replicas, pub/sub, big "
+                    "replies) are disconnected; raise it or return it to the default"
+                    + (f" ({defaults[name]})" if name in defaults else ""),
+                    name,
+                )
+    if values.get("timeout") == "0":
+        add(
+            "info",
+            "timeout is 0: idle client connections are never closed and can pile up against maxclients; "
+            "set it (for example 300) if clients leak connections",
+            "timeout",
+        )
+    samples = values.get("maxmemory-samples")
+    if samples is not None:
+        try:
+            current = float(samples)
+        except ValueError:
+            current = None
+        default = None
+        if "maxmemory-samples" in defaults:
+            try:
+                default = float(defaults["maxmemory-samples"])
+            except ValueError:
+                default = None
+        floor = default if default is not None else RISKY_MAXMEMORY_SAMPLES_FLOOR
+        if current is not None and current < floor:
+            add(
+                "warning",
+                f"maxmemory-samples is {samples}, below "
+                f"{'the engine default' if default is not None else 'the usual minimum'} ({floor:g}): "
+                "eviction picks worse victims and hit rate drops",
+                "maxmemory-samples",
+            )
     return out
