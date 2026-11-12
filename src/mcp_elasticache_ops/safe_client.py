@@ -14,13 +14,16 @@ import redis
 from redis.client import Pipeline
 
 # Commands that carry a subcommand we must inspect.
-_CONTAINERS = {"CLIENT", "CLUSTER", "COMMAND", "CONFIG", "LATENCY", "MEMORY", "OBJECT", "SLOWLOG"}
+_CONTAINERS = {"ACL", "CLIENT", "CLUSTER", "COMMAND", "CONFIG", "LATENCY", "MEMORY", "OBJECT", "SLOWLOG"}
 
 READ_ONLY_COMMANDS: frozenset[str] = frozenset(
     {
         # server / introspection
         "PING",
         "INFO",
+        # ACL visibility without password hashes: ACL LIST/GETUSER stay refused
+        "ACL LOG",
+        "ACL WHOAMI",
         "ROLE",
         "DBSIZE",
         "TIME",
@@ -175,6 +178,79 @@ def _check_config_get(patterns: tuple) -> None:
         raise ReadOnlyViolation(f"CONFIG GET {pat!r} is not in the allowed parameter list")
 
 
+_CLIENT_LIST_TYPES = frozenset({"NORMAL", "MASTER", "REPLICA", "SLAVE", "PUBSUB"})
+_SCAN_OPTIONS = frozenset({"MATCH", "COUNT", "TYPE"})
+
+
+def _int_arg(value: object, what: str) -> int:
+    """A non-negative integer given as int, or as digits in str/bytes (never bool)."""
+    if isinstance(value, bool):
+        raise ReadOnlyViolation(f"{what} must be an integer")
+    if isinstance(value, int):
+        number = value
+    else:
+        text = _text(value, what)
+        if not text.isascii() or not text.isdigit():
+            raise ReadOnlyViolation(f"{what} must be a non-negative integer, got {text!r}")
+        number = int(text)
+    if number < 0:
+        raise ReadOnlyViolation(f"{what} must be a non-negative integer")
+    return number
+
+
+def _check_acl_log(rest: tuple) -> None:
+    # ACL LOG [count]; the only other form is ACL LOG RESET, which clears server state.
+    if len(rest) > 1:
+        raise ReadOnlyViolation("ACL LOG accepts at most a count")
+    if rest:
+        _int_arg(rest[0], "ACL LOG count")
+
+
+def _check_memory_usage(rest: tuple) -> None:
+    if len(rest) not in (0, 1, 3):
+        raise ReadOnlyViolation("MEMORY USAGE takes a key and an optional SAMPLES count")
+    if len(rest) == 3:
+        if _text(rest[1], "MEMORY USAGE option").upper() != "SAMPLES":
+            raise ReadOnlyViolation("MEMORY USAGE only supports the SAMPLES option")
+        _int_arg(rest[2], "MEMORY USAGE SAMPLES")
+
+
+def _check_scan(rest: tuple) -> None:
+    if not rest:
+        return
+    _int_arg(rest[0], "SCAN cursor")
+    options = rest[1:]
+    if len(options) % 2:
+        raise ReadOnlyViolation("SCAN options come in name/value pairs")
+    for opt, value in zip(options[0::2], options[1::2], strict=True):
+        name = _text(opt, "SCAN option").upper()
+        if name not in _SCAN_OPTIONS:
+            raise ReadOnlyViolation(f"SCAN option {name!r} is not allowed")
+        if name == "COUNT":
+            _int_arg(value, "SCAN COUNT")
+        else:  # MATCH takes a glob and TYPE a type name; both are server-side filters only
+            _text(value, f"SCAN {name} value")
+
+
+def _check_client_list(rest: tuple) -> None:
+    if not rest:
+        return
+    option = _text(rest[0], "CLIENT LIST option").upper()
+    if option == "TYPE" and len(rest) == 2:
+        if _text(rest[1], "CLIENT LIST TYPE").upper() not in _CLIENT_LIST_TYPES:
+            raise ReadOnlyViolation("CLIENT LIST TYPE must be normal, master, replica or pubsub")
+    elif option == "ID" and len(rest) >= 2:
+        for client_id in rest[1:]:
+            _int_arg(client_id, "CLIENT LIST ID")
+    else:
+        raise ReadOnlyViolation("CLIENT LIST only accepts TYPE <type> or ID <id> [id ...]")
+
+
+def _check_single_key(key: str, rest: tuple) -> None:
+    if len(rest) > 1:
+        raise ReadOnlyViolation(f"{key} takes a single key")
+
+
 def check(args: tuple) -> None:
     name, sub, rest = _split(args)
     key = f"{name} {sub}".strip()
@@ -182,6 +258,18 @@ def check(args: tuple) -> None:
         raise ReadOnlyViolation(f"command {key!r} is not in the read-only allowlist")
     if key == "CONFIG GET":
         _check_config_get(rest)
+    elif key == "ACL LOG":
+        _check_acl_log(rest)
+    elif key == "ACL WHOAMI" and rest:
+        raise ReadOnlyViolation("ACL WHOAMI takes no arguments")
+    elif key == "MEMORY USAGE":
+        _check_memory_usage(rest)
+    elif key == "SCAN":
+        _check_scan(rest)
+    elif key == "CLIENT LIST":
+        _check_client_list(rest)
+    elif key.startswith("OBJECT "):
+        _check_single_key(key, rest)
 
 
 # Commands redis-py itself sends while (re)connecting; they only touch connection state.
@@ -196,7 +284,8 @@ FORBIDDEN_COMMANDS: frozenset[str] = frozenset(
         "FLUSHALL", "FLUSHDB", "KEYS", "CONFIG SET", "CONFIG REWRITE", "CONFIG RESETSTAT", "CLIENT KILL",
         "CLIENT PAUSE", "CLIENT UNPAUSE", "CLIENT REPLY", "CLIENT TRACKING", "DEBUG", "EVAL", "EVALSHA",
         "FCALL", "SCRIPT", "SCRIPT LOAD", "SCRIPT FLUSH", "FUNCTION", "ACL", "ACL LIST", "ACL GETUSER",
-        "ACL SETUSER", "MONITOR", "SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE", "PUBLISH", "XREAD", "XREADGROUP",
+        "ACL SETUSER", "ACL DELUSER", "ACL LOG RESET", "MONITOR", "SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE",
+                "PUBLISH", "XREAD", "XREADGROUP",
         "XRANGE", "MULTI", "EXEC", "WATCH", "SHUTDOWN", "SLAVEOF", "REPLICAOF", "FAILOVER", "SAVE", "BGSAVE",
         "BGREWRITEAOF", "SLOWLOG RESET", "CLUSTER FAILOVER", "CLUSTER RESET", "MIGRATE", "RESTORE", "DUMP",
         "MODULE LOAD", "SYNC", "PSYNC", "SORT", "OBJECT HELP", "MEMORY PURGE", "LATENCY RESET", "AUTH", "HELLO",

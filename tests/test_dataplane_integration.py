@@ -1,7 +1,10 @@
+import os
+
 import pytest
+import redis
 
 from mcp_elasticache_ops import dataplane
-from mcp_elasticache_ops.safe_client import ReadOnlyViolation
+from mcp_elasticache_ops.safe_client import ReadOnlyViolation, SafeRedis
 
 pytestmark = pytest.mark.integration
 
@@ -85,3 +88,61 @@ def test_guard_holds_on_live_server(safe):
         safe.set("small:0", "changed")
     with pytest.raises(ReadOnlyViolation):
         safe.get("small:0")
+
+
+# ---------------------------------------------------------------- cluster (3-primary compose stack)
+
+CLUSTER_HOST = os.getenv("CLUSTER_TEST_HOST")
+CLUSTER_PORT = int(os.getenv("CLUSTER_TEST_PORT", "7001"))
+needs_cluster = pytest.mark.skipif(not CLUSTER_HOST, reason="CLUSTER_TEST_HOST not set")
+
+
+@pytest.fixture()
+def cluster_factory():
+    def factory(host, port):
+        return SafeRedis(host=host, port=port, decode_responses=True, socket_timeout=5, socket_connect_timeout=5)
+
+    return factory
+
+
+@pytest.fixture()
+def cluster_seed(cluster_factory):
+    seed = cluster_factory(CLUSTER_HOST, CLUSTER_PORT)
+    yield seed
+    seed.close()
+
+
+@needs_cluster
+def test_cluster_nodes_integration(cluster_seed):
+    out = dataplane.cluster_nodes(cluster_seed)
+    assert out["cluster_enabled"] is True
+    assert out["slots_covered"] == 16384
+    assert len(out["shards"]) == 3
+    assert not out["findings"]
+
+
+@needs_cluster
+def test_cluster_fan_out_integration(cluster_seed, cluster_factory):
+    raw = redis.RedisCluster(host=CLUSTER_HOST, port=CLUSTER_PORT)  # test-only writer; product code never writes
+    for i in range(300):
+        raw.set(f"fan:{i}", "x" * (i + 1))
+    raw.close()
+    ks = dataplane.cluster_keyspace_sample(cluster_seed, cluster_factory, sample_size=3000, top=5, max_seconds=10)
+    assert ks["shards_total"] == 3 and ks["shards_ok"] == 3 and ks["partial"] is False
+    assert ks["sampled_keys"] == ks["dbsize"] >= 300
+    assert len({k["shard"] for k in ks["big_keys_by_bytes"]} | set(ks["per_shard"])) == 3
+    assert all("shard" in k for k in ks["big_keys_by_bytes"])
+    mem = dataplane.cluster_memory(cluster_seed, cluster_factory)
+    assert mem["shards_ok"] == 3
+    slow = dataplane.cluster_slowlog(cluster_seed, cluster_factory, count=5)
+    assert slow["shards_ok"] == 3
+    rep = dataplane.replication(cluster_seed, cluster_factory)
+    assert rep["role"] == "master"
+
+
+@needs_cluster
+def test_cluster_acl_log_integration(cluster_seed):
+    out = dataplane.acl_log(cluster_seed, 5)
+    assert out["whoami"] == "default"
+    with pytest.raises(ReadOnlyViolation):
+        cluster_seed.execute_command("ACL", "LOG", "RESET")

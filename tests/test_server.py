@@ -31,7 +31,7 @@ async def test_all_tools_read_only():
     async with Client(server.mcp) as c:
         tools = await c.list_tools()
     names = {t.name for t in tools}
-    assert len(tools) == 29
+    assert len(tools) == 34
     assert {
         "node_health",
         "node_info",
@@ -63,6 +63,13 @@ async def test_all_tools_read_only():
         "aws_subnet_groups",
     } <= names
     assert {"node_config", "aws_triage", "aws_parameter_drift"} <= names  # round 02
+    assert {
+        "node_cluster_keyspace_sample",
+        "node_cluster_slowlog",
+        "node_cluster_memory",
+        "node_acl_log",
+        "aws_cluster_overview",
+    } <= names  # round 03
     for t in tools:
         assert t.annotations.read_only_hint is True, t.name
         assert t.annotations.destructive_hint is False, t.name

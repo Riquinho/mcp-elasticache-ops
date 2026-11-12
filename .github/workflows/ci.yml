@@ -24,8 +24,12 @@ jobs:
         shell: bash
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      - name: Build smoke test
-        run: uv build
+      - name: Build wheel and smoke test it in an isolated interpreter
+        shell: bash
+        run: |
+          uv build
+          uv run --no-project --isolated --with dist/*.whl python -I -c 'import mcp_elasticache_ops'
+          uv run --no-project --isolated --with dist/*.whl python -I -m mcp_elasticache_ops --help
 
   test:
     runs-on: ubuntu-latest
@@ -55,3 +59,24 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: uv sync --locked
       - run: uv run pytest -q --cov=mcp_elasticache_ops --cov-fail-under=90
+
+  cluster:
+    runs-on: ubuntu-latest
+    env:
+      COMPOSE: docker compose -f tests/docker-compose.cluster.yml
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked
+      - name: Start 3-node valkey cluster
+        run: $COMPOSE up -d --wait --wait-timeout 90
+      - name: Cluster integration tests
+        env:
+          CLUSTER_TEST_HOST: 127.0.0.1
+          CLUSTER_TEST_PORT: "7001"
+        run: uv run pytest -q -m integration tests/test_dataplane_integration.py -k cluster
+      - name: Tear down
+        if: always()
+        run: $COMPOSE down -v --remove-orphans

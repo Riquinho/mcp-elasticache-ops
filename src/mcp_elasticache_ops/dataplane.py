@@ -11,6 +11,7 @@ reported as ``unavailable`` instead of failing the whole tool.
 
 from __future__ import annotations
 
+import math
 import re
 import statistics
 import time
@@ -67,6 +68,41 @@ def engine_of(info_server: dict) -> dict:
     if info_server.get("server_name") == "valkey" or "valkey_version" in info_server:
         return {"engine": "valkey", "version": str(info_server.get("valkey_version", ""))}
     return {"engine": "redis", "version": str(info_server.get("redis_version", ""))}
+
+
+# Oldest engine version that has each command (Valkey 7.2+ has all of them). A refusal on an older
+# engine is an expected quirk, so it is reported as a note that names the engine, never an error.
+MIN_ENGINE_VERSION: dict[str, tuple[int, ...]] = {
+    "CLUSTER SHARDS": (7, 0),
+    "ACL LOG": (6, 0),
+    "ACL WHOAMI": (6, 0),
+    "MEMORY DOCTOR": (4, 0),
+    "LATENCY LATEST": (2, 8, 13),
+}
+
+
+def version_tuple(version: Any) -> tuple[int, ...]:
+    """``"7.2.4"`` -> ``(7, 2, 4)``; parsing stops at the first non-numeric part, unknown -> ``()``."""
+    parts: list[int] = []
+    for token in str(version or "").split("."):
+        digits = re.match(r"\d+", token)
+        if not digits:
+            break
+        parts.append(int(digits.group()))
+    return tuple(parts)
+
+
+def command_support_note(command: str, info_server: dict | None, err: str | None) -> str:
+    """Explain a refused command, naming the engine version when it is simply too old."""
+    engine = engine_of(info_server or {})
+    version = version_tuple(engine["version"])
+    needed = MIN_ENGINE_VERSION.get(command)
+    if needed and version and version < needed:
+        return (
+            f"{command}: not supported by {engine['engine']} {engine['version']} "
+            f"(needs {'.'.join(map(str, needed))}+); skipped"
+        )
+    return f"{command}: unavailable ({err})"
 
 
 # --------------------------------------------------------------------------- INFO
@@ -625,25 +661,133 @@ def keyspace_sample(
 # ------------------------------------------------------------ replication/cluster
 
 
-def replication(r: redis.Redis) -> dict:
+REPL_LAG_BYTES_WARN = 1_000_000
+REPL_LAG_SECONDS_WARN = 10
+REPL_IO_SECONDS_WARN = 10
+REPLICA_SETTINGS = (
+    "replica-read-only",
+    "min-replicas-to-write",
+    "min-replicas-max-lag",
+    "cluster-allow-reads-when-down",
+)
+
+
+def _finding(severity: str, message: str, **extra: Any) -> dict:
+    return {"severity": severity, "message": message, **extra}
+
+
+def _primary_offset(
+    info: dict, client_factory: Callable[[str, int], redis.Redis] | None
+) -> tuple[int | None, str | None]:
+    """Replication offset of this replica's primary, read from the primary itself."""
+    host, port = info.get("master_host"), info.get("master_port")
+    if client_factory is None or not host or not port:
+        return None, None
+    client = None
+    try:
+        client = client_factory(str(host), int(port))
+        return int(_num(client.info("replication").get("master_repl_offset"))), None
+    except Exception as exc:
+        return None, f"primary {host}:{port} unreachable for offset comparison: {type(exc).__name__}: {exc}"
+    finally:
+        close = getattr(client, "close", None)
+        if close:
+            close()
+
+
+def replication(
+    r: redis.Redis,
+    client_factory: Callable[[str, int], redis.Redis] | None = None,
+    lag_bytes_threshold: int = REPL_LAG_BYTES_WARN,
+) -> dict:
+    """Replication state with findings: down links, lagging replicas, risky replica settings.
+
+    On a replica, ``client_factory`` (a ``SafeRedis`` builder) lets the offset be compared with the
+    primary's. Commands an older engine lacks become notes, never exceptions.
+    """
     info = r.info("replication")
     role, role_err = _try(r.execute_command, "ROLE")
+    server, _ = _try(r.info, "server")
+    findings: list[dict] = []
+    notes: list[str] = []
     replicas = []
     master_offset = int(_num(info.get("master_repl_offset")))
+    is_replica = info.get("role") == "slave"
     for k, v in info.items():
-        if k.startswith("slave") and isinstance(v, dict):
-            off = int(_num(v.get("offset")))
-            replicas.append({**v, "lag_bytes": master_offset - off})
+        if not (k.startswith("slave") and isinstance(v, dict)):
+            continue
+        row = {**v, "lag_bytes": master_offset - int(_num(v.get("offset")))}
+        replicas.append(row)
+        addr = f"{v.get('ip')}:{v.get('port')}"
+        if v.get("state") not in (None, "online"):
+            findings.append(_finding("critical", f"replica {addr} link is {v.get('state')}, not online", replica=addr))
+        if row["lag_bytes"] > lag_bytes_threshold:
+            findings.append(_finding("warning", f"replica {addr} is {row['lag_bytes']} bytes behind", replica=addr))
+        if _num(v.get("lag")) > REPL_LAG_SECONDS_WARN:
+            findings.append(_finding("warning", f"replica {addr} last acknowledged {v.get('lag')}s ago", replica=addr))
+    connected = int(_num(info.get("connected_slaves")))
+    if not is_replica and connected == 0:
+        findings.append(_finding("warning", "no replicas connected: there is no failover target and no read scaling"))
+    if is_replica:
+        if info.get("master_link_status") not in (None, "up"):
+            down = info.get("master_link_down_since_seconds")
+            findings.append(
+                _finding(
+                    "critical",
+                    f"replication link to the primary is {info.get('master_link_status')}"
+                    + (f" for {down}s" if down is not None else ""),
+                )
+            )
+        last_io = _num(info.get("master_last_io_seconds_ago"), default=-1)
+        if last_io > REPL_IO_SECONDS_WARN:
+            findings.append(_finding("warning", f"last I/O with the primary was {int(last_io)}s ago"))
+        if int(_num(info.get("master_sync_in_progress"))):
+            findings.append(_finding("info", "a full resync with the primary is in progress"))
+        own = int(_num(info.get("slave_repl_offset", info.get("master_repl_offset"))))
+        primary_offset, offset_err = _primary_offset(info, client_factory)
+        if offset_err:
+            notes.append(offset_err)
+        elif primary_offset is not None and primary_offset - own > lag_bytes_threshold:
+            findings.append(_finding("warning", f"this replica is {primary_offset - own} bytes behind the primary"))
+    settings: dict[str, str] = {}
+    refused = 0
+    for name in REPLICA_SETTINGS:
+        got, _ = _try(r.config_get, name)
+        if got is None:
+            refused += 1
+        elif name in got:
+            settings[name] = str(_s(got[name]))
+    if refused == len(REPLICA_SETTINGS):
+        notes.append(CONFIG_FALLBACK_NOTE)
+    if is_replica and settings.get("replica-read-only", "yes").lower() == "no":
+        findings.append(_finding("warning", "replica-read-only is no: writes to this replica diverge from the primary"))
+    min_write = int(_num(settings.get("min-replicas-to-write")))
+    if not is_replica and replicas and min_write == 0 and "min-replicas-to-write" in settings:
+        findings.append(_finding("info", "min-replicas-to-write is 0: writes are accepted with every replica gone"))
+    elif not is_replica and min_write > connected:
+        findings.append(
+            _finding("critical", f"min-replicas-to-write is {min_write} but only {connected} replicas are connected")
+        )
+    if settings.get("cluster-allow-reads-when-down", "").lower() == "yes":
+        findings.append(_finding("info", "cluster-allow-reads-when-down is yes: reads may be stale during an outage"))
+    if role is None and server:
+        notes.append(command_support_note("ROLE", server, role_err))
+    findings.sort(key=lambda f: _SEVERITY_RANK.get(f["severity"], 3))
     return {
         "role": info.get("role"),
         "connected_replicas": info.get("connected_slaves"),
         "replicas": replicas,
         "master_repl_offset": master_offset,
+        "slave_repl_offset": info.get("slave_repl_offset"),
         "master_link_status": info.get("master_link_status"),
         "master_last_io_seconds_ago": info.get("master_last_io_seconds_ago"),
         "master_sync_in_progress": info.get("master_sync_in_progress"),
         "repl_backlog_size": info.get("repl_backlog_size"),
         "role_command": _jsonable(role) if role is not None else {"unavailable": role_err},
+        "settings": settings,
+        "findings": findings,
+        **engine_of(server or {}),
+        **({"notes": notes} if notes else {}),
     }
 
 
@@ -667,6 +811,9 @@ def cluster(r: redis.Redis, serverless: bool = False) -> dict:
     elif isinstance(info, (bytes, str)):
         info = dict(line.split(":", 1) for line in _s(info).splitlines() if ":" in line)
     shards, shards_err = _try(r.execute_command, "CLUSTER", "SHARDS")
+    if shards is None:
+        server, _ = _try(r.info, "server")
+        notes.append(command_support_note("CLUSTER SHARDS", server, shards_err) + "; use node_cluster_nodes instead")
     slots, slots_err = _try(r.execute_command, "CLUSTER", "SLOTS")
     if slots is None:
         notes.append(_unsupported("CLUSTER SLOTS", slots_err, serverless))
@@ -874,3 +1021,428 @@ def _jsonable(v: Any) -> Any:
     if isinstance(v, (list, tuple)):
         return [_jsonable(x) for x in v]
     return v
+
+
+# ------------------------------------------------------------- cluster-wide fan-out
+
+ClientFactory = Callable[[str, int], redis.Redis]
+SKEW_RATIO = 1.5
+
+
+def _fan_out_primaries(
+    r: redis.Redis,
+    client_factory: ClientFactory,
+    work: Callable[[redis.Redis, float, int], dict],
+    max_workers: int,
+    total_seconds: float,
+    per_node_timeout: float,
+) -> tuple[dict, dict[str, dict]]:
+    """Run ``work(client, shard_budget_seconds, shard_count)`` on every shard primary.
+
+    Returns ``(topology, outcomes)``; ``outcomes`` maps ``host:port`` to ``{"status": "ok", "data": ...}``
+    or ``{"status": "unreachable", "error": ...}``. The wall-clock budget is split across the waves of
+    primaries the worker pool needs (``ceil(primaries / workers)``), so the sum of all shard budgets stays
+    within ``total_seconds``; a shard that hangs is abandoned ``per_node_timeout`` seconds after that,
+    and a dead shard never fails the call. Clients come from ``client_factory`` (``SafeRedis`` only).
+    """
+    topo = cluster_nodes(r)
+    if not topo.get("cluster_enabled") or "nodes" not in topo:
+        return topo, {}
+    primaries = [n for n in topo["nodes"] if n["role"] == "primary" and n["port"]]
+    workers = max(1, min(int(max_workers), 32, len(primaries) or 1))
+    shard_budget = total_seconds / math.ceil(len(primaries) / workers) if primaries else total_seconds
+    hard_deadline = time.monotonic() + total_seconds + per_node_timeout
+    outcomes: dict[str, dict] = {}
+
+    def run(node: dict) -> dict:
+        client = client_factory(node.get("hostname") or node["ip"], node["port"])
+        try:
+            return work(client, shard_budget, len(primaries))
+        finally:
+            close = getattr(client, "close", None)
+            if close:
+                close()
+
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {}
+        for node in sorted(primaries, key=_endpoint):
+            ep = _endpoint(node)
+            if node["failing"]:
+                outcomes[ep] = {"status": "unreachable", "error": "flagged as failing in CLUSTER NODES; not contacted"}
+            else:
+                futures[ep] = pool.submit(run, node)
+        for ep, fut in futures.items():
+            try:
+                outcomes[ep] = {"status": "ok", "data": fut.result(timeout=max(0.0, hard_deadline - time.monotonic()))}
+            except FutureTimeout:
+                outcomes[ep] = {"status": "unreachable", "error": "no answer within the time budget"}
+            except Exception as exc:  # one dead shard must not hide the others
+                outcomes[ep] = {"status": "unreachable", "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return topo, outcomes
+
+
+def _shard_counts(outcomes: dict[str, dict]) -> dict[str, int]:
+    return {
+        "shards_total": len(outcomes),
+        "shards_ok": sum(1 for o in outcomes.values() if o["status"] == "ok"),
+        "shards_partial": sum(1 for o in outcomes.values() if o["status"] == "partial"),
+        "shards_unreachable": sum(1 for o in outcomes.values() if o["status"] == "unreachable"),
+    }
+
+
+def _unreachable_findings(outcomes: dict[str, dict]) -> list[dict]:
+    return [
+        _finding("critical", f"shard {ep} unreachable: {o['error']}", shard=ep)
+        for ep, o in outcomes.items()
+        if o["status"] == "unreachable"
+    ]
+
+
+def _skew_findings(values: dict[str, float], label: str, ratio: float = SKEW_RATIO) -> list[dict]:
+    if len(values) < 2:
+        return []
+    mean = statistics.mean(values.values())
+    if mean <= 0:
+        return []
+    return [
+        _finding("warning", f"shard {ep} {label} is {v / mean:.1f}x the shard average (skew)", shard=ep)
+        for ep, v in values.items()
+        if v > mean * ratio
+    ]
+
+
+def _sorted_findings(findings: list[dict]) -> list[dict]:
+    return sorted(findings, key=lambda f: _SEVERITY_RANK.get(f["severity"], 3))
+
+
+def _labelled(rows: list[dict], shard: str) -> list[dict]:
+    return [{**row, "shard": shard} for row in rows]
+
+
+def cluster_keyspace_sample(
+    r: redis.Redis,
+    client_factory: ClientFactory,
+    sample_size: int = 1000,
+    match: str | None = None,
+    top: int = 20,
+    scan_count: int = 250,
+    pause_ms: int = 0,
+    max_seconds: float = DEFAULT_SAMPLE_SECONDS,
+    max_workers: int = 8,
+    per_node_timeout: float = 5.0,
+) -> dict:
+    """``keyspace_sample`` on every shard primary, merged with a ``shard`` label on each key.
+
+    ``sample_size`` and the ``max_seconds`` wall-clock budget are split across the primaries (the budget
+    by the waves of the worker pool), so the whole call returns within ``max_seconds`` plus at most
+    ``per_node_timeout`` for a stuck shard. Each shard reports ``ok``, ``partial`` (its own budget ran out)
+    or ``unreachable``; the merged top-N lists come from whatever the reachable shards returned.
+    """
+    started = time.monotonic()
+    max_seconds = max(0.01, min(float(max_seconds), MAX_SAMPLE_SECONDS))
+    top = max(1, int(top))
+
+    def work(client: redis.Redis, budget: float, shards: int) -> dict:
+        per_shard = max(1, math.ceil(max(1, min(int(sample_size), 100_000)) / shards))
+        return keyspace_sample(client, per_shard, match, top, scan_count, pause_ms, budget)
+
+    topo, outcomes = _fan_out_primaries(r, client_factory, work, max_workers, max_seconds, per_node_timeout)
+    if not outcomes:
+        if topo.get("cluster_enabled") is False:
+            single = keyspace_sample(r, sample_size, match, top, scan_count, pause_ms, max_seconds)
+            return {**single, "cluster_enabled": False, "note": "cluster mode disabled; sampled the single node"}
+        return topo
+    for o in outcomes.values():
+        if o["status"] == "ok" and o["data"]["partial"]:
+            o["status"] = "partial"
+    findings = _unreachable_findings(outcomes)
+    merged: dict[str, list[dict]] = defaultdict(list)
+    by_type: dict[str, dict[str, int]] = defaultdict(lambda: {"keys": 0, "bytes": 0})
+    per_shard: dict[str, dict] = {}
+    totals = {"sampled_keys": 0, "dbsize": 0, "keys_without_ttl": 0}
+    policy = ""
+    for ep, o in outcomes.items():
+        if o["status"] == "unreachable":
+            per_shard[ep] = o
+            continue
+        d = o["data"]
+        policy = policy or d["maxmemory_policy"]
+        for name in ("big_keys_by_bytes", "big_keys_by_length", "hot_keys_by_lfu", "coldest_keys_by_idle"):
+            merged[name] += _labelled(d.get(name, []), ep)
+        for t, v in d["by_type"].items():
+            by_type[t]["keys"] += v["keys"]
+            by_type[t]["bytes"] += v["bytes"]
+        for k in totals:
+            totals[k] += d[k]
+        per_shard[ep] = {
+            "status": o["status"],
+            "sampled_keys": d["sampled_keys"],
+            "dbsize": d["dbsize"],
+            "elapsed_seconds": d["elapsed_seconds"],
+            "complete_scan": d["complete_scan"],
+            **({"partial_reason": d["partial_reason"]} if d["partial"] else {}),
+        }
+        if d["partial"]:
+            findings.append(_finding("warning", f"shard {ep} sample is partial: {d['partial_reason']}", shard=ep))
+    findings += _skew_findings({ep: s["dbsize"] for ep, s in per_shard.items() if "dbsize" in s}, "key count")
+    if topo["findings"]:
+        findings += [_finding("warning", f) for f in topo["findings"]]
+    counts = _shard_counts(outcomes)
+    result: dict[str, Any] = {
+        "cluster_enabled": True,
+        "scope": "all shard primaries",
+        **counts,
+        "partial": counts["shards_total"] != counts["shards_ok"],
+        "max_seconds": max_seconds,
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "maxmemory_policy": policy,
+        **totals,
+        "by_type": dict(by_type),
+        "big_keys_by_bytes": sorted(merged["big_keys_by_bytes"], key=lambda x: x["bytes"] or 0, reverse=True)[:top],
+        "big_keys_by_length": sorted(merged["big_keys_by_length"], key=lambda x: x["length"] or 0, reverse=True)[:top],
+        "per_shard": per_shard,
+        "findings": _sorted_findings(findings),
+    }
+    if merged["hot_keys_by_lfu"]:
+        result["hot_keys_by_lfu"] = sorted(merged["hot_keys_by_lfu"], key=lambda x: x["lfu_freq"] or 0, reverse=True)[
+            :top
+        ]
+    elif merged["coldest_keys_by_idle"]:
+        result["coldest_keys_by_idle"] = sorted(
+            merged["coldest_keys_by_idle"], key=lambda x: x["idle_seconds"] or 0, reverse=True
+        )[:top]
+        result["hot_keys_note"] = "set maxmemory-policy to an *-lfu policy to rank hot keys (OBJECT FREQ)"
+    return result
+
+
+def cluster_slowlog(
+    r: redis.Redis,
+    client_factory: ClientFactory,
+    count: int = 25,
+    include_args: bool = False,
+    max_workers: int = 8,
+    per_node_timeout: float = 5.0,
+    max_seconds: float = 10.0,
+) -> dict:
+    """``slowlog`` on every shard primary: the slowest ``count`` entries overall, each labelled by shard."""
+    count = max(1, min(int(count), 1024))
+    started = time.monotonic()
+
+    def work(client: redis.Redis, budget: float, shards: int) -> dict:
+        return slowlog(client, count, include_args)
+
+    topo, outcomes = _fan_out_primaries(r, client_factory, work, max_workers, max_seconds, per_node_timeout)
+    if not outcomes:
+        if topo.get("cluster_enabled") is False:
+            return {**slowlog(r, count, include_args), "cluster_enabled": False, "note": "cluster mode disabled"}
+        return topo
+    findings = _unreachable_findings(outcomes)
+    entries: list[dict] = []
+    by_cmd: dict[str, dict[str, int]] = defaultdict(lambda: {"count": 0, "total_us": 0, "max_us": 0})
+    per_shard: dict[str, dict] = {}
+    for ep, o in outcomes.items():
+        if o["status"] == "unreachable":
+            per_shard[ep] = o
+            continue
+        d = o["data"]
+        if d.get("notes"):
+            o["status"] = "partial"
+            findings.append(_finding("warning", f"shard {ep} slowlog unavailable: {d['notes'][0]}", shard=ep))
+        entries += _labelled(d["entries"], ep)
+        for row in d["by_command"]:
+            agg = by_cmd[row["command"]]
+            agg["count"] += row["count"]
+            agg["total_us"] += row["total_us"]
+            agg["max_us"] = max(agg["max_us"], row["max_us"])
+        per_shard[ep] = {
+            "status": o["status"],
+            "slowlog_len": d["slowlog_len"],
+            "returned": d["returned"],
+            **({"notes": d["notes"]} if d.get("notes") else {}),
+        }
+    entries.sort(key=lambda e: _num(e["duration_us"]), reverse=True)
+    counts = _shard_counts(outcomes)
+    by_command = sorted(({"command": k, **v} for k, v in by_cmd.items()), key=lambda x: x["total_us"], reverse=True)
+    if entries:
+        worst = entries[0]
+        findings.append(
+            _finding(
+                "info",
+                f"slowest entry: {worst['command']} took {worst['duration_us']} us on shard {worst['shard']}",
+                shard=worst["shard"],
+            )
+        )
+    return {
+        "cluster_enabled": True,
+        "scope": "all shard primaries",
+        **counts,
+        "partial": counts["shards_total"] != counts["shards_ok"],
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "returned": min(len(entries), count),
+        "by_command": by_command,
+        "entries": entries[:count],
+        "per_shard": per_shard,
+        "findings": _sorted_findings(findings),
+    }
+
+
+def cluster_memory(
+    r: redis.Redis,
+    client_factory: ClientFactory,
+    max_workers: int = 8,
+    per_node_timeout: float = 5.0,
+    max_seconds: float = 10.0,
+) -> dict:
+    """Memory headline of every shard primary with skew, pressure and fragmentation findings."""
+    started = time.monotonic()
+
+    def work(client: redis.Redis, budget: float, shards: int) -> dict:
+        return memory_report(client)
+
+    topo, outcomes = _fan_out_primaries(r, client_factory, work, max_workers, max_seconds, per_node_timeout)
+    if not outcomes:
+        if topo.get("cluster_enabled") is False:
+            return {**memory_report(r), "cluster_enabled": False, "note": "cluster mode disabled"}
+        return topo
+    findings = _unreachable_findings(outcomes)
+    per_shard: dict[str, dict] = {}
+    used: dict[str, float] = {}
+    keep = (
+        "used_memory",
+        "used_memory_rss",
+        "maxmemory",
+        "usage_of_maxmemory",
+        "mem_fragmentation_ratio",
+        "fragmentation_verdict",
+        "evicted_keys",
+        "notes",
+    )
+    for ep, o in outcomes.items():
+        if o["status"] == "unreachable":
+            per_shard[ep] = o
+            continue
+        d = o["data"]
+        if "used_memory" not in d:
+            o["status"] = "partial"
+            findings.append(
+                _finding("warning", f"shard {ep} memory unavailable: {(d.get('notes') or ['?'])[0]}", shard=ep)
+            )
+        else:
+            used[ep] = d["used_memory"]
+            if (d.get("usage_of_maxmemory") or 0) > 0.9:
+                findings.append(
+                    _finding("critical", f"shard {ep} at {d['usage_of_maxmemory']:.0%} of maxmemory", shard=ep)
+                )
+            if _num(d.get("evicted_keys")) > 0:
+                findings.append(
+                    _finding("warning", f"shard {ep} evicted {int(_num(d['evicted_keys']))} keys", shard=ep)
+                )
+            if _num(d.get("mem_fragmentation_ratio"), 1.0) > 1.5:
+                findings.append(
+                    _finding("warning", f"shard {ep} fragmentation ratio {d['mem_fragmentation_ratio']}", shard=ep)
+                )
+        per_shard[ep] = {"status": o["status"], **{k: d[k] for k in keep if k in d}}
+    findings += _skew_findings(used, "memory")
+    counts = _shard_counts(outcomes)
+    return {
+        "cluster_enabled": True,
+        "scope": "all shard primaries",
+        **counts,
+        "partial": counts["shards_total"] != counts["shards_ok"],
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "total_used_memory": int(sum(used.values())),
+        "max_shard_used_memory": int(max(used.values())) if used else 0,
+        "per_shard": per_shard,
+        "findings": _sorted_findings(findings),
+    }
+
+
+# --------------------------------------------------------------------------- ACL LOG
+
+ACL_AUTH_FAILURES_WARN = 5
+ACL_DENIED_WARN = 20
+ACL_RECENT_SECONDS = 300
+_CLIENT_INFO_FIELDS = ("addr", "name", "user", "lib-name", "lib-ver", "cmd")
+
+
+def _client_info(raw: Any) -> dict[str, str]:
+    """Reduce ACL LOG's ``client-info`` (string or dict) to a few non-sensitive fields."""
+    if isinstance(raw, dict):
+        fields = {str(_s(k)): str(_s(v)) for k, v in raw.items()}
+    else:
+        fields = dict(tok.split("=", 1) for tok in str(_s(raw) or "").split() if "=" in tok)
+    return {k: fields[k] for k in _CLIENT_INFO_FIELDS if k in fields}
+
+
+def acl_log(r: redis.Redis, count: int = 25) -> dict:
+    """Recent ACL failures from ``ACL LOG`` plus ``ACL WHOAMI``; never ``ACL LIST``/``GETUSER`` (password hashes).
+
+    Key and channel names in ``object`` are hidden, client info is cut to address, name, user and
+    library, and any password-like field is redacted. ``ACL LOG RESET`` is refused by the client guard.
+    """
+    count = max(1, min(int(count), 128))
+    server, _ = _try(r.info, "server")
+    me, me_err = _try(r.execute_command, "ACL WHOAMI")
+    raw, err = _try(r.execute_command, "ACL LOG", count)
+    if raw is None:
+        return {
+            "whoami": _s(me),
+            "entries": [],
+            "findings": [],
+            "notes": [command_support_note("ACL LOG", server, err)],
+        }
+    entries = []
+    by_reason: Counter[str] = Counter()
+    by_user: Counter[str] = Counter()
+    auth_failures = denied_commands = recent_denied = 0
+    failing_users: set[str] = set()
+    for e in raw:
+        e = _jsonable(e)
+        reason = str(e.get("reason", "?"))
+        user = str(e.get("username", "?"))
+        n = int(_num(e.get("count"), 1))
+        by_reason[reason] += n
+        by_user[user] += n
+        if reason == "auth":
+            auth_failures += n
+            failing_users.add(user)
+        elif reason == "command":
+            denied_commands += n
+            if _num(e.get("age-seconds"), ACL_RECENT_SECONDS + 1) <= ACL_RECENT_SECONDS:
+                recent_denied += n
+        hidden = reason in ("key", "channel")
+        entries.append(
+            redact(
+                {
+                    "reason": reason,
+                    "context": e.get("context"),
+                    "object": "(name hidden)" if hidden else e.get("object"),
+                    "username": user,
+                    "count": n,
+                    "age_seconds": e.get("age-seconds"),
+                    "client": _client_info(e.get("client-info")),
+                }
+            )
+        )
+    entries.sort(key=lambda x: x["count"], reverse=True)
+    findings = []
+    if auth_failures >= ACL_AUTH_FAILURES_WARN:
+        who = ", ".join(sorted(failing_users))
+        findings.append(_finding("warning", f"{auth_failures} failed authentications for users: {who}"))
+    if recent_denied >= ACL_DENIED_WARN:
+        findings.append(
+            _finding("warning", f"{recent_denied} denied commands in the last {ACL_RECENT_SECONDS}s (ACL spike)")
+        )
+    elif denied_commands:
+        findings.append(_finding("info", f"{denied_commands} commands denied by ACL rules"))
+    return {
+        "whoami": _s(me) if me is not None else {"unavailable": me_err},
+        "entries_returned": len(entries),
+        "by_reason": dict(by_reason),
+        "by_user": dict(by_user),
+        "entries": entries,
+        "findings": _sorted_findings(findings),
+    }

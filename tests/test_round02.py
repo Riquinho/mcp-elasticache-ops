@@ -638,3 +638,168 @@ def test_readme_allowlist_matches_safe_client():
         assert f"`{name}`" in block, name
     for prefix in sc.CONFIG_GET_PREFIXES:
         assert f"`{prefix}*`" in block, prefix
+
+
+# ----------------------------------------------------------- round 03: aws_cluster_overview
+
+
+def sharded_rg(shards=3, node_type="cache.r7g.large", reader=True, replicas=1, group_id="prod-cluster"):
+    node_groups = []
+    for s in range(1, shards + 1):
+        members = [
+            {
+                "CacheClusterId": f"{group_id}-000{s}-00{i + 1}",
+                "PreferredAvailabilityZone": ("us-east-1a", "us-east-1b", "us-east-1c")[i % 3],
+                "CurrentRole": "primary" if i == 0 else "replica",
+            }
+            for i in range(replicas + 1)
+        ]
+        ng = {"NodeGroupId": f"000{s}", "Status": "available", "NodeGroupMembers": members}
+        if reader:
+            ng["ReaderEndpoint"] = {"Address": f"r{s}.example.com", "Port": 6379}
+        node_groups.append(ng)
+    members_all = [m["CacheClusterId"] for ng in node_groups for m in ng["NodeGroupMembers"]]
+    return {
+        "ReplicationGroupId": group_id,
+        "Status": "available",
+        "MultiAZ": "enabled",
+        "AutomaticFailover": "enabled",
+        "ClusterEnabled": False,
+        "MemberClusters": members_all,
+        "NodeGroups": node_groups,
+        "AtRestEncryptionEnabled": True,
+        "TransitEncryptionEnabled": True,
+        "AuthTokenEnabled": True,
+        "SnapshotRetentionLimit": 5,
+        "CacheNodeType": node_type,
+    }
+
+
+def _overview_plane(group, values, cw_error=None):
+    ec = Fake(
+        {
+            "describe_replication_groups": {"ReplicationGroups": [group]},
+            "describe_cache_clusters": {
+                "CacheClusters": [
+                    {
+                        "CacheClusterId": group["MemberClusters"][0],
+                        "ReplicationGroupId": group["ReplicationGroupId"],
+                        "Engine": "valkey",
+                        "EngineVersion": "8.0",
+                    }
+                ]
+            },
+        }
+    )
+    cw = Fake({"get_metric_data": cw_error or metric_result(values)})
+    return plane(ec, cw), ec, cw
+
+
+def _primary_values(group, per_shard_cpu, per_shard_mem, cpu_p=None):
+    values = {}
+    for ng, cpu, mem in zip(group["NodeGroups"], per_shard_cpu, per_shard_mem, strict=True):
+        for m in ng["NodeGroupMembers"]:
+            cid = m["CacheClusterId"]
+            primary = m["CurrentRole"] == "primary"
+            values[f"{cid}|EngineCPUUtilization"] = [cpu if primary else 5.0] * 6
+            values[f"{cid}|DatabaseMemoryUsagePercentage"] = [mem] * 6
+            values[f"{cid}|ReplicationLag"] = [] if primary else [0.1] * 6
+    return values
+
+
+def test_cluster_overview_flags_a_skewed_shard_worst_first():
+    group = sharded_rg(shards=4)
+    values = _primary_values(group, [20, 22, 21, 85], [40, 41, 39, 75])
+    cp, _, _ = _overview_plane(group, values)
+    out = cp.cluster_overview("prod-cluster")
+    assert out["status"] == "ok"
+    skew = [f for f in out["findings"] if f.get("metric")]
+    assert skew and skew[0]["shard"] == "0004" and skew[0]["ratio"] >= 1.5
+    assert {f["metric"] for f in skew} >= {"EngineCPUUtilization", "DatabaseMemoryUsagePercentage"}
+    assert all("0004" in f["message"] or "-0004-" in f["message"] for f in skew)
+    assert out["shards"][0]["shard"] == "0004"  # shards are worst-first by memory
+    assert out["topology"]["shard_count"] == 4 and out["topology"]["replicas_per_shard"] == [1]
+    assert out["topology"]["az_spread"] == ["us-east-1a", "us-east-1b"]
+    assert out["topology"]["engine"] == "valkey"
+    sev = [f["severity"] for f in out["findings"]]
+    assert sev == sorted(sev, key=lambda s: {"critical": 0, "warning": 2, "info": 5}.get(s, 9))
+
+
+def test_cluster_overview_balanced_group_has_no_skew_findings():
+    group = sharded_rg(shards=3)
+    cp, _, _ = _overview_plane(group, _primary_values(group, [40, 42, 41], [50, 52, 51]))
+    out = cp.cluster_overview("prod-cluster")
+    assert not [f for f in out["findings"] if f.get("metric")]
+
+
+def test_cluster_overview_rightsizing_hint():
+    group = sharded_rg(shards=2)
+    cp, _, _ = _overview_plane(group, _primary_values(group, [5, 6], [12, 15]))
+    out = cp.cluster_overview("prod-cluster")
+    hint = [f for f in out["findings"] if f.get("category") == "right-sizing"]
+    assert len(hint) == 1 and "smaller node type" in hint[0]["message"] and hint[0]["severity"] == "info"
+    busy = sharded_rg(shards=2)
+    cp, _, _ = _overview_plane(busy, _primary_values(busy, [5, 6], [45, 46]))
+    assert not [f for f in cp.cluster_overview("prod-cluster")["findings"] if f.get("category") == "right-sizing"]
+
+
+def test_cluster_overview_data_tiering_hints():
+    memory_bound = sharded_rg(shards=2, node_type="cache.r7g.xlarge")
+    cp, _, _ = _overview_plane(memory_bound, _primary_values(memory_bound, [8, 9], [82, 85]))
+    hint = [f for f in cp.cluster_overview("prod-cluster")["findings"] if f.get("category") == "right-sizing"]
+    assert hint and "data tiering" in hint[0]["message"] and "r6gd" in hint[0]["message"]
+    tiered = sharded_rg(shards=2, node_type="cache.r6gd.xlarge")
+    cp, _, _ = _overview_plane(tiered, _primary_values(tiered, [5, 6], [10, 12]))
+    hint = [f for f in cp.cluster_overview("prod-cluster")["findings"] if f.get("category") == "right-sizing"]
+    assert hint and "already in use" in hint[0]["message"]
+
+
+def test_cluster_overview_access_denied_on_metrics_degrades_to_partial():
+    group = sharded_rg(shards=2)
+    cp, _, cw = _overview_plane(group, {}, cw_error=denied("GetMetricData"))
+    out = cp.cluster_overview("prod-cluster")
+    assert "error" not in out and out["status"] == "partial"
+    assert out["topology"]["shard_count"] == 2 and len(out["shards"]) == 2
+    assert any("GetMetricData failed (AccessDenied)" in f["message"] for f in out["findings"])
+    assert not [f for f in out["findings"] if f.get("category") == "right-sizing"]
+    assert {name for name, _ in cw.calls} == {"get_metric_data"}
+
+
+def test_cluster_overview_reader_endpoint_and_missing_replica_findings():
+    group = sharded_rg(shards=2, reader=False)
+    cp, _, _ = _overview_plane(group, {})
+    msgs = [f["message"] for f in cp.cluster_overview("prod-cluster")["findings"]]
+    assert sum("no reader endpoint" in m for m in msgs) == 2
+    lonely = sharded_rg(shards=1, replicas=0)
+    cp, _, _ = _overview_plane(lonely, {})
+    out = cp.cluster_overview("prod-cluster")
+    assert any(f["severity"] == "critical" and "no replicas" in f["message"] for f in out["findings"])
+    fine = sharded_rg(shards=1)
+    cp, _, _ = _overview_plane(fine, {})
+    assert not [f for f in cp.cluster_overview("prod-cluster")["findings"] if "reader" in f["message"]]
+
+
+def test_cluster_overview_is_bounded_and_unknown_group_is_an_error():
+    group = sharded_rg(shards=60, reader=False)
+    cp, _, _ = _overview_plane(group, {})
+    out = cp.cluster_overview("prod-cluster")
+    assert len(out["shards"]) == controlplane.MAX_OVERVIEW_SHARDS and out["shards_total"] == 60
+    assert len(out["findings"]) == controlplane.MAX_OVERVIEW_FINDINGS and out["truncated"] is True
+    cp, _, _ = _overview_plane(group, {})
+    cp.client("elasticache").responses["describe_replication_groups"] = {"ReplicationGroups": []}
+    assert cp.cluster_overview("nope")["error"] == "NotFound"
+    assert cp.cluster_overview("x", minutes=0)["error"] == "InvalidArgument"
+
+
+def test_cluster_overview_only_calls_read_only_apis():
+    group = sharded_rg(shards=2)
+    cp, ec, cw = _overview_plane(group, _primary_values(group, [20, 21], [40, 41]))
+    cp.cluster_overview("prod-cluster")
+    for name, _ in ec.calls + cw.calls:
+        assert name.startswith(("describe_", "list_", "get_metric_data")), name
+
+
+async def test_cluster_overview_tool_is_registered_and_read_only():
+    async with Client(server.mcp) as c:
+        tools = {t.name: t for t in await c.list_tools()}
+    assert tools["aws_cluster_overview"].annotations.read_only_hint is True

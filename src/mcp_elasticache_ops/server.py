@@ -145,14 +145,25 @@ def node_keyspace_sample(
     """Big keys (bytes and element count), hot keys (LFU policies) or coldest keys,
     type distribution and TTL coverage from a bounded SCAN. Metadata only; values
     are never read. Stops at max_seconds and reports partial=true. On cluster-mode-enabled
-    groups this samples the connected node's slots only (see node_cluster_nodes)."""
+    groups this samples the connected node's slots only: use node_cluster_keyspace_sample for every shard."""
     return dataplane.keyspace_sample(redis_client(), sample_size, match, top, scan_count, pause_ms, max_seconds)
 
 
 @mcp.tool(annotations=READ_ONLY)
 def node_replication() -> dict:
-    """Replication role, replicas with byte lag, link status and backlog size."""
-    return dataplane.replication(redis_client())
+    """Replication role, replicas with byte lag, link status and backlog size, plus findings:
+    replica links that are down, lagging replicas (also against the primary's offset when run on a
+    replica), replica-read-only, min-replicas-to-write and cluster-allow-reads-when-down. Engine
+    quirks (Redis 6 has no CLUSTER SHARDS, ACL LOG needs 6+) are notes, not errors."""
+    return dataplane.replication(redis_client(), _node_client)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def node_acl_log(count: Annotated[int, Field(ge=1, le=128, description="ACL LOG entries to fetch")] = 25) -> dict:
+    """ACL WHOAMI and recent ACL LOG entries (auth failures, denied commands, key/channel denials)
+    with reason, user, client address and count; key and channel names are hidden. Findings flag
+    repeated auth failures and denied-command spikes. ACL LIST/GETUSER (password hashes) are never used."""
+    return dataplane.acl_log(redis_client(), count)
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -177,6 +188,60 @@ def node_cluster_health(
     """Cluster-mode fan-out: INFO on every node (bounded concurrency, per-node timeout)
     flagging memory/ops skew across shards, failed nodes, uncovered slots and replica lag."""
     return dataplane.cluster_health(redis_client(), _node_client, max_workers, per_node_timeout)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def node_cluster_keyspace_sample(
+    sample_size: Annotated[
+        int, Field(ge=1, le=100_000, description="Max keys to inspect, split across primaries")
+    ] = 1000,
+    match: Annotated[str | None, Field(description="SCAN MATCH glob, e.g. 'session:*'")] = None,
+    top: Annotated[int, Field(ge=1, le=500)] = 20,
+    scan_count: Annotated[int, Field(ge=10, le=5000, description="SCAN COUNT hint")] = 250,
+    pause_ms: Annotated[int, Field(ge=0, le=1000, description="Sleep between SCAN batches")] = 0,
+    max_seconds: Annotated[
+        float, Field(gt=0, le=60, description="Total wall-clock budget, split across primaries")
+    ] = 10.0,
+    max_workers: Annotated[int, Field(ge=1, le=32, description="Concurrent shard samplers")] = 8,
+    per_node_timeout: Annotated[float, Field(gt=0, le=60, description="Extra seconds to wait for a stuck shard")] = 5.0,
+) -> dict:
+    """node_keyspace_sample on every shard primary of a cluster-mode group: top big/hot/cold keys merged
+    with a `shard` label, per-shard status (ok, partial, unreachable) and skew findings. A dead shard is
+    reported, never fatal. The budget and sample size are split across primaries. Metadata only."""
+    return dataplane.cluster_keyspace_sample(
+        redis_client(),
+        _node_client,
+        sample_size,
+        match,
+        top,
+        scan_count,
+        pause_ms,
+        max_seconds,
+        max_workers,
+        per_node_timeout,
+    )
+
+
+@mcp.tool(annotations=READ_ONLY)
+def node_cluster_slowlog(
+    count: Annotated[int, Field(ge=1, le=1024, description="Entries to return overall")] = 25,
+    include_args: Annotated[bool, Field(description="Return full command arguments (may expose values)")] = False,
+    max_workers: Annotated[int, Field(ge=1, le=32, description="Concurrent shard probes")] = 8,
+    per_node_timeout: Annotated[float, Field(gt=0, le=60, description="Seconds to wait per node")] = 5.0,
+) -> dict:
+    """node_slowlog on every shard primary: the slowest entries overall labelled by shard, per-command
+    totals and per-shard status. Arguments beyond the key are hidden unless include_args is true."""
+    return dataplane.cluster_slowlog(redis_client(), _node_client, count, include_args, max_workers, per_node_timeout)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def node_cluster_memory(
+    max_workers: Annotated[int, Field(ge=1, le=32, description="Concurrent shard probes")] = 8,
+    per_node_timeout: Annotated[float, Field(gt=0, le=60, description="Seconds to wait per node")] = 5.0,
+) -> dict:
+    """node_memory headline for every shard primary: used/RSS/maxmemory, fragmentation, evictions, with
+    findings for memory skew between shards, shards above 90% of maxmemory and unreachable shards."""
+    return dataplane.cluster_memory(redis_client(), _node_client, max_workers, per_node_timeout)
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -330,6 +395,19 @@ def aws_triage(replication_group_id: Annotated[str, Field(description="Replicati
     CloudWatch peaks per member, pending service updates and snapshot age. Findings are worst-first
     (max 30); a section that fails is reported as unavailable instead of failing the call."""
     return control_plane().triage(replication_group_id)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def aws_cluster_overview(
+    replication_group_id: Annotated[str, Field(description="ReplicationGroupId to summarise")],
+    minutes: Annotated[int, Field(ge=5, le=20160, description="CloudWatch window (multiple of 5 min is fine)")] = 360,
+) -> dict:
+    """One findings-first call per replication group: shards, replicas per shard, AZ spread, failover and
+    engine version joined with per-node CloudWatch signals (CPU, memory, replication lag, evictions,
+    connections). Flags nodes above 1.5x their peers' median, reader endpoint gaps and right-sizing
+    hints (memory p95 < 30% and CPU p95 < 20%; data tiering for r6gd). Worst-first, bounded; if
+    GetMetricData is denied the topology is still returned with status partial."""
+    return control_plane().cluster_overview(replication_group_id, minutes)
 
 
 # ------------------------------------------------------------------------ main

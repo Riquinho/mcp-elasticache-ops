@@ -290,6 +290,9 @@ _BAD_BASES = [
     ("FUNCTION", "FLUSH"),
     ("ACL", "LIST"),
     ("ACL", "SETUSER", "x"),
+    ("ACL", "DELUSER", "x"),
+    ("ACL", "GETUSER", "x"),
+    ("ACL", "LOG", "RESET"),
     ("XREAD", "STREAMS", "s", "0"),
     ("SUBSCRIBE", "c"),
     ("PSUBSCRIBE", "*"),
@@ -354,3 +357,115 @@ def test_fuzz_allowlisted_commands_reject_whitespace_and_unicode_tricks(key):
             continue
         with pytest.raises(ReadOnlyViolation):
             check((bad,))
+
+
+# ------------------------------------------------------------------ round 03: argument guards
+
+_OK_ARGS = [
+    ("MEMORY", "USAGE", "k"),
+    ("MEMORY", "USAGE", "k", "SAMPLES", "5"),
+    ("memory", "usage", "k", "samples", "0"),
+    ("SCAN", "0"),
+    ("SCAN", "0", "MATCH", "user:*", "COUNT", "100", "TYPE", "string"),
+    ("scan", "17", "count", "10"),
+    ("CLIENT", "LIST"),
+    ("CLIENT", "LIST", "TYPE", "pubsub"),
+    ("CLIENT", "LIST", "ID", "1", "2", "3"),
+    ("OBJECT", "ENCODING", "k"),
+    ("OBJECT", "FREQ", "k"),
+    ("OBJECT", "IDLETIME", "k"),
+    ("ACL", "WHOAMI"),
+    ("ACL", "LOG"),
+    ("ACL", "LOG", "10"),
+    ("acl", "log", "0"),
+]
+
+
+@pytest.mark.parametrize("args", _OK_ARGS, ids=lambda a: " ".join(a))
+def test_round03_allowed_forms(args):
+    check(args)
+
+
+_BAD_ARGS = [
+    ("MEMORY", "USAGE", "k", "SAMPLES"),  # missing count
+    ("MEMORY", "USAGE", "k", "SAMPLES", "x"),
+    ("MEMORY", "USAGE", "k", "FOO", "5"),
+    ("MEMORY", "USAGE", "k", "SAMPLES", "5", "extra"),
+    ("MEMORY", "USAGE", "k", "SAMPLES", "-1"),
+    ("SCAN", "0", "MATCH"),
+    ("SCAN", "0", "COUNT", "x"),
+    ("SCAN", "0", "TYPE", "string", "DELETE", "1"),
+    ("SCAN", "0", "NOVALUES", "x"),
+    ("SCAN", "abc"),
+    ("CLIENT", "LIST", "TYPE", "admin"),
+    ("CLIENT", "LIST", "ID", "x"),
+    ("CLIENT", "LIST", "KILL", "1"),
+    ("OBJECT", "ENCODING", "k", "extra"),
+    ("OBJECT", "HELP"),
+    ("OBJECT", "FREQ", "k", "l"),
+    ("ACL", "LOG", "RESET"),
+    ("acl", "log", "reset"),
+    ("ACL", "LOG", "10", "RESET"),
+    ("ACL", "LOG", "10", "20"),
+    ("ACL", "LOG", "-1"),
+    ("ACL", "WHOAMI", "extra"),
+    ("ACL", "SETUSER", "x", "on"),
+    ("ACL", "DELUSER", "x"),
+    ("ACL", "GETUSER", "x"),
+    ("ACL", "LIST"),
+    ("ACL", "CAT"),
+    ("ACL", "GENPASS"),
+    ("ACL", "SAVE"),
+    ("ACL", "LOAD"),
+    ("ACL",),
+    ("ACL  LOG",),
+    ("ACL LOG RESET",),
+    ("ACL LOG\n10",),
+    (b"ACL", b"LOG", b"RESET"),
+    (b"ACL", b"DELUSER", b"default"),
+]
+
+
+@pytest.mark.parametrize("args", _BAD_ARGS, ids=lambda a: repr(a))
+def test_round03_refused_forms(args):
+    with pytest.raises(ReadOnlyViolation):
+        check(args)
+
+
+def test_acl_destructive_forms_are_forbidden_and_not_allowlisted():
+    from mcp_elasticache_ops.safe_client import FORBIDDEN_COMMANDS
+
+    for cmd in ("ACL SETUSER", "ACL DELUSER", "ACL LOG RESET", "ACL GETUSER", "ACL LIST"):
+        assert cmd in FORBIDDEN_COMMANDS and cmd not in READ_ONLY_COMMANDS
+    assert {"ACL LOG", "ACL WHOAMI"} <= READ_ONLY_COMMANDS
+
+
+def test_pipeline_refuses_commands_outside_the_allowlist():
+    r = SafeRedis(host="127.0.0.1", port=1, socket_connect_timeout=0.2)
+    pipe = r.pipeline()
+    pipe.type("k")  # allowed: queued, never sent
+    for bad in (
+        lambda: pipe.set("k", "v"),
+        lambda: pipe.delete("k"),
+        lambda: pipe.get("k"),
+        lambda: pipe.execute_command("FLUSHALL"),
+        lambda: pipe.execute_command("ACL", "LOG", "RESET"),
+        lambda: pipe.execute_command("SCAN", "0", "DEL", "x"),
+    ):
+        with pytest.raises(ReadOnlyViolation):
+            bad()
+    # even a command stacked behind the guard's back is refused before any connection is opened
+    pipe.command_stack.append((("SET", "k", "v"), {}))
+    with pytest.raises(ReadOnlyViolation):
+        pipe.execute()
+
+
+def test_pipeline_allows_the_sampling_commands():
+    r = SafeRedis(host="127.0.0.1", port=1, socket_connect_timeout=0.2)
+    pipe = r.pipeline()
+    pipe.type("k")
+    pipe.memory_usage("k", samples=5)
+    pipe.pttl("k")
+    pipe.object("FREQ", "k")
+    pipe.execute_command("OBJECT", "IDLETIME", "k")
+    assert len(pipe.command_stack) == 5

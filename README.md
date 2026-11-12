@@ -10,7 +10,7 @@ written from scratch for ElastiCache.
 
 ## Tools
 
-All 29 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
+All 34 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 
 **Data plane** (redis-py, talks to the node endpoint)
 
@@ -25,10 +25,14 @@ All 29 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `node_latency` | Client-side PING RTT percentiles + `LATENCY LATEST` |
 | `node_commandstats` | Commands ranked by total CPU time (`INFO commandstats`) |
 | `node_keyspace_sample` | Bounded `SCAN` sample: big keys by bytes and by element count, hot keys (LFU) or coldest keys, TTL coverage. Stops at `max_seconds` (default 10, hard cap 60) and returns `partial=true` |
-| `node_replication` | Role, replicas with byte lag, link status, backlog |
+| `node_replication` | Role, replicas with byte lag, link status, backlog; findings for lagging or link-down replicas, offset gap vs the primary, `replica-read-only`, `min-replicas-to-write`, `cluster-allow-reads-when-down`. Engine-version quirks (no `CLUSTER SHARDS` before 7.0, ...) come back as `notes`, not errors |
 | `node_cluster` | Cluster mode: `CLUSTER INFO`, slots per primary, `CLUSTER SHARDS` |
 | `node_cluster_nodes` | `CLUSTER NODES` parsed into shards (primary, replicas, slots, failing nodes) and per-shard endpoints |
 | `node_cluster_health` | Fan-out `INFO` to every node (bounded concurrency, per-node timeout): memory/ops skew, replica lag, link status, uncovered slots |
+| `node_cluster_keyspace_sample` | Cluster-wide `node_keyspace_sample`: fans out to every primary (bounded concurrency, `max_seconds` split across primaries) and merges big/hot/cold keys with a `shard` label; per-shard `ok`/`partial`/`unreachable`, a dead shard never fails the call |
+| `node_cluster_slowlog` | Same fan-out for `SLOWLOG GET`: merged slowest commands labelled by shard |
+| `node_cluster_memory` | Same fan-out for memory: per-shard used/maxmemory/fragmentation/evictions, skew and >90% findings |
+| `node_acl_log` | `ACL WHOAMI` + `ACL LOG` (optional count): auth failures and denied commands aggregated by reason and user, client info reduced and redacted, findings on bursts. `ACL LIST`, `GETUSER`, `SETUSER`, `DELUSER` and `LOG RESET` stay refused |
 | `memcached_stats` | Memcached `stats` summary (hit ratio, memory, evictions) or a raw stats group |
 
 **Control plane** (boto3, optional)
@@ -49,6 +53,7 @@ All 29 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `aws_service_updates` | `DescribeServiceUpdates`: pending updates, past or near apply-by dates |
 | `aws_subnet_groups` | `DescribeCacheSubnetGroups`: AZ spread (Multi-AZ needs 2+) |
 | `aws_triage` | One call per replication group: status/Multi-AZ/failover, last 6h events, CloudWatch peaks per member (EngineCPU, memory %, Evictions, ReplicationLag, CurrConnections), pending service updates, newest snapshot. Worst-first findings (max 30); a failing section is reported `unavailable` |
+| `aws_cluster_overview` | One findings-first call per replication group: shards, replicas per shard, AZ spread, failover, engine version joined with per-node CloudWatch (EngineCPU, memory %, ReplicationLag, Evictions, CurrConnections, NewConnections). Flags nodes above 1.5x the peer median, reader endpoint gaps and right-sizing (memory p95 < 30% and CPU p95 < 20%; data tiering for r6gd). Worst-first, bounded; `GetMetricData` denied gives `status: partial` |
 | `aws_parameter_drift` | Diff of two parameter groups: only modified parameters whose values differ, family mismatch, important parameters flagged |
 
 `aws_replication_groups` also returns per-group findings (Multi-AZ, failover, encryption, auth, snapshots, old Redis OSS,
@@ -76,7 +81,10 @@ so the server is useful against a plain Redis/Valkey too.
   Command names with extra tokens or whitespace are rejected, so a subcommand cannot be smuggled in.
 - `node_info` redacts password-like fields; `node_slowlog` hides arguments unless `include_args=true`.
 - `node_keyspace_sample` only inspects the connected node: in cluster mode that is only its own slots
-  (the result says so). Use `node_cluster_nodes` for shard endpoints, or `node_cluster_health` for a fan-out.
+  (the result says so). Use `node_cluster_keyspace_sample`, `node_cluster_slowlog` and `node_cluster_memory`
+  for the whole cluster, or `node_cluster_nodes` / `node_cluster_health` for topology and a fan-out `INFO`.
+  Fan-out clients are built by `connection.build_client` and are `SafeRedis` too; a test fails if any module
+  creates a bare `redis.Redis`. Arguments of `MEMORY USAGE`, `SCAN`, `CLIENT LIST`, `OBJECT` and `ACL LOG` are validated.
 - Control plane only calls `Describe*` / `List*` / `GetMetricData`. Give it an IAM policy with
   `elasticache:Describe*` and `cloudwatch:GetMetricData` only.
 - Passwords / AUTH tokens come from the environment or a file and are never returned by tools.
@@ -86,10 +94,10 @@ so the server is useful against a plain Redis/Valkey too.
 Generated from `safe_client.py`; the tests fail if this drifts from the code.
 
 <!-- allowlist:start -->
-- Allowed commands (41): `CLIENT GETNAME`, `CLIENT ID`, `CLIENT INFO`, `CLIENT LIST`, `CLUSTER INFO`, `CLUSTER MYID`, `CLUSTER NODES`, `CLUSTER SHARDS`, `CLUSTER SLOTS`, `COMMAND COUNT`, `COMMAND DOCS`, `CONFIG GET`, `DBSIZE`, `EXISTS`, `HLEN`, `INFO`, `LASTSAVE`, `LATENCY DOCTOR`, `LATENCY HISTORY`, `LATENCY LATEST`, `LLEN`, `MEMORY DOCTOR`, `MEMORY STATS`, `MEMORY USAGE`, `OBJECT ENCODING`, `OBJECT FREQ`, `OBJECT IDLETIME`, `PFCOUNT`, `PING`, `PTTL`, `ROLE`, `SCAN`, `SCARD`, `SLOWLOG GET`, `SLOWLOG LEN`, `STRLEN`, `TIME`, `TTL`, `TYPE`, `XLEN`, `ZCARD`
+- Allowed commands (43): `ACL LOG`, `ACL WHOAMI`, `CLIENT GETNAME`, `CLIENT ID`, `CLIENT INFO`, `CLIENT LIST`, `CLUSTER INFO`, `CLUSTER MYID`, `CLUSTER NODES`, `CLUSTER SHARDS`, `CLUSTER SLOTS`, `COMMAND COUNT`, `COMMAND DOCS`, `CONFIG GET`, `DBSIZE`, `EXISTS`, `HLEN`, `INFO`, `LASTSAVE`, `LATENCY DOCTOR`, `LATENCY HISTORY`, `LATENCY LATEST`, `LLEN`, `MEMORY DOCTOR`, `MEMORY STATS`, `MEMORY USAGE`, `OBJECT ENCODING`, `OBJECT FREQ`, `OBJECT IDLETIME`, `PFCOUNT`, `PING`, `PTTL`, `ROLE`, `SCAN`, `SCARD`, `SLOWLOG GET`, `SLOWLOG LEN`, `STRLEN`, `TIME`, `TTL`, `TYPE`, `XLEN`, `ZCARD`
 - `CONFIG GET` exact names: `appendfsync`, `appendonly`, `client-query-buffer-limit`, `cluster-allow-reads-when-down`, `cluster-enabled`, `cluster-node-timeout`, `cluster-require-full-coverage`, `databases`, `dynamic-hz`, `hz`, `io-threads`, `lfu-decay-time`, `lfu-log-factor`, `maxclients`, `min-replicas-max-lag`, `min-replicas-to-write`, `notify-keyspace-events`, `proto-max-bulk-len`, `rdbcompression`, `repl-backlog-size`, `repl-backlog-ttl`, `repl-diskless-sync`, `replica-read-only`, `save`, `tcp-keepalive`, `timeout`
 - `CONFIG GET` prefixes: `maxmemory*`, `slowlog-*`, `latency-*`, `activedefrag*`, `active-defrag-*`, `lazyfree-*`, `hash-max-*`, `list-max-*`, `set-max-*`, `zset-max-*`, `client-output-buffer-limit*`
-- Always refused (self-tested never to be allowed): `ACL`, `ACL GETUSER`, `ACL LIST`, `ACL SETUSER`, `AUTH`, `BGREWRITEAOF`, `BGSAVE`, `CLIENT KILL`, `CLIENT PAUSE`, `CLIENT REPLY`, `CLIENT TRACKING`, `CLIENT UNPAUSE`, `CLUSTER FAILOVER`, `CLUSTER RESET`, `CONFIG RESETSTAT`, `CONFIG REWRITE`, `CONFIG SET`, `DEBUG`, `DEL`, `DUMP`, `EVAL`, `EVALSHA`, `EXEC`, `EXPIRE`, `FAILOVER`, `FCALL`, `FLUSHALL`, `FLUSHDB`, `FUNCTION`, `GET`, `HELLO`, `HGET`, `HGETALL`, `KEYS`, `LATENCY RESET`, `LRANGE`, `MEMORY PURGE`, `MGET`, `MIGRATE`, `MODULE LOAD`, `MONITOR`, `MULTI`, `OBJECT HELP`, `PSUBSCRIBE`, `PSYNC`, `PUBLISH`, `REPLICAOF`, `RESTORE`, `SAVE`, `SCRIPT`, `SCRIPT FLUSH`, `SCRIPT LOAD`, `SET`, `SHUTDOWN`, `SLAVEOF`, `SLOWLOG RESET`, `SMEMBERS`, `SORT`, `SSUBSCRIBE`, `SUBSCRIBE`, `SYNC`, `UNLINK`, `WATCH`, `XRANGE`, `XREAD`, `XREADGROUP`, `ZRANGE`
+- Always refused (self-tested never to be allowed): `ACL`, `ACL DELUSER`, `ACL GETUSER`, `ACL LIST`, `ACL LOG RESET`, `ACL SETUSER`, `AUTH`, `BGREWRITEAOF`, `BGSAVE`, `CLIENT KILL`, `CLIENT PAUSE`, `CLIENT REPLY`, `CLIENT TRACKING`, `CLIENT UNPAUSE`, `CLUSTER FAILOVER`, `CLUSTER RESET`, `CONFIG RESETSTAT`, `CONFIG REWRITE`, `CONFIG SET`, `DEBUG`, `DEL`, `DUMP`, `EVAL`, `EVALSHA`, `EXEC`, `EXPIRE`, `FAILOVER`, `FCALL`, `FLUSHALL`, `FLUSHDB`, `FUNCTION`, `GET`, `HELLO`, `HGET`, `HGETALL`, `KEYS`, `LATENCY RESET`, `LRANGE`, `MEMORY PURGE`, `MGET`, `MIGRATE`, `MODULE LOAD`, `MONITOR`, `MULTI`, `OBJECT HELP`, `PSUBSCRIBE`, `PSYNC`, `PUBLISH`, `REPLICAOF`, `RESTORE`, `SAVE`, `SCRIPT`, `SCRIPT FLUSH`, `SCRIPT LOAD`, `SET`, `SHUTDOWN`, `SLAVEOF`, `SLOWLOG RESET`, `SMEMBERS`, `SORT`, `SSUBSCRIBE`, `SUBSCRIBE`, `SYNC`, `UNLINK`, `WATCH`, `XRANGE`, `XREAD`, `XREADGROUP`, `ZRANGE`
 - Memcached: only `stats`, `stats settings|slabs|items|conns` and `version`.
 - AWS: operation names must start with `describe_`, `list_` or `get_metric_data`.
 <!-- allowlist:end -->
@@ -188,7 +196,13 @@ uv run pytest -q                 # unit tests; control plane uses moto + botocor
 uv run pytest -q --cov=mcp_elasticache_ops   # 80% coverage gate (about 93% without a live server)
 scripts/integration.sh           # starts valkey/valkey:8-alpine (--rm, removed on exit) and runs everything
 IMAGE=redis:7-alpine scripts/integration.sh
+scripts/cluster-integration.sh   # 3-node valkey cluster via tests/docker-compose.cluster.yml, torn down with `down -v`
 ```
+
+The cluster test (`tests/test_dataplane_integration.py`, marker `integration`, needs `CLUSTER_TEST_HOST` and
+`CLUSTER_TEST_PORT`) runs `node_cluster_nodes` and the cluster fan-out against that cluster. CI runs it in the
+`cluster` job and removes the stack in an `always()` step; the `lint` job also builds the wheel and imports it in an
+isolated interpreter (`python -I`).
 
 ## More
 

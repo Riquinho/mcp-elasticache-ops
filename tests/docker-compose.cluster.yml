@@ -1,0 +1,31 @@
+# Throwaway 3-primary valkey cluster for tests/test_dataplane_integration.py (cluster tests).
+# One container runs three valkey-server processes on 7001-7003 and announces 127.0.0.1, so the
+# host reaches every node on the same ports. Always tear down with `down -v`.
+name: prova-elasticache-cluster
+
+services:
+  cluster:
+    image: ${IMAGE:-valkey/valkey:8-alpine}
+    ports:
+      - "127.0.0.1:7001:7001"
+      - "127.0.0.1:7002:7002"
+      - "127.0.0.1:7003:7003"
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli -p 7001 cluster info | grep -q cluster_state:ok"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for p in 7001 7002 7003; do
+          mkdir -p /data/$$p
+          valkey-server --port $$p --cluster-enabled yes --cluster-config-file /data/$$p/nodes.conf \
+            --cluster-node-timeout 3000 --cluster-announce-ip 127.0.0.1 --appendonly no --save "" \
+            --dir /data/$$p --daemonize yes --logfile /data/$$p/log
+        done
+        sleep 2
+        valkey-cli --cluster create 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 --cluster-replicas 0 --cluster-yes
+        tail -f /dev/null

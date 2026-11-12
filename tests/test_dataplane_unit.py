@@ -626,3 +626,331 @@ def test_working_endpoint_output_is_unchanged_by_serverless_flag():
     info = {"server": {"redis_version": "7.2"}, "default": {"role": "master", "used_memory": 10, "maxmemory": 100}}
     out = dataplane.health_summary(FakeRedis(infos=info))
     assert "notes" not in out and "serverless" not in out
+
+
+# ------------------------------------------------------------ round 03: cluster-wide fan-out
+
+
+def _shard_data(tag, n, size):
+    return {f"{tag}:k{j:03d}": ("string", size + j, -1, 1) for j in range(n)}
+
+
+def _shard_client(tag, n=20, size=100, **kw):
+    return FakeRedis(infos={"memory": _mem_info()}, data=_shard_data(tag, n, size), **kw)
+
+
+def _fan_factory(clients):
+    opened = []
+
+    def factory(host, port):
+        c = clients[f"{host}:{port}"]
+        if isinstance(c, Exception):
+            raise c
+        if callable(c):
+            c = c()
+        opened.append(c)
+        return c
+
+    return factory, opened
+
+
+def _seed():
+    seed = FakeRedis(infos={"cluster": {"cluster_enabled": 1}})
+    seed.commands["CLUSTER NODES"] = _healthy_topology()
+    return seed
+
+
+def test_cluster_keyspace_sample_merges_top_keys_with_shard_label():
+    clients = {
+        "10.0.0.1:6379": _shard_client("a", size=100),
+        "10.0.0.2:6379": _shard_client("b", size=5000),
+        "10.0.0.3:6379": _shard_client("c", size=300),
+    }
+    factory, opened = _fan_factory(clients)
+    out = dataplane.cluster_keyspace_sample(_seed(), factory, sample_size=90, top=3, max_seconds=5)
+    assert out["scope"] == "all shard primaries"
+    assert (out["shards_total"], out["shards_ok"], out["shards_unreachable"]) == (3, 3, 0)
+    assert out["partial"] is False
+    top = out["big_keys_by_bytes"]
+    assert [k["shard"] for k in top] == ["10.0.0.2:6379"] * 3  # the big shard owns the top 3
+    assert all(k["key"].startswith("b:") for k in top)
+    assert set(out["per_shard"]) == {"10.0.0.1:6379", "10.0.0.2:6379", "10.0.0.3:6379"}
+    assert out["sampled_keys"] == 60 and out["dbsize"] == 60
+    assert all(c.closed for c in opened)
+    assert all("shard" in k for k in out["big_keys_by_length"])
+
+
+def test_cluster_keyspace_sample_reports_dead_shard_without_failing():
+    clients = {
+        "10.0.0.1:6379": _shard_client("a"),
+        "10.0.0.2:6379": redis.ConnectionError("connection refused"),
+        "10.0.0.3:6379": _shard_client("c"),
+    }
+    factory, _ = _fan_factory(clients)
+    out = dataplane.cluster_keyspace_sample(_seed(), factory, sample_size=60, max_seconds=5)
+    assert (out["shards_ok"], out["shards_unreachable"]) == (2, 1)
+    assert out["partial"] is True
+    assert out["per_shard"]["10.0.0.2:6379"]["status"] == "unreachable"
+    assert "connection refused" in out["per_shard"]["10.0.0.2:6379"]["error"]
+    crit = [f for f in out["findings"] if f["severity"] == "critical"]
+    assert crit and crit[0]["shard"] == "10.0.0.2:6379"
+    assert out["findings"][0]["severity"] == "critical"  # worst first
+    assert {k["shard"] for k in out["big_keys_by_bytes"]} <= {"10.0.0.1:6379", "10.0.0.3:6379"}
+
+
+def test_cluster_keyspace_sample_does_not_contact_failing_nodes():
+    topo = _healthy_topology().replace("p2 10.0.0.2:6379@1 master -", "p2 10.0.0.2:6379@1 master,fail -")
+    seed = FakeRedis(infos={"cluster": {"cluster_enabled": 1}})
+    seed.commands["CLUSTER NODES"] = topo
+    clients = {"10.0.0.1:6379": _shard_client("a"), "10.0.0.3:6379": _shard_client("c")}
+    factory, opened = _fan_factory(clients)  # a KeyError would surface if 10.0.0.2 were contacted
+    out = dataplane.cluster_keyspace_sample(seed, factory, sample_size=40, max_seconds=5)
+    assert out["per_shard"]["10.0.0.2:6379"]["status"] == "unreachable"
+    assert "not contacted" in out["per_shard"]["10.0.0.2:6379"]["error"]
+    assert len(opened) == 2
+
+
+def _slow_shard(tag):
+    return lambda: _shard_client(tag, n=3000, scan_batch=5, scan_delay=0.02)
+
+
+def test_cluster_keyspace_sample_respects_total_time_budget():
+    clients = {f"10.0.0.{i}:6379": _slow_shard(t) for i, t in ((1, "a"), (2, "b"), (3, "c"))}
+    factory, _ = _fan_factory(clients)
+    started = time.monotonic()
+    out = dataplane.cluster_keyspace_sample(
+        _seed(), factory, sample_size=9000, max_seconds=0.6, max_workers=3, per_node_timeout=1.0
+    )
+    wall = time.monotonic() - started
+    assert wall < 0.6 + 1.0  # budget plus the hard per-node grace, never the full scan time (~12s)
+    assert out["partial"] is True and out["shards_partial"] == 3
+    assert all(s["status"] == "partial" for s in out["per_shard"].values())
+    assert out["sampled_keys"] < 9000
+
+
+def test_fan_out_splits_budget_across_waves():
+    seen = []
+
+    def work(client, budget, shards):
+        seen.append((budget, shards))
+        return {}
+
+    factory, _ = _fan_factory({f"10.0.0.{i}:6379": FakeRedis for i in (1, 2, 3)})
+    dataplane._fan_out_primaries(_seed(), factory, work, max_workers=1, total_seconds=9.0, per_node_timeout=1.0)
+    assert seen == [(3.0, 3)] * 3  # 3 primaries, 1 worker -> 3 waves of 3s
+    seen.clear()
+    dataplane._fan_out_primaries(_seed(), factory, work, max_workers=3, total_seconds=9.0, per_node_timeout=1.0)
+    assert seen == [(9.0, 3)] * 3
+
+
+def test_cluster_keyspace_sample_hung_shard_is_abandoned():
+    def hang():
+        time.sleep(3)
+        return _shard_client("b")
+
+    clients = {"10.0.0.1:6379": _shard_client("a"), "10.0.0.2:6379": hang, "10.0.0.3:6379": _shard_client("c")}
+    factory, _ = _fan_factory(clients)
+    started = time.monotonic()
+    out = dataplane.cluster_keyspace_sample(_seed(), factory, sample_size=60, max_seconds=0.5, per_node_timeout=0.3)
+    assert time.monotonic() - started < 2.0
+    assert out["per_shard"]["10.0.0.2:6379"]["status"] == "unreachable"
+    assert out["shards_ok"] == 2
+
+
+def test_cluster_keyspace_sample_non_cluster_falls_back_to_single_node():
+    r = _shard_client("solo")
+    out = dataplane.cluster_keyspace_sample(r, lambda h, p: pytest.fail("no fan-out expected"), sample_size=10)
+    assert out["cluster_enabled"] is False and out["sampled_keys"] == 10
+
+
+def test_cluster_slowlog_merges_and_labels():
+    def shard(cmd, us):
+        c = FakeRedis(infos={"memory": _mem_info()})
+        c.slowlog_entries = [{"id": 1, "start_time": 1, "duration": us, "command": f"{cmd} k", "client_name": ""}]
+        return c
+
+    clients = {
+        "10.0.0.1:6379": shard("LRANGE", 900),
+        "10.0.0.2:6379": ConnectionError("down"),
+        "10.0.0.3:6379": shard("SORT", 50000),
+    }
+    factory, _ = _fan_factory(clients)
+    out = dataplane.cluster_slowlog(_seed(), factory, count=5, max_seconds=5)
+    assert out["shards_unreachable"] == 1
+    assert out["entries"][0]["shard"] == "10.0.0.3:6379"
+    assert {e["shard"] for e in out["entries"]} == {"10.0.0.1:6379", "10.0.0.3:6379"}
+    assert out["findings"][0]["severity"] == "critical"
+
+
+def test_cluster_memory_flags_pressure_and_dead_shard():
+    def shard(used, maxmem=1000):
+        return FakeRedis(infos={"memory": _mem_info(used_memory=used, maxmemory=maxmem), "stats": {"evicted_keys": 0}})
+
+    clients = {
+        "10.0.0.1:6379": shard(950),
+        "10.0.0.2:6379": shard(100),
+        "10.0.0.3:6379": ConnectionError("down"),
+    }
+    factory, _ = _fan_factory(clients)
+    out = dataplane.cluster_memory(_seed(), factory, max_seconds=5)
+    assert out["shards_unreachable"] == 1 and out["per_shard"]["10.0.0.3:6379"]["status"] == "unreachable"
+    text = " ".join(f["message"] for f in out["findings"])
+    assert "10.0.0.1:6379" in text
+    assert out["per_shard"]["10.0.0.1:6379"]["used_memory"] == 950
+
+
+# ------------------------------------------------------- round 03: replication read-safety
+
+
+def _repl_info(role="master", **over):
+    base = {"role": role, "master_repl_offset": 10_000_000, "connected_slaves": 0}
+    return {**base, **over}
+
+
+def _repl_client(info, config=None):
+    r = FakeRedis(infos={"replication": info, "server": {"valkey_version": "8.0.1", "server_name": "valkey"}})
+    if config is not None:
+        r.config_get = lambda name: {name: config[name]} if name in config else {}
+    return r
+
+
+def test_replication_flags_lagging_and_link_down_replicas():
+    info = _repl_info(
+        connected_slaves=2,
+        slave0={"ip": "10.0.0.4", "port": 6379, "state": "online", "offset": 1_000, "lag": 0},
+        slave1={"ip": "10.0.0.5", "port": 6379, "state": "wait_bgsave", "offset": 10_000_000, "lag": 42},
+    )
+    out = dataplane.replication(_repl_client(info))
+    msgs = [f["message"] for f in out["findings"]]
+    assert any("10.0.0.4:6379" in m and "bytes behind" in m for m in msgs)
+    assert any("10.0.0.5:6379" in m and "wait_bgsave" in m for m in msgs)
+    assert any("last acknowledged 42s ago" in m for m in msgs)
+    assert out["findings"][0]["severity"] == "critical"  # the link problem sorts first
+
+
+def test_replication_primary_without_replicas_is_a_finding():
+    out = dataplane.replication(_repl_client(_repl_info()))
+    assert any("no replicas connected" in f["message"] for f in out["findings"])
+
+
+def test_replica_link_down_and_offset_gap_through_the_factory():
+    info = _repl_info(
+        role="slave",
+        master_host="10.0.0.1",
+        master_port=6379,
+        master_link_status="down",
+        master_link_down_since_seconds=120,
+        master_last_io_seconds_ago=60,
+        slave_repl_offset=1_000,
+    )
+    primary = FakeRedis(infos={"replication": {"master_repl_offset": 9_000_000}})
+    seen = []
+
+    def factory(host, port):
+        seen.append((host, port))
+        return primary
+
+    out = dataplane.replication(_repl_client(info), factory)
+    msgs = [f["message"] for f in out["findings"]]
+    assert seen == [("10.0.0.1", 6379)] and primary.closed
+    assert any("link to the primary is down for 120s" in m for m in msgs)
+    assert any("last I/O with the primary was 60s ago" in m for m in msgs)
+    assert any("8999000 bytes behind the primary" in m for m in msgs)
+
+
+def test_replica_unreachable_primary_becomes_a_note():
+    info = _repl_info(role="slave", master_host="10.0.0.1", master_port=6379, slave_repl_offset=5)
+
+    def factory(host, port):
+        raise ConnectionError("refused")
+
+    out = dataplane.replication(_repl_client(info), factory)
+    assert any("unreachable for offset comparison" in n for n in out["notes"])
+
+
+def test_replication_setting_findings():
+    config = {"replica-read-only": "no", "min-replicas-to-write": "2", "cluster-allow-reads-when-down": "yes"}
+    replica = dataplane.replication(_repl_client(_repl_info(role="slave"), config))
+    text = " ".join(f["message"] for f in replica["findings"])
+    assert "replica-read-only is no" in text and "cluster-allow-reads-when-down is yes" in text
+    primary = dataplane.replication(_repl_client(_repl_info(connected_slaves=1), config))
+    assert any(
+        f["severity"] == "critical" and "min-replicas-to-write is 2" in f["message"] for f in primary["findings"]
+    )
+    assert primary["settings"]["min-replicas-to-write"] == "2"
+
+
+class _Redis6(FakeRedis):
+    def __init__(self):
+        super().__init__(infos={"cluster": {"cluster_enabled": 1}, "server": {"redis_version": "6.2.6"}})
+        self.commands["CLUSTER INFO"] = "cluster_state:ok\r\ncluster_slots_assigned:16384\r\n"
+        self.commands["CLUSTER SHARDS"] = redis.ResponseError("unknown subcommand shards")
+        self.commands["CLUSTER SLOTS"] = [[0, 16383, ["10.0.0.1", 6379, "id"]]]
+
+
+def test_redis6_refusing_cluster_shards_is_a_note_not_an_error():
+    out = dataplane.cluster(_Redis6())
+    assert out["cluster_enabled"] is True and out["slots_covered"] == 16384
+    assert out["shards"] == {"unavailable": "unknown subcommand shards"}
+    note = " ".join(out["notes"])
+    assert "CLUSTER SHARDS: not supported by redis 6.2.6 (needs 7.0+)" in note
+    assert "node_cluster_nodes" in note
+
+
+def test_command_support_note_and_version_tuple():
+    assert dataplane.version_tuple("7.2.4") == (7, 2, 4)
+    assert dataplane.version_tuple("8.0-rc1") == (8, 0)
+    assert dataplane.version_tuple(None) == ()
+    old = {"redis_version": "5.0.7"}
+    assert "not supported by redis 5.0.7 (needs 6.0+)" in dataplane.command_support_note("ACL LOG", old, "x")
+    new = {"valkey_version": "8.0.1", "server_name": "valkey"}
+    assert dataplane.command_support_note("ACL LOG", new, "boom") == "ACL LOG: unavailable (boom)"
+
+
+# ------------------------------------------------------------------- round 03: ACL log
+
+
+def _acl_entry(reason="auth", user="app", count=1, age=10.0, obj="GET", info=None):
+    return {
+        "count": count,
+        "reason": reason,
+        "context": "toplevel",
+        "object": obj,
+        "username": user,
+        "age-seconds": age,
+        "client-info": info or "id=5 addr=10.1.1.1:5000 name=svc user=app lib-name=redis-py cmd=get password=hunter2",
+    }
+
+
+def test_acl_log_aggregates_redacts_and_flags():
+    r = FakeRedis(infos={"server": {"valkey_version": "8.0.1"}})
+    r.commands["ACL WHOAMI"] = "default"
+    r.commands["ACL LOG 25"] = [
+        _acl_entry("auth", "mallory", count=6),
+        _acl_entry("key", "app", count=2, obj="user:secret:42"),
+        _acl_entry("command", "app", count=25, age=5),
+    ]
+    out = dataplane.acl_log(r, 25)
+    assert out["whoami"] == "default"
+    assert out["by_reason"] == {"auth": 6, "key": 2, "command": 25}
+    assert out["by_user"] == {"mallory": 6, "app": 27}
+    text = " ".join(f["message"] for f in out["findings"])
+    assert "6 failed authentications" in text and "mallory" in text and "ACL spike" in text
+    dump = repr(out)
+    assert "user:secret:42" not in dump and "hunter2" not in dump
+    key_entry = next(e for e in out["entries"] if e["reason"] == "key")
+    assert key_entry["object"] == "(name hidden)"
+    assert out["entries"][0]["count"] == 25  # most frequent first
+    assert set(out["entries"][0]["client"]) <= {"addr", "name", "user", "lib-name", "lib-ver", "cmd"}
+
+
+def test_acl_log_clean_and_unsupported():
+    r = FakeRedis(infos={"server": {"valkey_version": "8.0.1"}})
+    r.commands["ACL WHOAMI"] = "default"
+    r.commands["ACL LOG 25"] = []
+    out = dataplane.acl_log(r, 25)
+    assert out["entries"] == [] and out["findings"] == []
+
+    old = FakeRedis(infos={"server": {"redis_version": "5.0.7"}})
+    got = dataplane.acl_log(old, 25)
+    assert got["entries"] == [] and "not supported by redis 5.0.7" in got["notes"][0]
