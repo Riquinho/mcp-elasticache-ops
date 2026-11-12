@@ -1761,3 +1761,200 @@ def test_latency_events_tolerates_refused_commands_and_odd_replies():
     err = dataplane.latency_events(r3)
     assert any("LATENCY HISTORY command: unavailable" in n for n in err["notes"])
     assert any(f["severity"] == "info" and f.get("event") == "command" for f in err["findings"])
+
+
+# ------------------------------------------------------------ keyspace access evidence
+
+DAY = 24 * 3600
+
+
+def _access_redis(policy: str, values: dict[str, int], n: int = 10) -> FakeRedis:
+    r = FakeRedis(infos={"memory": _mem_info(maxmemory_policy=policy)}, data=_keys(n))
+    r.object_values = values
+    return r
+
+
+def test_keyspace_access_is_off_by_default():
+    out = dataplane.keyspace_sample(_access_redis("allkeys-lru", {}))
+    assert "access" not in out
+
+
+def test_keyspace_access_lru_reports_share_idle_over_7_days():
+    values = {f"k{i:04d}": (8 * DAY if i < 4 else 60) for i in range(10)}
+    r = _access_redis("allkeys-lru", values)
+    out = dataplane.keyspace_sample(r, include_access=True)
+    access = out["access"]
+    assert access["command"] == "OBJECT IDLETIME"
+    assert (access["keys_read"], access["cold_keys"], access["cold_pct"]) == (10, 4, 40.0)
+    assert access["eviction_risk_hint"] == "40% of sampled keys untouched for >7d, candidates for TTL or removal"
+    assert any(f.get("section") == "access" and f["severity"] == "info" for f in out["findings"])
+    assert not any(c[:2] == ("OBJECT", "FREQ") for c in r.sent)
+    assert out["coldest_keys_by_idle"][0]["idle_seconds"] == 8 * DAY
+
+
+def test_keyspace_access_lfu_uses_frequency_not_idle_time():
+    values = {f"k{i:04d}": (0 if i < 5 else 200) for i in range(10)}
+    r = _access_redis("allkeys-lfu", values)
+    out = dataplane.keyspace_sample(r, include_access=True)
+    assert out["access"]["command"] == "OBJECT FREQ"
+    assert out["access"]["cold_pct"] == 50.0
+    assert "low access frequency" in out["access"]["eviction_risk_hint"]
+    assert not any(c[:2] == ("OBJECT", "IDLETIME") for c in r.sent)
+
+
+def test_keyspace_access_warns_under_memory_pressure_and_stays_quiet_when_warm():
+    cold = {f"k{i:04d}": 9 * DAY for i in range(10)}
+    out = dataplane.keyspace_sample(_access_redis("noeviction", cold), include_access=True)
+    assert any(f.get("section") == "access" and f["severity"] == "warning" for f in out["findings"])
+    warm = dataplane.keyspace_sample(_access_redis("allkeys-lru", {}), include_access=True)
+    assert warm["access"]["cold_pct"] == 0.0 and "eviction_risk_hint" not in warm["access"]
+    assert not [f for f in warm["findings"] if f.get("section") == "access"]
+
+
+def test_keyspace_access_respects_the_time_budget():
+    r = FakeRedis(infos={"memory": _mem_info()}, data=_keys(500), scan_batch=5, scan_delay=0.03)
+    r.object_values = dict.fromkeys(r.data, 9 * DAY)
+    out = dataplane.keyspace_sample(r, sample_size=500, max_seconds=0.05, include_access=True)
+    assert out["partial"] is True
+    assert out["access"]["partial"] is True
+    assert out["access"]["keys_read"] == out["sampled_keys"] < 500
+
+
+def test_keyspace_access_sends_only_allowlisted_commands():
+    from mcp_elasticache_ops import safe_client
+
+    r = _access_redis("allkeys-lru", {})
+    dataplane.keyspace_sample(r, include_access=True)
+    assert r.sent
+    for command in r.sent:
+        safe_client.check(command)
+
+
+# ------------------------------------------------------------------ node_doctor
+
+_HEALTHY_MEMORY = (
+    "Hi Sam, I can't find any memory issue in your instance. I can only account for what occurs on this base."
+)
+_HEALTHY_LATENCY = (
+    "Dave, no latency spike was observed during the lifetime of this Redis instance, not in the slightest bit. "
+    "I honestly think you ought to sit down calmly, take a stress pill, and think things over."
+)
+_PROBLEM_MEMORY = (
+    "Hi Sam, this instance is having memory issues.\n\n"
+    "* High total RSS: This instance has a memory fragmentation and RSS overhead greater than 1.4.\n"
+    "* Big replica buffers: The replica output buffers in this instance are greater than 10% of the dataset size."
+)
+_PROBLEM_LATENCY = (
+    "Dave, I have observed latency spikes in this Redis instance.\n\n"
+    "1. command: 4 latency spikes (average 300ms, mean deviation 120ms, period 73.40 sec).\n\n"
+    "I have a few advices for you:\n\n- Check SLOWLOG to see which commands are slow."
+)
+
+
+def test_node_doctor_healthy_reply_has_no_findings():
+    r = FakeRedis(infos={"server": {"redis_version": "7.1.0"}})
+    r.commands["MEMORY DOCTOR"] = _HEALTHY_MEMORY
+    r.commands["LATENCY DOCTOR"] = _HEALTHY_LATENCY.encode()
+    out = dataplane.node_doctor(r)
+    assert out["findings"] == [] and out["notes"] == []
+    assert out["memory_doctor"] == {"status": "healthy", "advice": _HEALTHY_MEMORY}
+    assert out["latency_doctor"]["status"] == "healthy"
+
+
+def test_node_doctor_problem_reply_keeps_only_unhealthy_lines_and_trims_advice():
+    r = FakeRedis(infos={"server": {"redis_version": "7.1.0"}})
+    r.commands["MEMORY DOCTOR"] = _PROBLEM_MEMORY
+    r.commands["LATENCY DOCTOR"] = _PROBLEM_LATENCY + "\n- " + "x" * 5000
+    out = dataplane.node_doctor(r)
+    messages = [f["message"] for f in out["findings"]]
+    assert any(m.startswith("MEMORY DOCTOR: * High total RSS") for m in messages)
+    assert any(m.startswith("LATENCY DOCTOR: 1. command: 4 latency spikes") for m in messages)
+    assert all(f["severity"] in {"warning", "info"} and len(f["message"]) < 400 for f in out["findings"])
+    assert out["memory_doctor"]["status"] == "findings"
+    assert out["latency_doctor"]["status"] == "findings"
+    assert len(out["latency_doctor"]["advice"]) <= dataplane.LATENCY_DOCTOR_CHARS + 60
+
+
+def test_node_doctor_unsupported_command_is_a_note_not_an_error():
+    r = FakeRedis(infos={"server": {"redis_version": "3.2.0"}})
+    r.commands["MEMORY DOCTOR"] = redis.ResponseError("unknown subcommand 'doctor'")
+    out = dataplane.node_doctor(r)  # LATENCY DOCTOR is unknown to the fake: also refused
+    assert out["findings"] == []
+    assert out["memory_doctor"]["status"] == "not available"
+    assert out["latency_doctor"]["status"] == "not available"
+    assert any(n.startswith("MEMORY DOCTOR: not available") and "3.2.0" in n for n in out["notes"])
+    serverless = dataplane.node_doctor(r, serverless=True)
+    assert "serverless" in serverless["memory_doctor"]["reason"]
+
+
+def test_triage_includes_the_doctor_section():
+    r = FakeRedis(infos={"server": {"redis_version": "7.1.0"}, "default": {"role": "master"}})
+    r.commands["MEMORY DOCTOR"] = _PROBLEM_MEMORY
+    r.commands["LATENCY DOCTOR"] = _HEALTHY_LATENCY
+    out = dataplane.triage(r)
+    assert out["sections"]["doctor"] == {"status": "ok", "memory": "findings", "latency": "healthy"}
+    assert any(f.get("section") == "doctor" for f in out["findings"])
+
+
+# ------------------------------------------------------------------ engine quirk findings
+
+
+def _sources(info: dict) -> set[str]:
+    return {f["source"] for f in dataplane.engine_quirk_findings(info)}
+
+
+_VALKEY8 = {"server_name": "valkey", "valkey_version": "8.0.1", "redis_version": "7.2.4"}
+
+
+def test_quirk_io_threads_idle_with_busy_loop_only_on_valkey_8():
+    busy = {"io_threads_active": 0, "instantaneous_eventloop_duration_usec": 9000}
+    assert "io-threads" in _sources({**_VALKEY8, **busy})
+    assert "io-threads" not in _sources({**_VALKEY8, **busy, "io_threads_active": 1})
+    assert "io-threads" not in _sources({**_VALKEY8, **busy, "instantaneous_eventloop_duration_usec": 100})
+    assert "io-threads" not in _sources({**_VALKEY8, **busy, "valkey_version": "7.2.5"})
+    assert "io-threads" not in _sources({"redis_version": "7.2.4", **busy})
+
+
+def test_quirk_lazyfree_backlog_threshold_and_engine():
+    big = {"lazyfree_pending_objects": dataplane.LAZYFREE_PENDING_WARN + 1}
+    assert "lazyfree" in _sources({"redis_version": "7.0.0", **big})
+    assert "lazyfree" not in _sources({"redis_version": "3.2.0", **big})
+    assert "lazyfree" not in _sources({"redis_version": "7.0.0", "lazyfree_pending_objects": 10})
+
+
+def test_quirk_dict_rehash_needs_valkey_8_and_enough_memory_share():
+    heavy = {"used_memory": 1000, "mem_overhead_db_hashtable_rehashing": 50}
+    assert "dict-rehash" in _sources({**_VALKEY8, **heavy})
+    assert "dict-rehash" not in _sources({**_VALKEY8, **heavy, "mem_overhead_db_hashtable_rehashing": 1})
+    assert "dict-rehash" not in _sources({"redis_version": "7.2.4", **heavy})
+
+
+def test_quirk_replica_stale_data_only_when_link_down():
+    down = {"redis_version": "7.0.0", "role": "slave", "master_link_status": "down"}
+    assert "replica-serve-stale-data" in _sources(down)
+    assert "replica-serve-stale-data" not in _sources({**down, "master_link_status": "up"})
+    assert "replica-serve-stale-data" not in _sources({**down, "role": "master"})
+
+
+def test_quirk_lua_and_functions_memory_gated_by_version():
+    info = {
+        "redis_version": "7.2.0",
+        "used_memory": 10_000_000,
+        "used_memory_lua": 100_000,
+        "used_memory_vm_functions": 900_000,
+    }
+    assert "lua-functions" in _sources(info)  # 10% of used memory incl. functions
+    old = {**info, "redis_version": "6.2.0"}
+    assert "lua-functions" not in _sources(old)  # functions heap does not exist before 7.0
+    assert "lua-functions" in _sources({**old, "used_memory_lua": 80 * 1024 * 1024})
+    assert _sources({"redis_version": "7.2.0", "used_memory": 10_000_000, "used_memory_lua": 1000}) == set()
+
+
+def test_node_doctor_surfaces_quirk_findings():
+    r = FakeRedis(
+        infos={"server": {"redis_version": "7.0.0"}, "replication": {"role": "slave", "master_link_status": "down"}}
+    )
+    r.commands["MEMORY DOCTOR"] = _HEALTHY_MEMORY
+    r.commands["LATENCY DOCTOR"] = _HEALTHY_LATENCY
+    out = dataplane.node_doctor(r)
+    assert [f["source"] for f in out["findings"]] == ["replica-serve-stale-data"]

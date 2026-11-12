@@ -489,7 +489,7 @@ def slowlog(r: redis.Redis, count: int = 25, include_args: bool = False, serverl
         )
     summary = sorted(
         ({"command": k, "count": len(v), "total_us": sum(v), "max_us": max(v)} for k, v in by_cmd.items()),
-        key=lambda x: x["total_us"],
+        key=lambda x: _num(x["total_us"]),
         reverse=True,
     )
     return {"slowlog_len": total_len, "returned": len(out), "by_command": summary, "entries": out}
@@ -725,6 +725,152 @@ def latency_events(r: redis.Redis) -> dict:
     }
 
 
+DOCTOR_MAX_FINDINGS = 8  # advice lines kept per DOCTOR command
+DOCTOR_LINE_CHARS = 300
+# Lines the engine prints when it found nothing to report; they are kept in the advice text but are not findings.
+_DOCTOR_HEALTHY = re.compile(
+    r"can't find any memory issue|no latency spike was observed|empty or is using very little memory|"
+    r"no (memory|latency) (issue|spike)s? (was|were) (found|observed)",
+    re.IGNORECASE,
+)
+_DOCTOR_LEAD_IN = re.compile(r"^(hi sam|dave),?\s", re.IGNORECASE)
+
+
+def _doctor_findings(label: str, text: str) -> list[dict]:
+    """The non-healthy lines of a DOCTOR reply: the engine's own advice, one finding per line."""
+    lines = [line.strip() for line in text.splitlines()]
+    advice = [line for line in lines if line and not _DOCTOR_HEALTHY.search(line)]
+    if not any(not _DOCTOR_LEAD_IN.match(line) for line in advice):  # only a greeting left: nothing to act on
+        return []
+    out = []
+    for line in advice[:DOCTOR_MAX_FINDINGS]:
+        message = line if len(line) <= DOCTOR_LINE_CHARS else line[:DOCTOR_LINE_CHARS] + "..."
+        out.append(_finding("warning", f"{label}: {message}", source=label))
+    if len(advice) > DOCTOR_MAX_FINDINGS:
+        out.append(_finding("info", f"{label}: {len(advice) - DOCTOR_MAX_FINDINGS} more advice lines omitted"))
+    return out
+
+
+LAZYFREE_PENDING_WARN = 100_000  # objects still queued for background free
+REHASH_OVERHEAD_WARN_RATIO = 0.01  # incremental-rehash tables holding >1% of used memory
+SCRIPT_MEMORY_WARN_RATIO = 0.05  # Lua/functions memory above 5% of used memory
+SCRIPT_MEMORY_WARN_BYTES = 64 * 1024 * 1024
+EVENTLOOP_BUSY_USEC = 5_000  # average event-loop cycle above 5 ms
+
+
+def engine_quirk_findings(info: dict) -> list[dict]:
+    """Version-gated findings from a merged ``INFO``. Each check runs only on the engine/version that reports
+    the field, so an engine that lacks it never produces a finding (missing field = no signal)."""
+    engine = engine_of(info)
+    version = version_tuple(engine["version"])
+    valkey = engine["engine"] == "valkey"
+    findings: list[dict] = []
+    used = _num(info.get("used_memory"))
+
+    # Valkey 8+: I/O threads. The main thread is the ceiling when threads are idle and the loop is slow.
+    if valkey and version >= (8, 0) and "io_threads_active" in info:
+        loop_us = _num(info.get("instantaneous_eventloop_duration_usec"))
+        if int(_num(info["io_threads_active"])) == 0 and loop_us > EVENTLOOP_BUSY_USEC:
+            findings.append(
+                _finding(
+                    "info",
+                    f"io_threads_active=0 while the event loop averages {loop_us:.0f} us per cycle: the main thread "
+                    "does all I/O; if the parameter group sets io-threads > 1, check it took effect",
+                    source="io-threads",
+                )
+            )
+
+    # Background free backlog (lazyfree exists since 4.0 on Redis, always on Valkey).
+    pending = int(_num(info.get("lazyfree_pending_objects")))
+    if (valkey or version >= (4, 0)) and pending > LAZYFREE_PENDING_WARN:
+        findings.append(
+            _finding(
+                "warning",
+                f"{pending} objects are waiting in the lazyfree queue: big deletes or expirations outpace the "
+                "background thread, memory is released late",
+                source="lazyfree",
+            )
+        )
+
+    # Valkey 8 reports memory held by hash tables that are mid incremental rehash.
+    rehash = _num(info.get("mem_overhead_db_hashtable_rehashing"))
+    if valkey and version >= (8, 0) and used > 0 and rehash / used > REHASH_OVERHEAD_WARN_RATIO:
+        findings.append(
+            _finding(
+                "info",
+                f"{rehash / used:.1%} of used memory sits in hash tables that are rehashing: expect a temporary "
+                "memory and latency bump while the dict resizes",
+                source="dict-rehash",
+            )
+        )
+
+    # A replica that lost its primary keeps answering from old data unless replica-serve-stale-data is no.
+    if str(info.get("role", "")) == "slave" and str(info.get("master_link_status", "")) == "down":
+        since = int(_num(info.get("master_link_down_since_seconds")))
+        findings.append(
+            _finding(
+                "warning",
+                f"replica link to the primary is down (for {since}s): with replica-serve-stale-data yes (default) "
+                "reads return stale data; fix the link or set it to no",
+                source="replica-serve-stale-data",
+            )
+        )
+
+    # Lua scripts (all versions) and Redis 7 / Valkey functions keep their own heap outside the dataset.
+    script_bytes = _num(info.get("used_memory_lua"))
+    if version >= (7, 0):
+        script_bytes += _num(info.get("used_memory_vm_functions"))
+    if script_bytes > SCRIPT_MEMORY_WARN_BYTES or (used > 0 and script_bytes / used > SCRIPT_MEMORY_WARN_RATIO):
+        findings.append(
+            _finding(
+                "warning",
+                f"Lua/functions memory is {script_bytes / 1024 / 1024:.0f} MiB: scripts or loaded functions keep "
+                "large state (EVAL cache, global tables); check SCRIPT FLUSH policy and function libraries",
+                source="lua-functions",
+            )
+        )
+    return findings
+
+
+def node_doctor(r: redis.Redis, serverless: bool = False) -> dict:
+    """MEMORY DOCTOR and LATENCY DOCTOR of this node: the engine's own advice, findings first.
+
+    ``findings`` keeps only the non-healthy lines. A node that rejects a command (older engine, ElastiCache or
+    Serverless restriction) gets a ``not available`` note for that command instead of an error. Run it per node:
+    each node reports on its own memory and latency history.
+    """
+    info_server, _ = _try(r.info, "server")
+    findings: list[dict] = []
+    notes: list[str] = []
+    report: dict[str, dict] = {}
+    full_info, _ = _try(r.info)
+    if isinstance(full_info, dict):
+        findings += engine_quirk_findings({**(info_server or {}), **full_info})
+    for key, label, command in (
+        ("memory_doctor", "MEMORY DOCTOR", ("MEMORY", "DOCTOR")),
+        ("latency_doctor", "LATENCY DOCTOR", ("LATENCY", "DOCTOR")),
+    ):
+        reply, err = _try(r.execute_command, *command)
+        if err is not None:
+            reason = (
+                "serverless: command not supported" if serverless else command_support_note(label, info_server, err)
+            )
+            notes.append(f"{label}: not available ({reason})")
+            report[key] = {"status": "not available", "reason": reason}
+            continue
+        raw = _s(reply)
+        raw = raw.strip() if isinstance(raw, str) else ""
+        found = _doctor_findings(label, raw)
+        findings += found
+        advice = (
+            raw
+            if len(raw) <= LATENCY_DOCTOR_CHARS
+            else raw[:LATENCY_DOCTOR_CHARS] + (f"... [trimmed, {len(raw) - LATENCY_DOCTOR_CHARS} more characters]")
+        )
+        report[key] = {"status": "findings" if found else "healthy", "advice": advice}
+    return {"findings": _sorted_findings(findings), **report, "notes": notes}
+
+
 COMMANDSTATS_P99_WARN_USEC = 10_000  # a top-by-time command whose p99 exceeds 10 ms is worth a look
 MAX_ERROR_PREFIXES = 20  # errorstats rows returned
 # Error prefixes that point at a specific, fixable cause (INFO errorstats, Redis 6.2+/Valkey).
@@ -779,7 +925,7 @@ def commandstats(r: redis.Redis, top: int = 20) -> dict:
                 "failed_calls": int(_num(v.get("failed_calls"))),
             }
         )
-    rows.sort(key=lambda x: x["usec"], reverse=True)
+    rows.sort(key=lambda x: _num(x["usec"]), reverse=True)
     top_rows = rows[:top]
 
     notes: list[str] = []
@@ -795,11 +941,11 @@ def commandstats(r: redis.Redis, top: int = 20) -> dict:
 
     findings: list[str] = []
     for row in error_rows:
-        cause = _ERROR_CAUSES.get(row["error"].upper())
+        cause = _ERROR_CAUSES.get(str(row["error"]).upper())
         if cause and row["count"] > 0:
             findings.append(f"{row['count']} {row['error']} error replies since start: {cause}")
     for row in top_rows:
-        p99 = (latency.get(row["command"]) or {}).get("p99_usec", 0.0)
+        p99 = (latency.get(str(row["command"])) or {}).get("p99_usec", 0.0)
         if p99 > COMMANDSTATS_P99_WARN_USEC:
             findings.append(
                 f"{row['command']} p99 latency is {p99 / 1000:.1f} ms (above {COMMANDSTATS_P99_WARN_USEC // 1000} ms) "
@@ -985,6 +1131,9 @@ MAX_SAMPLE_SECONDS = 60.0
 PIPELINE_CHUNK = 100
 DEFAULT_TOP_PREFIXES = 10
 MAX_TOP_PREFIXES = 50
+ACCESS_IDLE_SECONDS = 7 * 24 * 3600  # OBJECT IDLETIME above this counts as untouched
+ACCESS_LFU_COLD_FREQ = 1  # OBJECT FREQ (logarithmic counter, decays when untouched) at or below this is cold
+ACCESS_FINDING_PCT = 20.0  # share of cold sampled keys that becomes a finding
 PREFIX_PRESSURE_RATIO = 0.8  # memory share of maxmemory at which a no-TTL prefix becomes a finding
 PREFIX_SHARE_PCT = 10.0  # a prefix must hold at least this share of sampled memory to be flagged
 PREFIX_NO_TTL_PCT = 90.0
@@ -1199,6 +1348,35 @@ def _prefix_report(
     }
 
 
+def _access_report(rows: list[dict], lfu: bool, policy: str, usage: float | None) -> tuple[dict, list[dict]]:
+    """Share of sampled keys that look untouched, from the OBJECT IDLETIME / OBJECT FREQ values already read.
+
+    LRU-style policies report idle seconds (cold = idle over 7 days); LFU policies have no idle time, so cold
+    means a frequency counter at or below ``ACCESS_LFU_COLD_FREQ``. Keys whose OBJECT reply failed are skipped.
+    """
+    field_name = "lfu_freq" if lfu else "idle_seconds"
+    known = [row[field_name] for row in rows if isinstance(row.get(field_name), int)]
+    cold = sum(1 for v in known if (v <= ACCESS_LFU_COLD_FREQ if lfu else v > ACCESS_IDLE_SECONDS))
+    pct = round(100 * cold / len(known), 1) if known else 0.0
+    basis = f"OBJECT FREQ <= {ACCESS_LFU_COLD_FREQ}" if lfu else "OBJECT IDLETIME > 7d"
+    report: dict[str, Any] = {
+        "command": "OBJECT FREQ" if lfu else "OBJECT IDLETIME",
+        "keys_read": len(known),
+        "cold_keys": cold,
+        "cold_pct": pct,
+        "basis": basis,
+    }
+    findings: list[dict] = []
+    if known and pct >= ACCESS_FINDING_PCT:
+        what = "of sampled keys have a low access frequency" if lfu else "of sampled keys untouched for >7d"
+        report["eviction_risk_hint"] = f"{pct:g}% {what}, candidates for TTL or removal"
+        pressure = policy == "noeviction" or (usage is not None and usage >= PREFIX_PRESSURE_RATIO)
+        findings.append(_finding("warning" if pressure else "info", report["eviction_risk_hint"], section="access"))
+    elif not known:
+        report["note"] = "no OBJECT reply could be read for the sampled keys"
+    return report, findings
+
+
 def keyspace_sample(
     r: redis.Redis,
     sample_size: int = 1000,
@@ -1209,6 +1387,7 @@ def keyspace_sample(
     max_seconds: float = DEFAULT_SAMPLE_SECONDS,
     clock: Callable[[], float] = time.monotonic,
     top_prefixes: int = DEFAULT_TOP_PREFIXES,
+    include_access: bool = False,
 ) -> dict:
     """Big/hot key finder based on a bounded SCAN.
 
@@ -1220,6 +1399,8 @@ def keyspace_sample(
     (OBJECT FREQ); otherwise idle time is reported. Only the connected node is
     sampled, which in cluster mode means only that node's slots. ``prefixes`` groups the sampled keys by
     normalised prefix (see ``normalize_key``) from data already fetched, so it costs no extra commands.
+    ``include_access`` adds an ``access`` block (share of keys idle for over 7 days, or with a cold LFU counter)
+    built from the same OBJECT replies and the same budget; it never issues extra commands.
     """
     sample_size = max(1, min(int(sample_size), 100_000))
     scan_count = max(1, min(int(scan_count), MAX_SCAN_COUNT))
@@ -1234,7 +1415,7 @@ def keyspace_sample(
     cursor = 0
     while True:
         cursor, batch = r.scan(cursor=cursor, match=match, count=scan_count)
-        keys.extend(batch)
+        keys.extend(k.decode() if isinstance(k, bytes) else k for k in batch)
         if cursor == 0 or len(keys) >= sample_size:
             break
         if clock() >= deadline:
@@ -1292,6 +1473,10 @@ def keyspace_sample(
     ttl_histogram = _ttl_histograms(rows)
     rate = hit_rate(mem_info.get("keyspace_hits"), mem_info.get("keyspace_misses"))
     prefix_report["findings"] += _ttl_findings(ttl_histogram["overall"], policy, rate)
+    access: dict[str, Any] | None = None
+    if include_access:
+        access, access_findings = _access_report(rows, lfu, policy, usage)
+        prefix_report["findings"] += access_findings
     result: dict[str, Any] = {
         "sampled_keys": len(rows),
         "dbsize": dbsize,
@@ -1316,6 +1501,8 @@ def keyspace_sample(
             (x for x in rows if x["type"] != "string"), key=lambda x: x["length"] or 0, reverse=True
         )[:top],
     }
+    if access is not None:
+        result["access"] = {**access, "partial": partial}
     cluster_info, _ = _try(r.info, "cluster")
     if int(_num((cluster_info or {}).get("cluster_enabled"))):
         result["cluster_mode"] = True
@@ -1571,10 +1758,22 @@ def cluster_topology_findings(nodes: list[dict]) -> list[dict]:
         flags = set(n["flags"])
         ep = label(n)
         if "fail" in flags:
-            findings.append(_finding("critical", f"node {ep} is flagged fail: the cluster considers it down", node=ep))
+            findings.append(
+                _finding(
+                    "critical",
+                    f"node {ep} is flagged fail: the cluster considers it down",
+                    node=ep,
+                    category="node-down",
+                )
+            )
         if "fail?" in flags:
             findings.append(
-                _finding("warning", f"node {ep} is flagged fail? (possible failure, not yet confirmed)", node=ep)
+                _finding(
+                    "warning",
+                    f"node {ep} is flagged fail? (possible failure, not yet confirmed)",
+                    node=ep,
+                    category="node-down",
+                )
             )
         if "handshake" in flags:
             findings.append(
@@ -1605,6 +1804,7 @@ def cluster_topology_findings(nodes: list[dict]) -> list[dict]:
                         "warning",
                         f"primary {label(p)} has no replica: no failover target for its {p['slot_count']} slots",
                         node=label(p),
+                        category="no-replica",
                     )
                 )
     elif primaries:
@@ -1633,16 +1833,24 @@ def _pairs(raw: Any) -> dict[str, Any]:
 
 
 def cluster_shards_check(raw: Any, lag_bytes_threshold: int = REPL_LAG_BYTES_WARN) -> tuple[list[dict], list[dict]]:
-    """Cross-check CLUSTER SHARDS (7.0+): node health and replication offset lag per replica.
+    """Cross-check CLUSTER SHARDS (7.0+): node health, replication offset gaps and replica coverage per shard.
 
-    Returns ``(findings, shards)``; ``shards`` lists slot count, primary and each replica's health and byte lag.
+    Returns ``(findings, shards)``; ``shards`` lists slot count, primary, each replica's health and byte lag, and
+    how many replicas are online. Findings are tagged ``source`` ``CLUSTER SHARDS`` and a ``category`` so
+    ``merge_shard_findings`` can drop the ones ``cluster_topology_findings`` already reports (``node-down``,
+    ``no-replica``). A shard whose replicas are all failed or loading has no failover target and is critical;
+    a ``loading`` replica (full sync in progress) is a warning.
     """
     findings: list[dict] = []
     shards: list[dict] = []
+    parsed: list[tuple[dict | None, list[dict], int]] = []
 
     def endpoint(n: dict) -> str:
         host = _s(n.get("endpoint") or n.get("hostname") or n.get("ip"))
         return f"{host}:{n.get('port') or n.get('tls-port')}"
+
+    def add(severity: str, message: str, node: str, category: str) -> None:
+        findings.append(_finding(severity, message, node=node, category=category, source="CLUSTER SHARDS"))
 
     for entry in raw or []:
         shard = _pairs(entry)
@@ -1656,19 +1864,19 @@ def cluster_shards_check(raw: Any, lag_bytes_threshold: int = REPL_LAG_BYTES_WAR
             health = str(_s(n.get("health", "online")))
             ep = endpoint(n)
             if health != "online":
-                findings.append(
-                    _finding(
-                        "critical" if health == "fail" else "warning",
-                        f"CLUSTER SHARDS: node {ep} health is {health}",
-                        node=ep,
-                    )
+                add(
+                    "critical" if health == "fail" else "warning",
+                    f"CLUSTER SHARDS: node {ep} health is {health}",
+                    ep,
+                    "node-down" if health == "fail" else "node-loading",
                 )
             if n is primary:
                 continue
             lag = primary_offset - int(_num(n.get("replication-offset"))) if primary_offset is not None else None
             replicas.append({"endpoint": ep, "health": health, "lag_bytes": lag})
             if lag is not None and lag > lag_bytes_threshold:
-                findings.append(_finding("warning", f"replica {ep} is {lag} bytes behind its primary", node=ep))
+                add("warning", f"replica {ep} is {lag} bytes behind its primary", ep, "replica-lag")
+        parsed.append((primary, replicas, slot_count))
         shards.append(
             {
                 "slot_count": slot_count,
@@ -1676,7 +1884,38 @@ def cluster_shards_check(raw: Any, lag_bytes_threshold: int = REPL_LAG_BYTES_WAR
                 "replicas": replicas,
             }
         )
+    replication_in_use = any(replicas for _, replicas, _ in parsed)
+    for primary, replicas, slot_count in parsed:
+        if primary is None:
+            continue
+        pep = endpoint(primary)
+        if not replicas and replication_in_use:
+            add(
+                "warning",
+                f"shard {pep} has no replica: no failover target for its {slot_count} slots",
+                pep,
+                "no-replica",
+            )
+        elif replicas and not any(rep["health"] == "online" for rep in replicas):
+            add(
+                "critical",
+                f"shard {pep} has no healthy replica ({len(replicas)} replica(s), none online): "
+                f"failover has no target for its {slot_count} slots",
+                pep,
+                "no-healthy-replica",
+            )
     return findings, shards
+
+
+def merge_shard_findings(topology: list[dict], check: list[dict]) -> list[dict]:
+    """Topology findings plus the CLUSTER SHARDS findings that add something new, severity-sorted.
+
+    A CLUSTER SHARDS finding is dropped when a topology finding already covers the same ``(node, category)``,
+    for example a node flagged ``fail`` in CLUSTER NODES or a primary without a replica.
+    """
+    seen = {(f.get("node"), f["category"]) for f in topology if f.get("category")}
+    extra = [f for f in check if (f.get("node"), f.get("category")) not in seen]
+    return _sorted_findings([*topology, *extra])
 
 
 def _endpoint(n: dict) -> str:
@@ -1727,7 +1966,7 @@ def cluster_nodes(r: redis.Redis, serverless: bool = False, cross_check: bool = 
         findings.append(f"{covered} of {TOTAL_SLOTS} slots covered by primaries")
     findings += [f"node {_endpoint(n)} is {','.join(n['flags'])}/{n['link_state']}" for n in nodes if n["failing"]]
     topology = cluster_topology_findings(nodes)
-    notes: list[str] = []
+    notes = []
     shards_check = None
     if cross_check:
         raw_shards, shards_err = _try(r.execute_command, "CLUSTER", "SHARDS")
@@ -1738,7 +1977,7 @@ def cluster_nodes(r: redis.Redis, serverless: bool = False, cross_check: bool = 
             )
         else:
             check_findings, shards_check = cluster_shards_check(raw_shards)
-            topology = _sorted_findings([*topology, *check_findings])
+            topology = merge_shard_findings(topology, check_findings)
     return {
         "cluster_enabled": True,
         "nodes": nodes,
@@ -1921,6 +2160,7 @@ def _fan_out_primaries(
     max_workers: int,
     total_seconds: float,
     per_node_timeout: float,
+    cross_check: bool = False,
 ) -> tuple[dict, dict[str, dict]]:
     """Run ``work(client, shard_budget_seconds, shard_count)`` on every shard primary.
 
@@ -1929,8 +2169,9 @@ def _fan_out_primaries(
     primaries the worker pool needs (``ceil(primaries / workers)``), so the sum of all shard budgets stays
     within ``total_seconds``; a shard that hangs is abandoned ``per_node_timeout`` seconds after that,
     and a dead shard never fails the call. Clients come from ``client_factory`` (``SafeRedis`` only).
+    ``cross_check`` also reads CLUSTER SHARDS (one extra command on the seed node) for ``topology_findings``.
     """
-    topo = cluster_nodes(r, cross_check=False)
+    topo = cluster_nodes(r, cross_check=cross_check)
     if not topo.get("cluster_enabled") or "nodes" not in topo:
         return topo, {}
     primaries = [n for n in topo["nodes"] if n["role"] == "primary" and n["port"]]
@@ -2201,7 +2442,9 @@ def cluster_slowlog(
         }
     entries.sort(key=lambda e: _num(e["duration_us"]), reverse=True)
     counts = _shard_counts(outcomes)
-    by_command = sorted(({"command": k, **v} for k, v in by_cmd.items()), key=lambda x: x["total_us"], reverse=True)
+    by_command = sorted(
+        ({"command": k, **v} for k, v in by_cmd.items()), key=lambda x: _num(x["total_us"]), reverse=True
+    )
     if entries:
         worst = entries[0]
         findings.append(
@@ -2730,12 +2973,19 @@ def _triage_latency(d: dict) -> tuple[dict, list[dict]]:
     return {"ping_p50_ms": rtt["p50"], "ping_p99_ms": rtt["p99"], "events": len(events)}, findings
 
 
+def _triage_doctor(d: dict) -> tuple[dict, list[dict]]:
+    """MEMORY/LATENCY DOCTOR advice: two cheap commands whose refusal is a note, never an unavailable section."""
+    summary = {"memory": d["memory_doctor"]["status"], "latency": d["latency_doctor"]["status"]}
+    return summary, list(d["findings"])
+
+
 def triage(
     r: redis.Redis, client_factory: Callable[[str, int], redis.Redis] | None = None, serverless: bool = False
 ) -> dict:
     """One-call data-plane on-call snapshot.
 
-    Runs health, memory, replication, clients, commandstats, slowlog (top 5) and latency by reusing the
+    Runs health, memory, replication, clients, commandstats, slowlog (top 5), latency and the DOCTOR advice by
+    reusing the
     section functions (no extra Redis commands). A section that fails becomes ``unavailable`` and the
     result ``partial``; findings from every section are merged, severity-sorted and capped at
     ``TRIAGE_MAX_FINDINGS``. On Serverless an unavailable section is an info finding, not a warning.
@@ -2748,6 +2998,7 @@ def triage(
         ("commandstats", lambda: commandstats(r, 500), _triage_commandstats),
         ("slowlog", lambda: slowlog(r, 5, False, serverless), _triage_slowlog),
         ("latency", lambda: latency(r, 5), _triage_latency),
+        ("doctor", lambda: node_doctor(r, serverless), _triage_doctor),
     ]
     sections: dict[str, dict] = {}
     findings: list[dict] = []
@@ -2808,7 +3059,7 @@ def cluster_triage(
     """
     started = time.monotonic()
     topo, outcomes = _fan_out_primaries(
-        r, client_factory, _node_triage_work, max_workers, max_seconds, per_node_timeout
+        r, client_factory, _node_triage_work, max_workers, max_seconds, per_node_timeout, cross_check=True
     )
     if not outcomes:
         if topo.get("cluster_enabled") is False:
@@ -2864,6 +3115,11 @@ def cluster_triage(
     findings = list(merged.values())
     for f in findings:
         f["count"] = len(f["nodes"])
+    # CLUSTER SHARDS cross-check (already deduplicated against the CLUSTER NODES topology findings)
+    for f in topo.get("topology_findings", []):
+        if f.get("source") == "CLUSTER SHARDS":
+            findings.append({**f, "section": "topology", "nodes": [f["node"]], "shards": [], "count": 1})
+    findings.sort(key=severity_rank)
     total = len(findings)
     counts = _shard_counts(outcomes)
     if not findings:
@@ -2875,6 +3131,7 @@ def cluster_triage(
         "partial": counts["shards_total"] != counts["shards_ok"]
         or any(n["status"] not in ("ok", "unreachable") for n in per_node.values()),
         "partial_nodes": _partial_nodes(outcomes),
+        **({"notes": topo["notes"]} if topo.get("notes") else {}),
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "worst_node": node_order[0] if node_order and tally[node_order[0]] != (0, 0) else None,
         "findings": findings[:CLUSTER_TRIAGE_MAX_FINDINGS],

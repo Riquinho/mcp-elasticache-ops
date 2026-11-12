@@ -3,6 +3,27 @@
 ## Unreleased
 
 ### Added
+- Round 16: `controlplane.py` is now the `controlplane/` package (core plumbing, shared helpers, inventory, monitoring,
+  cost, security, triage; every module under 1200 lines, all names re-exported so `server.py` and the tests import
+  unchanged; the two AST scans over the former single file now walk the package); mypy in the dev group and in CI
+  (`uv run mypy src`, baseline without strict, `ignore_missing_imports` for boto3/botocore/moto); `node_doctor` adds
+  engine-quirk findings from `INFO` gated by the parsed engine version (Valkey 8 io-threads idle on a busy event loop,
+  lazyfree backlog, dict rehash memory, replica serving stale data on a down link, Lua/functions memory with the
+  functions heap only counted from 7.0); output-budget audit `tests/test_output_budget.py` calls every registered
+  tool through the server layer with oversized backends and fails when a tool has no fixture. Integration gate: C:
+  read 6.8G free at the start of the round and 890M at the end, so `scripts/integration.sh` exited at the gate
+  (5G, unchanged) and no containers were started.
+- Round 15: `node_doctor` (`MEMORY DOCTOR` / `LATENCY DOCTOR` as findings first, `not available` note when rejected,
+  also a section of `node_triage`); `node_keyspace_sample(include_access=true)` access summary (cold keys, share idle
+  over 7 days, eviction-risk hint; the existing `OBJECT FREQ`/`IDLETIME` reads of the sampling pipeline are kept because
+  `coldest_keys_by_idle` and `hot_keys_by_lfu` depend on them, so the flag gates the summary, not the reads);
+  `CLUSTER SHARDS` cross-check in `node_cluster_health` and `node_cluster_triage` (offset gaps, loading or failed
+  replicas, shard without a healthy replica, `CLUSTER NODES` fallback, deduplicated against topology findings);
+  `aws_capacity_forecast` (days until memory is full from 14 days of hourly metrics, one `GetMetricData` batch,
+  ranked, <7 days critical, <30 warning). Tool count is now 53. Integration gate: C: showed 3.6G free (99% used) during
+  the round, so the integration run was not started; `scripts/integration.sh` and `.ps1` now print the exact prune and
+  `fstrim` steps when the gate trips (gate unchanged at 5G; df later read 6.9G free). Splitting `controlplane.py` into a
+  package was deferred.
 - Round 14: `aws_shard_balance` (per-shard CPU/memory/items/traffic skew, hot-key and hot-shard findings); failover/event correlation in `aws_triage` and `aws_serverless_triage` (category `failover-correlation`); serverless limits/throttling findings with p95 and a recommendation; `aws_parameters(diff_engine_defaults=True)` plus risky-setting findings (README IAM adds `elasticache:DescribeEngineDefaultParameters`, guarded by a README-policy test); `node_latency_events` (LATENCY LATEST/HISTORY/DOCTOR, MEMORY DOCTOR). 51 tools. Local integration run skipped: only 3.6G free on C: (gate needs 5G), docker cleanup freed 0B and fstrim is unavailable in the WSL distro; gate not weakened.
 - Round 13: `node_connectivity` (staged DNS, TCP, TLS with plaintext fallback probe, PING, AUTH; stops at the first
   failure, findings first, secrets never echoed); `aws_security_audit` (fleet hardening roll-up with region fan-out:

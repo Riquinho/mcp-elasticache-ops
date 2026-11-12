@@ -7,6 +7,18 @@
 #   IMAGE=redis:7-alpine scripts/integration.sh
 set -euo pipefail
 
+MIN_FREE_GB=${MIN_FREE_GB:-5}
+FREE_GB=$(df -Pk "${DISK_PATH:-.}" | awk 'NR==2 {printf "%d", $4/1048576}')
+if [ "$FREE_GB" -lt "$MIN_FREE_GB" ]; then
+  echo "disk gate: ${FREE_GB}G free (< ${MIN_FREE_GB}G required)"
+  echo "INTEGRATION SKIPPED: nothing was started. Free only what tests created, then re-run (the gate is not lowered):"
+  echo "  1. wsl -d Ubuntu -e docker image prune -f"
+  echo "  2. wsl -d Ubuntu -e docker volume ls -q -f dangling=true   (remove only 64-hex anonymous names)"
+  echo "  3. wsl -d Ubuntu -e docker builder prune -f --filter until=24h"
+  echo "  4. wsl -d Ubuntu -u root -e fstrim -v /"
+  exit 0
+fi
+
 DOCKER=${DOCKER:-docker}
 IMAGE=${IMAGE:-valkey/valkey:8-alpine}
 NAME=${NAME:-prova-elasticache-ops-redis}

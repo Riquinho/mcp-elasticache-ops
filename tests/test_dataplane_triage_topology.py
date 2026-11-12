@@ -50,6 +50,7 @@ def test_triage_healthy_case_covers_every_section():
         "memory",
         "replication",
         "clients",
+        "doctor",
         "commandstats",
         "slowlog",
         "latency",
@@ -448,3 +449,109 @@ def test_cluster_topology_fan_out_does_not_probe_cluster_shards():
     seed.execute_command = lambda *a: (calls.append(a), original(*a))[1]
     dataplane._fan_out_primaries(seed, lambda h, p: FakeRedis(), lambda c, b, n: {}, 2, 1.0, 1.0)
     assert ("CLUSTER", "SHARDS") not in calls
+
+
+# ------------------------------------------------- CLUSTER SHARDS cross-check (round 15)
+
+
+def _shards_entry(slots, *members):
+    """CLUSTER SHARDS entry (RESP3 dict shape); members are (ip, role, offset, health)."""
+    return {
+        "slots": slots,
+        "nodes": [
+            {"id": ip, "endpoint": ip, "port": 6379, "role": role, "replication-offset": offset, "health": health}
+            for ip, role, offset, health in members
+        ],
+    }
+
+
+SHARDS_TOPOLOGY = _cluster_text(
+    _node(ID_A, "10.0.0.1:6379", "myself,master", slots="0-8191"),
+    _node(ID_B, "10.0.0.2:6379", "master", slots="8192-16383"),
+    _node(ID_C, "10.0.0.3:6379", "slave", master=ID_A),
+    _node(ID_R, "10.0.0.4:6379", "slave", master=ID_B),
+)
+
+
+def _seed_shards(reply, text=SHARDS_TOPOLOGY, version="7.2.4"):
+    seed = FakeRedis(infos={"cluster": {"cluster_enabled": 1}, "server": {"redis_version": version}})
+    seed.commands["CLUSTER NODES"] = text
+    if reply is not None:
+        seed.commands["CLUSTER SHARDS"] = reply
+    return seed
+
+
+def test_cluster_shards_check_reports_offset_gap_and_failed_replica():
+    reply = [
+        _shards_entry(
+            [0, 8191],
+            ("10.0.0.1", "master", 9_000_000, "online"),
+            ("10.0.0.3", "replica", 1_000, "online"),
+        ),
+        _shards_entry(
+            [8192, 16383],
+            ("10.0.0.2", "master", 100, "online"),
+            ("10.0.0.4", "replica", 100, "fail"),
+        ),
+    ]
+    out = dataplane.cluster_nodes(_seed_shards(reply))
+    findings = {f["message"]: f for f in out["topology_findings"]}
+    gap = findings["replica 10.0.0.3:6379 is 8999000 bytes behind its primary"]
+    assert gap["severity"] == "warning" and gap["source"] == "CLUSTER SHARDS"
+    failed = findings["CLUSTER SHARDS: node 10.0.0.4:6379 health is fail"]
+    assert failed["severity"] == "critical"
+    none_healthy = [m for m in findings if "has no healthy replica" in m]
+    assert none_healthy and findings[none_healthy[0]]["severity"] == "critical"
+    assert out["topology_findings"][0]["severity"] == "critical"  # findings first, worst first
+
+
+def test_cluster_shards_check_flags_a_shard_without_replica_once():
+    text = _cluster_text(
+        _node(ID_A, "10.0.0.1:6379", "myself,master", slots="0-8191"),
+        _node(ID_B, "10.0.0.2:6379", "master", slots="8192-16383"),
+        _node(ID_C, "10.0.0.3:6379", "slave", master=ID_A),
+    )
+    reply = [
+        _shards_entry([0, 8191], ("10.0.0.1", "master", 10, "online"), ("10.0.0.3", "replica", 10, "online")),
+        _shards_entry([8192, 16383], ("10.0.0.2", "master", 10, "online")),
+    ]
+    out = dataplane.cluster_nodes(_seed_shards(reply, text))
+    assert sum("10.0.0.2:6379 has no replica" in f["message"] for f in out["topology_findings"]) == 1
+    assert out["topology_findings"][0]["message"].startswith("primary 10.0.0.2:6379 has no replica")  # topology wins
+    findings, shards = dataplane.cluster_shards_check(reply)
+    assert any(f["category"] == "no-replica" and f["source"] == "CLUSTER SHARDS" for f in findings)
+    assert shards[1]["replicas"] == []
+
+
+def test_cluster_shards_check_dedupes_a_node_already_flagged_fail():
+    text = _cluster_text(
+        _node(ID_A, "10.0.0.1:6379", "myself,master", slots="0-16383"),
+        _node(ID_C, "10.0.0.3:6379", "slave,fail", master=ID_A, link="disconnected"),
+    )
+    reply = [_shards_entry([0, 16383], ("10.0.0.1", "master", 10, "online"), ("10.0.0.3", "replica", 10, "fail"))]
+    out = dataplane.cluster_nodes(_seed_shards(reply, text))
+    down = [f for f in out["topology_findings"] if f["node"] == "10.0.0.3:6379" and f["category"] == "node-down"]
+    assert len(down) == 1 and "flagged fail" in down[0]["message"]
+
+
+def test_cluster_shards_check_older_engine_falls_back_to_cluster_nodes():
+    seed = _seed_shards(redis.ResponseError("unknown subcommand 'shards'"), version="6.2.14")
+    out = dataplane.cluster_nodes(seed)
+    assert "shards_check" not in out
+    assert any("CLUSTER SHARDS: not supported by redis 6.2.14" in n for n in out["notes"])
+    assert out["shards"] and out["topology_findings"] == []
+
+
+def test_cluster_triage_reports_cluster_shards_findings_and_the_fallback_note():
+    reply = [
+        _shards_entry([0, 8191], ("10.0.0.1", "master", 10, "online"), ("10.0.0.3", "replica", 10, "loading")),
+        _shards_entry([8192, 16383], ("10.0.0.2", "master", 10, "online"), ("10.0.0.4", "replica", 10, "online")),
+    ]
+    clients = {ep: FakeRedis(infos={"default": {"role": "master"}}) for ep in ("10.0.0.1:6379", "10.0.0.2:6379")}
+    factory, _ = _fan_factory(clients)
+    out = dataplane.cluster_triage(_seed_shards(reply), factory)
+    topo = [f for f in out["findings"] if f.get("section") == "topology"]
+    assert [f["message"] for f in topo if "loading" in f["message"]]
+    assert any("has no healthy replica" in f["message"] for f in topo)
+    old = dataplane.cluster_triage(_seed_shards(redis.ResponseError("unknown"), version="6.0.9"), factory)
+    assert any("CLUSTER SHARDS" in n for n in old["notes"])

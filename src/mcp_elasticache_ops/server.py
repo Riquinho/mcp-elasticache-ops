@@ -35,7 +35,7 @@ ElastiCache/CloudWatch APIs and are optional. Start with `node_health` and
 `aws_replication_groups`, then drill down. No tool writes, flushes or reads values.
 """
 
-READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True)
+READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True)
 
 mcp = FastMCP("mcp-elasticache-ops", instructions=INSTRUCTIONS)
 
@@ -257,10 +257,19 @@ def node_connectivity() -> dict:
 @read_tool
 def node_triage() -> dict:
     """On-call snapshot of the connected endpoint in one call: health, memory, replication, clients,
-    failed/rejected commandstats, top-5 slowlog and latency. Findings from every section are merged,
-    worst-first (max 30), with a short per-section summary; a section that fails is reported as
-    unavailable and the rest still run. Start here, then drill into the specific node_ tool."""
+    failed/rejected commandstats, top-5 slowlog, latency and MEMORY/LATENCY DOCTOR advice. Findings from every
+    section are merged worst-first (max 30); a section that fails is reported unavailable and the rest still
+    run. Start here, then drill into the specific node_ tool."""
     return dataplane.triage(redis_client(), _node_client, _serverless())
+
+
+@read_tool
+def node_doctor() -> dict:
+    """MEMORY DOCTOR and LATENCY DOCTOR of the connected node: the engine's own advice text (trimmed) plus
+    findings that keep only the non-healthy lines. Engines or managed services that reject the command
+    (older versions, Serverless) get a 'not available' note, not an error. Per node: point
+    ELASTICACHE_HOST at each node you suspect. node_triage already includes this section."""
+    return dataplane.node_doctor(redis_client(), _serverless())
 
 
 @read_tool
@@ -344,12 +353,28 @@ def node_keyspace_sample(
         float, Field(gt=0, le=60, description="Wall-clock budget; returns partial=true when exceeded")
     ] = 10.0,
     top_prefixes: Annotated[int, Field(ge=1, le=50, description="Key prefixes to report")] = 10,
+    include_access: Annotated[
+        bool,
+        Field(
+            description="Add an access block: share of sampled keys idle over 7 days (OBJECT IDLETIME) or with a "
+            "cold LFU counter (OBJECT FREQ), with an eviction-risk hint"
+        ),
+    ] = False,
 ) -> dict:
     """Big keys, hot keys (LFU) or coldest keys, type mix, TTL coverage and per-prefix bytes from a bounded
     SCAN. Metadata only; values never read. Partial=true at max_seconds. Cluster mode: connected node's
-    slots only, use node_cluster_keyspace_sample for all shards. Flags large no-TTL prefixes under pressure."""
+    slots only, use node_cluster_keyspace_sample for all shards. Flags large no-TTL prefixes under pressure.
+    include_access=true adds the share of idle keys (IDLETIME, or FREQ on LFU)."""
     return dataplane.keyspace_sample(
-        redis_client(), sample_size, match, top, scan_count, pause_ms, max_seconds, top_prefixes=top_prefixes
+        redis_client(),
+        sample_size,
+        match,
+        top,
+        scan_count,
+        pause_ms,
+        max_seconds,
+        top_prefixes=top_prefixes,
+        include_access=include_access,
     )
 
 
@@ -488,9 +513,10 @@ def memcached_stats(
     """Memcached summary (hit ratio, memory, evictions, connections) or a raw
     `stats <group>` output. Uses MEMCACHED_HOST/MEMCACHED_PORT."""
     cfg = _memcached_target()
+    host = cfg.host or ""  # _memcached_target already rejected an empty host
     if group:
-        return {"group": group, "stats": memcached.stats(cfg.host, cfg.port, group, cfg.timeout)}
-    return memcached.summary(cfg.host, cfg.port, cfg.timeout)
+        return {"group": group, "stats": memcached.stats(host, cfg.port, group, cfg.timeout)}
+    return memcached.summary(host, cfg.port, cfg.timeout)
 
 
 @read_tool
@@ -810,6 +836,15 @@ def aws_cost_overview(region: Region = None) -> dict:
     replicas, on-demand and non-Graviton nodes, old manual snapshots, uncapped serverless. Bounded GetMetricData
     calls under one deadline; all ELASTICACHE_REGIONS unless `region` is set."""
     return control_plane().cost_overview_fan_out(region)
+
+
+@read_tool
+def aws_capacity_forecast(region: Region = None) -> dict:
+    """Days until memory is full across the fleet, findings first: every replication group, standalone cluster
+    and serverless cache from 14 days of DatabaseMemoryUsagePercentage (Serverless: BytesUsedForCache against
+    the storage maximum), ranked soonest-first. Under 7 days critical, under 30 warning, with a sizing
+    hint. One GetMetricData batch; all ELASTICACHE_REGIONS unless `region` is set."""
+    return control_plane().capacity_forecast_fan_out(region)
 
 
 # ------------------------------------------------------------------- on-call prompts

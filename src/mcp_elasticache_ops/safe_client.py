@@ -364,7 +364,7 @@ class _GuardedConnectionMixin:
         _check_handshake_or_allowed(args)
         previous, self._safe_packed_ok = self._safe_packed_ok, True  # checked above
         try:
-            return super().send_command(*args, **kwargs)  # type: ignore[misc]
+            return super().send_command(*args, **kwargs)
         finally:
             self._safe_packed_ok = previous
 
@@ -373,7 +373,7 @@ class _GuardedConnectionMixin:
         # queued command first) may use them.
         if not self._safe_packed_ok:
             raise ReadOnlyViolation("raw packed commands are not allowed")
-        return super().send_packed_command(command, check_health=check_health)  # type: ignore[misc]
+        return super().send_packed_command(command, check_health=check_health)
 
 
 def _guarded_class(cls: type) -> type:

@@ -64,6 +64,8 @@ class FakeRedis:
         self.clients: list[dict] = []
         self.commands: dict[str, Any] = {}
         self.closed = False
+        self.object_values: dict[str, int] = {}  # key -> OBJECT FREQ/IDLETIME reply (default 5)
+        self.sent: list[tuple] = []  # every pipelined command, for allowlist assertions
 
     def info(self, section: str | None = None) -> dict:
         if section is None:
@@ -97,8 +99,9 @@ class FakeRedis:
 
     def run(self, cmd: tuple):
         name = cmd[0]
+        self.sent.append(cmd)
         if name == "OBJECT":
-            return 5
+            return self.object_values.get(cmd[-1], 5)
         key = cmd[-1] if name in {"TYPE", "MEMORY USAGE", "PTTL"} else cmd[1]
         typ, size, pttl, length = self.data[key]
         return {"TYPE": typ, "MEMORY USAGE": size, "PTTL": pttl}.get(name, length)

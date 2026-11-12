@@ -26,6 +26,12 @@ $free = [math]::Round((Get-PSDrive -Name $Drive).Free / 1GB, 1)
 if ($free -lt $MinFreeGB) {
     Write-Host "disk gate: ${free}G free on ${Drive}: (< ${MinFreeGB}G required)"
     Write-Host "INTEGRATION SKIPPED: not enough disk, nothing was started. Trigger the CI integration job instead (workflow_dispatch or the 'integration' PR label)."
+    Write-Host "To free space (only what tests created; never 'prune -a', never named volumes in use):"
+    Write-Host "  1. wsl -d Ubuntu -e docker image prune -f"
+    Write-Host "  2. wsl -d Ubuntu -e docker volume ls -q -f dangling=true   (remove only 64-hex anonymous names)"
+    Write-Host "  3. wsl -d Ubuntu -e docker builder prune -f --filter until=24h"
+    Write-Host "  4. wsl -d Ubuntu -u root -e fstrim -v /"
+    Write-Host "Then re-run this script. The gate (-MinFreeGB ${MinFreeGB}) is not lowered."
     exit 0
 }
 Write-Host "disk gate: ${free}G free on ${Drive}: (>= ${MinFreeGB}G), running integration"

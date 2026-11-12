@@ -40,6 +40,8 @@ jobs:
         run: bash scripts/release-check.sh
       - run: uv run ruff check .
       - run: uv run ruff format --check .
+      - name: Type check
+        run: uv run mypy src
       - name: Build wheel and smoke test it in an isolated interpreter
         shell: bash
         run: |

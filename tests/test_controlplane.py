@@ -259,9 +259,10 @@ def test_every_boto3_call_in_controlplane_has_a_matching_action_in_the_readme_po
     readme = (root / "README.md").read_text(encoding="utf-8")
     block = re.search(r"```json\n(\{.*?\})\n```", readme, re.S).group(1)
     actions = {a.split(":", 1)[1] for st in json.loads(block)["Statement"] for a in st["Action"]}
-    tree = ast.parse((root / "src" / "mcp_elasticache_ops" / "controlplane.py").read_text(encoding="utf-8"))
+    package = root / "src" / "mcp_elasticache_ops" / "controlplane"
+    trees = [ast.parse(f.read_text(encoding="utf-8")) for f in sorted(package.glob("*.py"))]
     names = set()
-    for node in ast.walk(tree):
+    for node in (n for tree in trees for n in ast.walk(tree)):
         text = node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
         text = node.attr if isinstance(node, ast.Attribute) else text
         if text and re.fullmatch(r"(describe|list)_[a-z_]+|get_metric_data", text):

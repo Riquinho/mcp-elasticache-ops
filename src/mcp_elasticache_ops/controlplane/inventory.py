@@ -1,0 +1,790 @@
+"""Replication groups, clusters, serverless caches, snapshots, global datastores, events and catalogs."""
+
+from __future__ import annotations
+
+import datetime as dt
+import re
+from collections import Counter, defaultdict
+from typing import Any
+
+from botocore.exceptions import (
+    BotoCoreError,
+    ClientError,
+)
+
+from .. import memcached
+from ._core import _CoreMixin
+from ._shared import (
+    _CRITICAL_EVENT_WORDS,
+    _SEVERITY_ORDER,
+    GLOBAL_LAG_METRIC,
+    _auth_token_age_days,
+    _cluster_findings,
+    _error_code,
+    _error_result,
+    _jsonable,
+    _rg_findings,
+    _serverless_cache_findings,
+    _serverless_snapshot_findings,
+    _serverless_snapshot_view,
+    _snapshot_findings,
+    _snapshot_view,
+    _sorted_findings,
+    finding,
+)
+
+GLOBAL_LAG_WINDOW_MINUTES = 60
+
+
+MAX_GLOBAL_SECONDARIES = 6  # secondary regions inspected per global datastore (each costs 3 API calls)
+
+
+HEALTHY_GLOBAL_MEMBER_STATUSES = frozenset({"associated", "available"})
+
+
+EVENT_SOURCE_TYPES = frozenset(
+    {
+        "cache-cluster",
+        "cache-parameter-group",
+        "cache-security-group",
+        "cache-subnet-group",
+        "replication-group",
+        "serverless-cache",
+        "user",
+        "user-group",
+    }
+)
+
+
+MAX_EVENTS_RETURNED = 100
+
+
+MAX_EVENT_FINDINGS = 50
+
+
+# aws_events treats a failover as critical (a primary was lost) and maintenance as a warning.
+_EVENTS_CRITICAL_WORDS = (*_CRITICAL_EVENT_WORDS, "not available", "failover")
+
+
+_EVENTS_WARNING_WORDS = ("replac", "reboot", "restart", "removed", "recover", "maintenance")
+
+
+def _event_severity(message: str) -> str:
+    low = message.lower()
+    if any(w in low for w in _EVENTS_CRITICAL_WORDS):
+        return "critical"
+    if any(w in low for w in _EVENTS_WARNING_WORDS):
+        return "warning"
+    return "info"
+
+
+def _event_time(event: dict) -> float:
+    when = event.get("Date")
+    return when.timestamp() if isinstance(when, dt.datetime) else 0.0
+
+
+def _event_stamp(event: dict) -> str:
+    when = event.get("Date")
+    return when.isoformat() if isinstance(when, dt.datetime) else str(when)
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", version))
+
+
+def _engine_version_views(items: list[dict], prefix: str | None) -> list[dict]:
+    views = [
+        {
+            "version": str(i.get("EngineVersion", "")),
+            "family": i.get("CacheParameterGroupFamily"),
+            "description": i.get("CacheEngineVersionDescription"),
+        }
+        for i in items
+        if not prefix or str(i.get("EngineVersion", "")).startswith(prefix)
+    ]
+    return sorted(views, key=lambda v: _version_key(v["version"]), reverse=True)
+
+
+def _latest_per_major(views: list[dict], engine: str) -> list[dict]:
+    """Newest listed version of each major (views are sorted newest first)."""
+    seen: set[int] = set()
+    out: list[dict] = []
+    for v in views:
+        key = _version_key(v["version"])
+        major = key[0] if key else -1
+        if major not in seen:
+            seen.add(major)
+            out.append({**v, "engine": engine, "reason": f"latest minor in major {major}"})
+    return out
+
+
+def _log_delivery_view(obj: dict) -> list[dict]:
+    return [
+        {
+            "log_type": d.get("LogType"),
+            "destination_type": d.get("DestinationType"),
+            "log_format": d.get("LogFormat"),
+            "status": d.get("Status"),
+            "message": d.get("Message"),
+        }
+        for d in obj.get("LogDeliveryConfigurations") or []
+    ]
+
+
+def _rg_view(g: dict, engine_version: tuple[str, str] | None = None, ctx: dict[str, Any] | None = None) -> dict:
+    return {
+        "id": g.get("ReplicationGroupId"),
+        "description": g.get("Description"),
+        "status": g.get("Status"),
+        "engine": g.get("Engine") or (engine_version[0] if engine_version else None),
+        "engine_version": engine_version[1] if engine_version else None,
+        "cluster_mode": g.get("ClusterMode") or ("enabled" if g.get("ClusterEnabled") else "disabled"),
+        "node_type": g.get("CacheNodeType"),
+        "multi_az": g.get("MultiAZ"),
+        "automatic_failover": g.get("AutomaticFailover"),
+        "transit_encryption": g.get("TransitEncryptionEnabled"),
+        "at_rest_encryption": g.get("AtRestEncryptionEnabled"),
+        "transit_encryption_mode": g.get("TransitEncryptionMode"),
+        "auth_token_enabled": g.get("AuthTokenEnabled"),
+        "auth_token_age_days": _auth_token_age_days(g, ctx),
+        "data_tiering": g.get("DataTiering"),
+        "network_type": g.get("NetworkType"),
+        "ip_discovery": g.get("IpDiscovery"),
+        "log_delivery": _log_delivery_view(g),
+        "auto_minor_version_upgrade": g.get("AutoMinorVersionUpgrade"),
+        "member_clusters": g.get("MemberClusters", []),
+        "configuration_endpoint": _jsonable(g.get("ConfigurationEndpoint")),
+        "findings": _rg_findings(g, engine_version, ctx),
+        "node_groups": [
+            {
+                "id": ng.get("NodeGroupId"),
+                "status": ng.get("Status"),
+                "slots": ng.get("Slots"),
+                "primary_endpoint": _jsonable(ng.get("PrimaryEndpoint")),
+                "reader_endpoint": _jsonable(ng.get("ReaderEndpoint")),
+                "members": [
+                    {
+                        "cluster_id": m.get("CacheClusterId"),
+                        "role": m.get("CurrentRole"),
+                        "az": m.get("PreferredAvailabilityZone"),
+                    }
+                    for m in ng.get("NodeGroupMembers", [])
+                ],
+            }
+            for ng in g.get("NodeGroups", [])
+        ],
+        "pending_modified_values": _jsonable(g.get("PendingModifiedValues") or {}),
+        "snapshot_retention_limit": g.get("SnapshotRetentionLimit"),
+    }
+
+
+def _cluster_view(c: dict, ctx: dict[str, Any] | None = None) -> dict:
+    return {
+        "findings": _cluster_findings(c, ctx),
+        "id": c.get("CacheClusterId"),
+        "status": c.get("CacheClusterStatus"),
+        "engine": c.get("Engine"),
+        "engine_version": c.get("EngineVersion"),
+        "node_type": c.get("CacheNodeType"),
+        "num_nodes": c.get("NumCacheNodes"),
+        "replication_group_id": c.get("ReplicationGroupId"),
+        "az": c.get("PreferredAvailabilityZone"),
+        "parameter_group": (c.get("CacheParameterGroup") or {}).get("CacheParameterGroupName"),
+        "parameter_apply_status": (c.get("CacheParameterGroup") or {}).get("ParameterApplyStatus"),
+        "maintenance_window": c.get("PreferredMaintenanceWindow"),
+        "transit_encryption_mode": c.get("TransitEncryptionMode"),
+        "auth_token_age_days": _auth_token_age_days(c, ctx),
+        "network_type": c.get("NetworkType"),
+        "ip_discovery": c.get("IpDiscovery"),
+        "log_delivery": _log_delivery_view(c),
+        "auto_minor_version_upgrade": c.get("AutoMinorVersionUpgrade"),
+        "pending_modified_values": _jsonable(c.get("PendingModifiedValues") or {}),
+        "nodes": [
+            {
+                "id": n.get("CacheNodeId"),
+                "status": n.get("CacheNodeStatus"),
+                "endpoint": _jsonable(n.get("Endpoint")),
+                "az": n.get("CustomerAvailabilityZone"),
+            }
+            for n in c.get("CacheNodes", [])
+        ],
+    }
+
+
+class _InventoryMixin(_CoreMixin):
+    def replication_groups_fan_out(self, replication_group_id: str | None = None, region: str | None = None) -> dict:
+        """``replication_groups`` over every region in ELASTICACHE_REGIONS (or just ``region``).
+
+        A region that does not hold ``replication_group_id`` is skipped quietly; other failures are
+        reported per region and never hide the regions that answered."""
+        targets = self._target_regions(region)
+        if len(targets) == 1:
+            return self.in_region(targets[0]).replication_groups(replication_group_id)
+        views: list[dict] = []
+        findings: list[dict] = []
+        failures: dict[str, dict] = {}
+        for target in targets:
+            result = self.in_region(target).replication_groups(replication_group_id)
+            if "replication_groups" not in result:
+                if result.get("error") != "ReplicationGroupNotFoundFault":
+                    failures[str(target)] = result
+                continue
+            views.extend({**v, "region": target} for v in result["replication_groups"])
+            findings.extend({**f, "region": target} for f in result["findings"])
+        out: dict[str, Any] = {
+            "regions": [str(t) for t in targets],
+            "count": len(views),
+            "findings": _sorted_findings(findings),
+            "replication_groups": views,
+        }
+        if failures:
+            out["region_errors"] = failures
+        return out
+
+    # ---------------------------------------------------------------- tools
+    def replication_groups(self, replication_group_id: str | None = None) -> dict:
+        def run() -> dict:
+            kwargs = {"ReplicationGroupId": replication_group_id} if replication_group_id else {}
+            groups = self._paginate("describe_replication_groups", "ReplicationGroups", **kwargs)
+            versions = self._member_engine_versions() if groups else {}
+            ctx = self._engine_context({engine.lower() for engine, _ in versions.values()}, False)
+            views = [_rg_view(g, versions.get(g.get("ReplicationGroupId", "")), ctx) for g in groups]
+            findings = [{**f, "resource": v["id"]} for v in views for f in v["findings"]]
+            return {
+                "count": len(groups),
+                "findings": _sorted_findings(findings),
+                "replication_groups": views,
+            }
+
+        return self._guard(run)
+
+    def _member_clusters(self) -> list[dict]:
+        """All cache clusters; best effort, never fails the tool."""
+        try:
+            return self._paginate("describe_cache_clusters", "CacheClusters")
+        except (BotoCoreError, ClientError):
+            return []
+
+    def _member_engine_versions(self, clusters: list[dict] | None = None) -> dict[str, tuple[str, str]]:
+        """Replication group id -> (engine, engine version); best effort, never fails the tool."""
+        out: dict[str, tuple[str, str]] = {}
+        for c in self._member_clusters() if clusters is None else clusters:
+            rg = c.get("ReplicationGroupId")
+            if rg and c.get("EngineVersion"):
+                out.setdefault(rg, (str(c.get("Engine", "")), str(c["EngineVersion"])))
+        return out
+
+    def _subnet_group_azs(self, clusters: list[dict], replication_group_id: str) -> tuple[str, set[str]] | None:
+        """Subnet group name and AZs of a replication group, from the member data already fetched.
+
+        Makes one extra DescribeCacheSubnetGroups call only when a member names its subnet group; best effort."""
+        name = next(
+            (
+                c["CacheSubnetGroupName"]
+                for c in clusters
+                if c.get("ReplicationGroupId") == replication_group_id and c.get("CacheSubnetGroupName")
+            ),
+            None,
+        )
+        if not name:
+            return None
+        try:
+            groups = self._paginate("describe_cache_subnet_groups", "CacheSubnetGroups", CacheSubnetGroupName=name)
+        except (BotoCoreError, ClientError):
+            return None
+        if not groups:
+            return None
+        return name, {
+            az for sn in groups[0].get("Subnets", []) if (az := (sn.get("SubnetAvailabilityZone") or {}).get("Name"))
+        }
+
+    def cache_clusters(self, cache_cluster_id: str | None = None, show_nodes: bool = True) -> dict:
+        def run() -> dict:
+            kwargs: dict[str, Any] = {"ShowCacheNodeInfo": show_nodes}
+            if cache_cluster_id:
+                kwargs["CacheClusterId"] = cache_cluster_id
+            clusters = self._paginate("describe_cache_clusters", "CacheClusters", **kwargs)
+            ctx = self._engine_context({str(c.get("Engine", "")).lower() for c in clusters}, bool(clusters))
+            views = [_cluster_view(c, ctx) for c in clusters]
+            findings = [{**f, "resource": v["id"]} for v in views for f in v["findings"]]
+            return {"count": len(clusters), "findings": _sorted_findings(findings), "cache_clusters": views}
+
+        return self._guard(run)
+
+    def memcached_discovery(
+        self, cache_cluster_id: str, host: str | None = None, port: int | None = None, timeout: float = 5.0
+    ) -> dict:
+        """Diff a Memcached cluster's auto-discovery config (``config get cluster``) with DescribeCacheClusters nodes.
+
+        ``host`` defaults to the cluster's configuration endpoint. Findings first; an unreachable endpoint is a
+        finding, never an exception."""
+
+        def run() -> dict:
+            clusters = self._paginate(
+                "describe_cache_clusters", "CacheClusters", CacheClusterId=cache_cluster_id, ShowCacheNodeInfo=True
+            )
+            cluster = next((c for c in clusters if c.get("CacheClusterId") == cache_cluster_id), None)
+            if cluster is None:
+                return _error_result("CacheClusterNotFound", f"no cache cluster {cache_cluster_id!r}")
+            if str(cluster.get("Engine", "")).lower() != "memcached":
+                return _error_result(
+                    "NotMemcached", f"{cache_cluster_id} runs {cluster.get('Engine')}: discovery applies to memcached"
+                )
+            report = memcached.discovery_report(cluster, host, port, timeout)
+            aws_nodes = [
+                f"{(n.get('Endpoint') or {}).get('Address')}:{(n.get('Endpoint') or {}).get('Port')}"
+                for n in cluster.get("CacheNodes", [])
+            ]
+            return {**report, "aws_nodes": aws_nodes}
+
+        return self._guard(run)
+
+    def serverless_caches(self) -> dict:
+        def run() -> dict:
+            items = self._paginate_token("describe_serverless_caches", "ServerlessCaches")
+            findings = [f for c in items for f in _serverless_cache_findings(c)]
+            return {"count": len(items), "findings": _sorted_findings(findings), "serverless_caches": _jsonable(items)}
+
+        return self._guard(run)
+
+    def serverless_snapshots(
+        self,
+        serverless_cache_name: str | None = None,
+        snapshot_type: str | None = None,
+        stale_hours: int = 24,
+    ) -> dict:
+        def run() -> dict:
+            kwargs: dict[str, Any] = {}
+            if serverless_cache_name:
+                kwargs["ServerlessCacheName"] = serverless_cache_name
+            if snapshot_type:
+                kwargs["SnapshotType"] = snapshot_type
+            snaps = self._paginate_token("describe_serverless_cache_snapshots", "ServerlessCacheSnapshots", **kwargs)
+            notes: list[str] = []
+            caches: list[dict] | None
+            try:
+                caches = self._paginate_token(
+                    "describe_serverless_caches",
+                    "ServerlessCaches",
+                    **({"ServerlessCacheName": serverless_cache_name} if serverless_cache_name else {}),
+                )
+            except (BotoCoreError, ClientError) as exc:
+                caches = None
+                notes.append(
+                    f"per-cache retention skipped: DescribeServerlessCaches failed ({_error_code(exc)}); "
+                    "only the snapshot list is checked"
+                )
+            now = self._clock()
+            views = [_serverless_snapshot_view(s, now) for s in snaps]
+            findings = _serverless_snapshot_findings(views, caches, now, stale_hours)
+            retention = [
+                {
+                    "cache": c.get("ServerlessCacheName"),
+                    "retention_limit_days": c.get("SnapshotRetentionLimit"),
+                    "daily_snapshot_time": c.get("DailySnapshotTime"),
+                }
+                for c in caches or []
+            ]
+            return {
+                "count": len(views),
+                "findings": _sorted_findings(findings),
+                "serverless_snapshots": views,
+                "cache_retention": retention,
+                **({"partial": True, "notes": notes} if caches is None else {}),
+            }
+
+        return self._guard(run)
+
+    def events(self, source_identifier: str | None = None, source_type: str | None = None, hours: int = 24) -> dict:
+        """DescribeEvents, findings first: classified events (worst, then newest), counts per source, capped raw list."""
+        if source_type and source_type not in EVENT_SOURCE_TYPES:
+            return {
+                "error": "InvalidArgument",
+                "message": f"source_type must be one of: {', '.join(sorted(EVENT_SOURCE_TYPES))}",
+            }
+
+        def run() -> dict:
+            window = max(1, min(int(hours), 14 * 24))
+            kwargs: dict[str, Any] = {"Duration": window * 60}
+            if source_identifier:
+                kwargs["SourceIdentifier"] = source_identifier
+            if source_type:
+                kwargs["SourceType"] = source_type
+            events = self._paginate("describe_events", "Events", **kwargs)
+            events.sort(key=_event_time, reverse=True)
+            by_source = Counter(str(e.get("SourceIdentifier") or "unknown") for e in events)
+            classified = [(_event_severity(str(e.get("Message", ""))), e) for e in events]
+            findings = [
+                finding(
+                    sev,
+                    f"event {_event_stamp(e)}: {e.get('Message', '')}",
+                    resource=e.get("SourceIdentifier"),
+                    source_type=e.get("SourceType"),
+                )
+                for sev, e in classified
+            ]
+            findings = _sorted_findings(findings)  # stable: newest first inside a severity
+            return {
+                "window_hours": window,
+                "count": len(events),
+                "findings": findings[:MAX_EVENT_FINDINGS],
+                "findings_truncated": len(findings) > MAX_EVENT_FINDINGS,
+                "by_severity": dict(Counter(sev for sev, _ in classified)),
+                "by_source": dict(by_source.most_common()),
+                "events": _jsonable(events[:MAX_EVENTS_RETURNED]),
+                "truncated": len(events) > MAX_EVENTS_RETURNED,
+            }
+
+        return self._guard(run)
+
+    # ------------------------------------------------------------ snapshots
+    def snapshots(
+        self,
+        replication_group_id: str | None = None,
+        cache_cluster_id: str | None = None,
+        source: str | None = None,
+        stale_hours: int = 36,
+    ) -> dict:
+        def run() -> dict:
+            kwargs: dict[str, Any] = {}
+            if replication_group_id:
+                kwargs["ReplicationGroupId"] = replication_group_id
+            if cache_cluster_id:
+                kwargs["CacheClusterId"] = cache_cluster_id
+            if source:
+                kwargs["SnapshotSource"] = source
+            snaps = self._paginate("describe_snapshots", "Snapshots", **kwargs)
+            now = self._clock()
+            views = [_snapshot_view(s, now) for s in snaps]
+            findings = _snapshot_findings(views, now, stale_hours)
+            return {"count": len(views), "findings": _sorted_findings(findings), "snapshots": views}
+
+        return self._guard(run)
+
+    # -------------------------------------------------------- global datastores
+    def global_replication_groups(self) -> dict:
+        def run() -> dict:
+            groups = self._paginate(
+                "describe_global_replication_groups", "GlobalReplicationGroups", ShowMemberInfo=True
+            )
+            views = []
+            findings = []
+            for g in groups:
+                gid = g.get("GlobalReplicationGroupId")
+                members = [
+                    {
+                        "replication_group_id": m.get("ReplicationGroupId"),
+                        "region": m.get("ReplicationGroupRegion"),
+                        "role": m.get("Role"),
+                        "status": m.get("Status"),
+                        "automatic_failover": m.get("AutomaticFailover"),
+                    }
+                    for m in g.get("Members", [])
+                ]
+                views.append(
+                    {
+                        "id": gid,
+                        "description": g.get("GlobalReplicationGroupDescription"),
+                        "status": g.get("Status"),
+                        "engine": g.get("Engine"),
+                        "engine_version": g.get("EngineVersion"),
+                        "node_type": g.get("CacheNodeType"),
+                        "cluster_mode": g.get("ClusterEnabled"),
+                        "transit_encryption": g.get("TransitEncryptionEnabled"),
+                        "at_rest_encryption": g.get("AtRestEncryptionEnabled"),
+                        "members": members,
+                    }
+                )
+                if g.get("Status") not in (None, "available"):
+                    findings.append(finding("warning", f"global datastore status is {g.get('Status')}", resource=gid))
+                if len(members) < 2:
+                    findings.append(finding("warning", "global datastore has no secondary region", resource=gid))
+                for m in members:
+                    if m["status"] not in HEALTHY_GLOBAL_MEMBER_STATUSES | {None}:
+                        findings.append(
+                            finding(
+                                "warning",
+                                f"member {m['replication_group_id']} ({m['region']}) is {m['status']}",
+                                resource=gid,
+                            )
+                        )
+                findings += self._secondary_readiness(g, members)
+            return {"count": len(views), "findings": _sorted_findings(findings), "global_replication_groups": views}
+
+        return self._guard(run)
+
+    def _secondary_readiness(self, g: dict, members: list[dict]) -> list[dict]:
+        """Failover-readiness findings for the secondary regions of a global datastore.
+
+        Per secondary (at most MAX_GLOBAL_SECONDARIES): its replication group (node type, member nodes), one
+        member's engine version and ``GlobalDatastoreReplicationLag`` in the secondary's own region. Each member
+        dict gets a ``replication_lag`` summary. Best effort: a region that cannot be read yields an info finding."""
+        gid = g.get("GlobalReplicationGroupId")
+        out: list[dict] = []
+        secondaries = [m for m in members if m["role"] == "SECONDARY" and m["replication_group_id"] and m["region"]]
+        if len(secondaries) > MAX_GLOBAL_SECONDARIES:
+            out.append(
+                finding(
+                    "info", f"only the first {MAX_GLOBAL_SECONDARIES} secondary regions were inspected", resource=gid
+                )
+            )
+        for m in secondaries[:MAX_GLOBAL_SECONDARIES]:
+            label = f"{m['replication_group_id']} ({m['region']})"
+            try:
+                regional = self.in_region(m["region"])
+                groups = regional._paginate(
+                    "describe_replication_groups", "ReplicationGroups", ReplicationGroupId=m["replication_group_id"]
+                )
+                member_ids = (groups[0].get("MemberClusters") or []) if groups else []
+                node_type = groups[0].get("CacheNodeType") if groups else None
+                version = None
+                if member_ids:
+                    clusters = regional._paginate(
+                        "describe_cache_clusters", "CacheClusters", CacheClusterId=member_ids[0]
+                    )
+                    version = clusters[0].get("EngineVersion") if clusters else None
+                if member_ids:
+                    summary, _, found = regional._collect_metrics(
+                        member_ids,
+                        [GLOBAL_LAG_METRIC],
+                        GLOBAL_LAG_WINDOW_MINUTES,
+                        60,
+                        None,
+                        False,
+                        rightsizing=False,
+                    )
+                    lags = [s[GLOBAL_LAG_METRIC] for s in summary.values() if s[GLOBAL_LAG_METRIC]["points"]]
+                    if lags:
+                        m["replication_lag"] = max(lags, key=lambda s: s["max"])
+                    out += [
+                        {**f, "resource": gid, "message": f"secondary {label}: {f['message']}"}
+                        for f in found
+                        if GLOBAL_LAG_METRIC in f["message"]
+                    ]
+            except (BotoCoreError, ClientError, ValueError) as exc:
+                out.append(
+                    finding("info", f"secondary {label} could not be inspected: {_error_code(exc)}", resource=gid)
+                )
+                continue
+            m["node_type"], m["engine_version"] = node_type, version
+            if node_type and g.get("CacheNodeType") and node_type != g["CacheNodeType"]:
+                out.append(
+                    finding(
+                        "warning",
+                        f"secondary {label} node type {node_type} differs from the primary ({g['CacheNodeType']}); "
+                        "a failover could land on a differently sized node",
+                        resource=gid,
+                    )
+                )
+            if version and g.get("EngineVersion") and version != g["EngineVersion"]:
+                out.append(
+                    finding(
+                        "warning",
+                        f"secondary {label} engine version {version} differs from the primary ({g['EngineVersion']})",
+                        resource=gid,
+                    )
+                )
+        return out
+
+    # ------------------------------------------------- engine versions, parameter groups
+    def engine_versions(self, engine: str, version_prefix: str | None = None) -> dict:
+        def run() -> dict:
+            items = self._paginate("describe_cache_engine_versions", "CacheEngineVersions", Engine=engine)
+            views = _engine_version_views(items, version_prefix)
+            notes: list[str] = []
+            targets = _latest_per_major(views, engine)
+            findings: list[dict] = []
+            if engine == "redis":
+                try:
+                    valkey = _engine_version_views(
+                        self._paginate("describe_cache_engine_versions", "CacheEngineVersions", Engine="valkey"), None
+                    )
+                except (BotoCoreError, ClientError) as exc:
+                    valkey = []
+                    notes.append(f"Valkey versions unavailable: {_error_code(exc)}")
+                if valkey:
+                    newest = valkey[0]
+                    targets.append(
+                        {**newest, "engine": "valkey", "reason": "latest Valkey; supported upgrade path from Redis OSS"}
+                    )
+                    findings.append(
+                        finding(
+                            "info",
+                            f"Valkey {newest['version']} (family {newest['family']}) is available as an upgrade target",
+                        )
+                    )
+            return {
+                "engine": engine,
+                "version_prefix": version_prefix,
+                "count": len(views),
+                "findings": _sorted_findings(findings),
+                "upgrade_targets": targets,
+                "versions": views,
+                **({"notes": notes} if notes else {}),
+            }
+
+        return self._guard(run)
+
+    def parameter_groups(self) -> dict:
+        def run() -> dict:
+            groups = self._paginate("describe_cache_parameter_groups", "CacheParameterGroups")
+            notes: list[str] = []
+            try:
+                clusters = self._paginate("describe_cache_clusters", "CacheClusters")
+            except (BotoCoreError, ClientError) as exc:
+                clusters = None
+                notes.append(f"cluster listing unavailable ({_error_code(exc)}); in-use detection skipped")
+            users: dict[str, list[str]] = defaultdict(list)
+            running: dict[str, set[tuple[str, str]]] = defaultdict(set)
+            for c in clusters or []:
+                name = (c.get("CacheParameterGroup") or {}).get("CacheParameterGroupName")
+                if name:
+                    users[str(name)].append(str(c.get("CacheClusterId")))
+                    running[str(name)].add((str(c.get("Engine", "")).lower(), str(c.get("EngineVersion", ""))))
+            ctx = self._engine_context({e for pairs in running.values() for e, _ in pairs}, False)
+            views, findings = [], []
+            for g in groups:
+                name = str(g.get("CacheParameterGroupName"))
+                family = g.get("CacheParameterGroupFamily")
+                custom = not name.startswith("default.")
+                members = sorted(users.get(name, []))
+                views.append(
+                    {
+                        "name": name,
+                        "family": family,
+                        "description": g.get("Description"),
+                        "custom": custom,
+                        "in_use": bool(members) if clusters is not None else None,
+                        "used_by": members,
+                    }
+                )
+                if clusters is not None and custom and not members:
+                    findings.append(
+                        finding(
+                            "info", f"custom parameter group {name} is not used by any cache cluster", resource=name
+                        )
+                    )
+                for engine, version in sorted(running.get(name, ())):
+                    expected = ctx["family_of"].get((engine, version))
+                    if family and expected and family != expected:
+                        findings.append(
+                            finding(
+                                "warning",
+                                f"parameter group {name} is family {family} but {engine} {version} expects {expected}",
+                                resource=name,
+                            )
+                        )
+            return {
+                "count": len(views),
+                "findings": _sorted_findings(findings),
+                "parameter_groups": views,
+                **({"partial": True, "notes": notes} if notes else {}),
+            }
+
+        return self._guard(run)
+
+    # ---------------------------------------------------------- service updates
+    def service_updates(self, status: str = "available", soon_days: int = 14) -> dict:
+        def run() -> dict:
+            updates = self._paginate("describe_service_updates", "ServiceUpdates", ServiceUpdateStatus=[status])
+            now = self._clock()
+            views = []
+            findings = []
+            for u in updates:
+                apply_by = u.get("ServiceUpdateRecommendedApplyByDate")
+                view = {
+                    "name": u.get("ServiceUpdateName"),
+                    "type": u.get("ServiceUpdateType"),
+                    "severity": u.get("ServiceUpdateSeverity"),
+                    "status": u.get("ServiceUpdateStatus"),
+                    "engine": u.get("Engine"),
+                    "engine_version": u.get("EngineVersion"),
+                    "release_date": _jsonable(u.get("ServiceUpdateReleaseDate")),
+                    "recommended_apply_by": _jsonable(apply_by),
+                    "auto_update_after_apply_by": u.get("AutoUpdateAfterRecommendedApplyByDate"),
+                    "estimated_update_minutes": u.get("EstimatedUpdateTime"),
+                    "description": u.get("ServiceUpdateDescription"),
+                }
+                views.append(view)
+                sev = str(view["severity"] or "low")
+                name = view["name"]
+                if status == "available":
+                    if apply_by and apply_by < now:
+                        findings.append(
+                            finding("critical", f"{name} ({sev}) is past its recommended apply-by date", resource=name)
+                        )
+                    elif apply_by and apply_by - now < dt.timedelta(days=soon_days):
+                        auto = view["auto_update_after_apply_by"]
+                        note = " and will be applied automatically after that date" if auto else ""
+                        findings.append(
+                            finding(
+                                "warning",
+                                f"{name} ({sev}) is due by {view['recommended_apply_by']}{note}",
+                                resource=name,
+                            )
+                        )
+                    elif sev in {"critical", "important"}:
+                        findings.append(finding("warning", f"{sev} service update {name} is pending", resource=name))
+                    else:
+                        findings.append(finding("info", f"{sev} service update {name} is pending", resource=name))
+            views.sort(key=lambda v: _SEVERITY_ORDER.get(str(v["severity"]), 9))
+            return {"count": len(views), "findings": _sorted_findings(findings), "service_updates": views}
+
+        return self._guard(run)
+
+    # ----------------------------------------------------------- subnet groups
+    def subnet_groups(self) -> dict:
+        def run() -> dict:
+            groups = self._paginate("describe_cache_subnet_groups", "CacheSubnetGroups")
+            views = []
+            findings = []
+            for g in groups:
+                subnets = [
+                    {"id": s.get("SubnetIdentifier"), "az": (s.get("SubnetAvailabilityZone") or {}).get("Name")}
+                    for s in g.get("Subnets", [])
+                ]
+                azs = {s["az"] for s in subnets if s["az"]}
+                name = g.get("CacheSubnetGroupName")
+                views.append({"name": name, "vpc_id": g.get("VpcId"), "subnets": subnets, "azs": sorted(azs)})
+                if len(azs) < 2:
+                    findings.append(
+                        finding("warning", f"subnet group spans {len(azs)} AZ(s); Multi-AZ needs 2+", resource=name)
+                    )
+            return {"count": len(views), "findings": _sorted_findings(findings), "subnet_groups": views}
+
+        return self._guard(run)
+
+    def _engine_context(self, engines: set[str], with_parameter_groups: bool) -> dict[str, Any]:
+        """Engine versions, their parameter group families and parameter group families, best effort.
+
+        Used only to add findings; any API failure just means fewer findings, never a failed tool.
+        """
+        versions: dict[str, set[str]] = defaultdict(set)
+        family_of: dict[tuple[str, str], str] = {}
+        for engine in sorted(e for e in engines if e):
+            try:
+                items = self._paginate("describe_cache_engine_versions", "CacheEngineVersions", Engine=engine)
+            except (BotoCoreError, ClientError):
+                continue
+            for item in items:
+                version = str(item.get("EngineVersion", ""))
+                versions[engine].add(version)
+                if item.get("CacheParameterGroupFamily"):
+                    family_of[(engine, version)] = str(item["CacheParameterGroupFamily"])
+        parameter_group_family: dict[str, str] = {}
+        if with_parameter_groups:
+            try:
+                groups = self._paginate("describe_cache_parameter_groups", "CacheParameterGroups")
+            except (BotoCoreError, ClientError):
+                groups = []
+            parameter_group_family = {
+                str(g.get("CacheParameterGroupName")): str(g["CacheParameterGroupFamily"])
+                for g in groups
+                if g.get("CacheParameterGroupFamily")
+            }
+        return {
+            "versions": versions,
+            "family_of": family_of,
+            "parameter_group_family": parameter_group_family,
+            "now": self._clock(),
+        }

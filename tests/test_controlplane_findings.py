@@ -538,10 +538,11 @@ def test_real_botocore_operations_are_all_read_only():
 
 
 def test_static_calls_in_controlplane_use_read_only_prefixes():
-    tree = ast.parse((ROOT / "src/mcp_elasticache_ops/controlplane.py").read_text(encoding="utf-8"))
+    package = ROOT / "src/mcp_elasticache_ops/controlplane"
+    trees = [ast.parse(f.read_text(encoding="utf-8")) for f in sorted(package.glob("*.py"))]
     paginated: list[str] = []
     direct: list[str] = []
-    for node in ast.walk(tree):
+    for node in (n for tree in trees for n in ast.walk(tree)):
         if not isinstance(node, ast.Call):
             continue
         f = node.func
@@ -1805,3 +1806,92 @@ def test_failover_correlation_serverless_uses_serverless_source_type():
     assert "Failover complete" in f["message"] and "30 min ago" in f["message"]
     kwargs = next(kw for name, kw in ec.calls if name == "describe_events")
     assert kwargs["SourceType"] == "serverless-cache" and kwargs["Duration"] == 24 * 60
+
+
+# ------------------------------------------------------------------ aws_capacity_forecast
+
+
+def _ramp(start, end, n=336):
+    """Hourly series, oldest first; ``metric_result`` wants newest first."""
+    return [start + (end - start) * i / (n - 1) for i in range(n)][::-1]
+
+
+def _forecast_ec(sc_max=None):
+    groups = [_cost_group("grow", "cache.r6g.large"), _cost_group("flat", "cache.r6g.large")]
+    groups[1]["MemberClusters"] = ["flat-001"]
+    cache = {"ServerlessCacheName": "sc1", "Engine": "valkey", "Status": "available"}
+    if sc_max:
+        cache["CacheUsageLimits"] = {"DataStorage": {"Maximum": sc_max, "Unit": "GB"}}
+    clusters = [
+        {"CacheClusterId": m, "ReplicationGroupId": g["ReplicationGroupId"], "Engine": "redis"}
+        for g in groups
+        for m in g["MemberClusters"]
+    ]
+    clusters += [
+        {"CacheClusterId": "solo", "Engine": "valkey", "CacheNodeType": "cache.t4g.small"},
+        {"CacheClusterId": "mc", "Engine": "memcached"},
+    ]
+    return Fake(
+        {
+            "describe_replication_groups": {"ReplicationGroups": groups},
+            "describe_cache_clusters": {"CacheClusters": clusters},
+            "describe_serverless_caches": {"ServerlessCaches": [cache]},
+        }
+    )
+
+
+def test_capacity_forecast_ranks_growing_flat_noisy_and_serverless_in_one_batch():
+    import random
+
+    rnd = random.Random(7)
+    noisy = [40 + rnd.uniform(-3, 3) for _ in range(336)]
+    gb = 1024**3
+    cw = Fake(
+        {
+            "get_metric_data": metric_result(
+                {
+                    "grow-001|DatabaseMemoryUsagePercentage": _ramp(30, 60),  # roughly 19 days left at this pace
+                    "grow-002|DatabaseMemoryUsagePercentage": _ramp(30, 50),
+                    "flat-001|DatabaseMemoryUsagePercentage": [20.0] * 336,
+                    "solo|DatabaseMemoryUsagePercentage": noisy,
+                    "sc1|BytesUsedForCache": [v / 100 * 10 * gb for v in _ramp(10, 96)],  # 10 GB cap, ~2 days
+                }
+            )
+        }
+    )
+    out = plane(_forecast_ec(sc_max=10), cw).capacity_forecast()
+    ranked = [r["id"] for r in out["forecast"]]
+    assert ranked[:2] == ["sc1", "grow"]
+    by_id = {r["id"]: r for r in out["forecast"]}
+    assert by_id["sc1"]["days_to_full"] < 7 and by_id["grow"]["fastest_node"] == "grow-001"
+    assert 7 <= by_id["grow"]["days_to_full"] < 30
+    assert by_id["flat"]["status"] == "stable" and by_id["flat"]["days_to_full"] is None
+    assert "right-size" not in by_id["flat"].get("hint", "") and "smaller node type" in by_id["flat"]["hint"]
+    assert by_id["solo"]["status"] == "stable"  # noise is not growth
+    sev = {f["resource"]: f["severity"] for f in out["findings"]}
+    assert sev == {"sc1": "critical", "grow": "warning"}
+    assert out["findings"][0]["resource"] == "sc1" and out["findings"][0]["hint"]
+    assert any("memcached" in n for n in out["notes"]) and out["partial"] is True
+    # one batch for the nodes, one for serverless
+    assert len([c for c in cw.calls if c[0] == "get_metric_data"]) == 2
+
+
+def test_capacity_forecast_uncapped_serverless_and_no_data():
+    cw = Fake({"get_metric_data": metric_result({})})
+    out = plane(_forecast_ec(), cw).capacity_forecast()
+    by_id = {r["id"]: r for r in out["forecast"]}
+    assert by_id["sc1"]["status"] == "uncapped" and by_id["grow"]["status"] == "no-data"
+    assert out["findings"] == []
+
+
+def test_capacity_forecast_access_denied_is_an_error_result():
+    ec = Fake({"describe_replication_groups": denied("DescribeReplicationGroups")})
+    out = plane(ec).capacity_forecast()
+    assert "error" in out and "findings" not in out
+
+
+def test_capacity_forecast_serverless_describe_failure_is_a_note():
+    ec = _forecast_ec()
+    ec.responses["describe_serverless_caches"] = denied("DescribeServerlessCaches")
+    out = plane(ec, Fake({"get_metric_data": metric_result({})})).capacity_forecast()
+    assert any("serverless caches not checked" in n for n in out["notes"])
