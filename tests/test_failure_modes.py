@@ -16,6 +16,7 @@ from botocore.exceptions import ConnectTimeoutError
 from fastmcp import Client
 
 from mcp_elasticache_ops import dataplane, server
+from mcp_elasticache_ops.config import DEFAULT_MAX_OUTPUT_CHARS
 from mcp_elasticache_ops.controlplane import ControlPlane, ControlPlaneConfig
 from tests.fakes import AwsAudit, FakeRedis
 from tests.test_server import AUDIT_CALLS, audit  # noqa: F401  (audit is a fixture)
@@ -168,3 +169,99 @@ def test_node_doctor_hanging_node_returns_partial_with_error_within_budget():
 def test_node_doctor_without_a_budget_is_unchanged():
     out = dataplane.node_doctor(FakeRedis(infos={"server": {"redis_version": "7.1.0"}}))
     assert "partial" not in out and "error" not in out
+
+
+# ------------------------------------- COMMANDLOG and CLUSTER LINKS sections of node_cluster_triage
+
+_NODE_IDS = {"10.0.0.1:6379": "p1", "10.0.0.2:6379": "p2", "10.0.0.3:6379": "p3"}
+_VALKEY8 = {"valkey_version": "8.0.1", "redis_version": "7.2.4"}
+_PRE_VALKEY8 = {"redis_version": "7.1.0"}
+
+
+def _bus_client(endpoint: str, server: dict, *, big_reply: bool = False, buffer: int = 0, hang_for: float = 0.0):
+    """A shard primary with a CLUSTER LINKS reply to its peers and, on Valkey 8, a COMMANDLOG."""
+    from tests.test_dataplane_unit import _mem_info, _shard_data
+
+    me = _NODE_IDS[endpoint]
+    peers = [i for i in ("p1", "p2", "p3", "r1") if i != me]
+    client = FakeRedis(infos={"memory": _mem_info(), "server": server}, data=_shard_data(me, 20, 100))
+    client.commands["CLUSTER LINKS"] = [
+        ["direction", "to", "node", peer, "send-buffer-allocated", buffer, "send-buffer-used", 0] for peer in peers
+    ]
+    if server is _VALKEY8:
+        for kind in ("slow", "large-request", "large-reply"):
+            rows = [[1, 1700000000, 20 * 1024 * 1024, ["GET", "k"], "10.1.1.1:5000", "app"]] if big_reply else []
+            client.commands[f"COMMANDLOG GET 5 {kind}"] = rows if kind == "large-reply" else []
+            client.commands[f"COMMANDLOG LEN {kind}"] = len(rows) if kind == "large-reply" else 0
+    if hang_for:
+        original = client.info
+
+        def slow_info(section=None):
+            time.sleep(hang_for)
+            return original(section)
+
+        client.info = slow_info  # type: ignore[method-assign]
+    return client
+
+
+def _triage(clients, **kw):
+    from tests.test_dataplane_unit import _fan_factory, _seed
+
+    factory, _ = _fan_factory(clients)
+    started = time.monotonic()
+    out = dataplane.cluster_triage(_seed(), factory, **kw)
+    return out, time.monotonic() - started
+
+
+def _assert_bounded(out: dict) -> None:
+    assert len(out["findings"]) <= dataplane.CLUSTER_TRIAGE_MAX_FINDINGS
+    assert len(json.dumps(server.cap_output(out, DEFAULT_MAX_OUTPUT_CHARS), default=str)) <= DEFAULT_MAX_OUTPUT_CHARS
+
+
+def test_cluster_triage_aggregates_commandlog_and_links_across_shards():
+    clients = {ep: _bus_client(ep, _VALKEY8, big_reply=ep != "10.0.0.2:6379") for ep in _NODE_IDS}
+    clients["10.0.0.3:6379"] = _bus_client("10.0.0.3:6379", _VALKEY8, big_reply=True, buffer=200 * 1024 * 1024)
+    out, _ = _triage(clients, max_seconds=5)
+    assert out["commandlog"]["reached"] == "reached 3/3 nodes"
+    assert out["cluster_links"] == {"reached": "reached 3/3 nodes", "max_send_buffer_bytes": 200 * 1024 * 1024}
+    big = [f for f in out["findings"] if f.get("source") == "commandlog" and f["severity"] == "critical"]
+    assert big and sorted(big[0]["nodes"]) == ["10.0.0.1:6379", "10.0.0.3:6379"]  # merged, not repeated per node
+    assert any(f.get("source") == "cluster links" for f in out["findings"])
+    _assert_bounded(out)
+
+
+def test_cluster_triage_hanging_node_keeps_reached_line_for_new_sections():
+    clients = {ep: _bus_client(ep, _VALKEY8) for ep in _NODE_IDS}
+    clients["10.0.0.2:6379"] = lambda: _bus_client("10.0.0.2:6379", _VALKEY8, hang_for=3.0)
+    out, elapsed = _triage(clients, max_seconds=0.8, per_node_timeout=0.4)
+    assert elapsed < 3.0
+    assert out["per_node"]["10.0.0.2:6379"]["status"] == "unreachable"
+    assert out["commandlog"]["reached"] == "reached 2/3 nodes"
+    assert out["cluster_links"]["reached"] == "reached 2/3 nodes"
+    assert out["reached"].startswith("reached 2/3 shards")
+    _assert_bounded(out)
+
+
+def test_cluster_triage_one_shard_down_is_isolated_from_commandlog_and_links():
+    clients = {ep: _bus_client(ep, _VALKEY8, big_reply=True) for ep in _NODE_IDS}
+    clients["10.0.0.3:6379"] = redis.ConnectionError("connection refused")
+    out, _ = _triage(clients, max_seconds=5)
+    assert out["per_node"]["10.0.0.3:6379"]["status"] == "unreachable"
+    assert out["commandlog"]["reached"] == "reached 2/3 nodes"
+    assert out["cluster_links"]["reached"] == "reached 2/3 nodes"
+    assert out["reached"].startswith("reached 2/3 shards") and out["partial"] is True
+    assert any(f["severity"] == "critical" and "10.0.0.3:6379" in f["message"] for f in out["findings"])
+    assert any(f.get("source") == "commandlog" for f in out["findings"])
+    _assert_bounded(out)
+
+
+def test_cluster_triage_pre_valkey8_node_has_no_commandlog_and_no_error():
+    clients = {ep: _bus_client(ep, _VALKEY8, big_reply=True) for ep in _NODE_IDS}
+    clients["10.0.0.2:6379"] = _bus_client("10.0.0.2:6379", _PRE_VALKEY8)
+    out, _ = _triage(clients, max_seconds=5)
+    assert out["commandlog"]["reached"] == "reached 2/3 nodes"
+    assert out["cluster_links"]["reached"] == "reached 3/3 nodes"
+    assert out["per_node"]["10.0.0.2:6379"]["status"] != "unreachable"
+    assert not any("COMMANDLOG" in f["message"] and "10.0.0.2:6379" in f.get("nodes", []) for f in out["findings"])
+    assert out["reached"].startswith("reached 3/3 shards")
+    _assert_bounded(out)

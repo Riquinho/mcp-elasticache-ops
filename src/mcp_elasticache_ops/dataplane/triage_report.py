@@ -199,6 +199,8 @@ def _triage_latency(d: dict) -> tuple[dict, list[dict]]:
 def _triage_doctor(d: dict) -> tuple[dict, list[dict]]:
     """MEMORY/LATENCY DOCTOR advice: two cheap commands whose refusal is a note, never an unavailable section."""
     summary = {"memory": d["memory_doctor"]["status"], "latency": d["latency_doctor"]["status"]}
+    if "commandlog" in d:
+        summary["commandlog"] = d["commandlog"]["status"]
     return summary, list(d["findings"])
 
 
@@ -300,6 +302,9 @@ def cluster_triage(
     raw: list[dict] = []
     snapshots: dict[str, dict] = {}
     link_notes: set[str] = set()
+    commandlog_ran: list[str] = []
+    links_ran: list[str] = []
+    max_send_buffer = 0
     for ep, o in outcomes.items():
         shard = shard_names.get(ep, "?")
         if o["status"] == "unreachable":
@@ -319,6 +324,11 @@ def cluster_triage(
         found = [{**f, "node": ep} for f in snapshot["findings"] if f.get("section") != "triage"]
         found += [{**f, "section": "pubsub", "node": ep} for f in pubsub["findings"]]
         links = data.get("links") or {}
+        if snapshot["sections"].get("doctor", {}).get("commandlog") in ("healthy", "findings"):
+            commandlog_ran.append(ep)
+        if links.get("supported"):
+            links_ran.append(ep)
+            max_send_buffer = max(max_send_buffer, int(links.get("max_send_buffer_bytes") or 0))
         self_ids = {n["id"] for n in topo["nodes"] if _endpoint(n) == ep}
         expected = {n["id"] for n in topo["nodes"] if not n["failing"]} - self_ids
         found += [
@@ -383,6 +393,12 @@ def cluster_triage(
         **({"notes": [*topo.get("notes", []), *sorted(link_notes)]} if topo.get("notes") or link_notes else {}),
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "consistency": {k: v for k, v in consistency.items() if k != "findings"},
+        # Valkey 8 COMMANDLOG and CLUSTER LINKS findings are merged above; these say how many nodes answered them
+        "commandlog": {"reached": f"reached {len(commandlog_ran)}/{len(outcomes)} nodes"},
+        "cluster_links": {
+            "reached": f"reached {len(links_ran)}/{len(outcomes)} nodes",
+            "max_send_buffer_bytes": max_send_buffer,
+        },
         "worst_node": node_order[0] if node_order and tally[node_order[0]] != (0, 0) else None,
         "findings": findings[:CLUSTER_TRIAGE_MAX_FINDINGS],
         "findings_total": total,
