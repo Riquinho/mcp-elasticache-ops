@@ -10,13 +10,14 @@ written from scratch for ElastiCache.
 
 ## Tools
 
-All 34 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
+All 37 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 
 **Data plane** (redis-py, talks to the node endpoint)
 
 | Tool | What it does |
 |---|---|
 | `node_health` | One-shot summary: engine/version, role, memory, clients, hit ratio, evictions, findings |
+| `node_triage` | On-call snapshot in one call: health, memory, replication, clients, failed/rejected commandstats, top-5 slowlog and latency. Findings merged worst-first (max 30) with a per-section summary; a failing section is `unavailable`, the rest still run. No extra Redis commands |
 | `node_info` | Raw `INFO`, optionally one section; password-like fields (`masterauth`, `requirepass`, ...) are redacted |
 | `node_memory` | used/RSS/peak/dataset/overhead, maxmemory + policy, fragmentation verdict, `MEMORY STATS/DOCTOR` |
 | `node_config` | Allowlisted `CONFIG GET` values (never secrets) with findings: `noeviction` with a maxmemory limit, `timeout 0` with idle clients, AOF, slowlog and latency monitor off, broad keyspace events. Points at `aws_parameters` when the endpoint refuses `CONFIG` |
@@ -24,7 +25,7 @@ All 34 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `node_clients` | `CLIENT LIST` aggregated by IP, name, user and last command; idle and buffer outliers |
 | `node_latency` | Client-side PING RTT percentiles + `LATENCY LATEST` |
 | `node_commandstats` | Commands ranked by total CPU time (`INFO commandstats`) |
-| `node_keyspace_sample` | Bounded `SCAN` sample: big keys by bytes and by element count, hot keys (LFU) or coldest keys, TTL coverage. Stops at `max_seconds` (default 10, hard cap 60) and returns `partial=true` |
+| `node_keyspace_sample` | Bounded `SCAN` sample: big keys by bytes and by element count, hot keys (LFU) or coldest keys, TTL coverage, and `prefixes` (keys grouped by normalised prefix such as `user:*:cart`, with estimated bytes scaled to dbsize, % without TTL; large no-TTL prefixes are flagged under `noeviction` or memory pressure; `top_prefixes`, default 10, max 50). Stops at `max_seconds` (default 10, hard cap 60) and returns `partial=true` |
 | `node_replication` | Role, replicas with byte lag, link status, backlog; findings for lagging or link-down replicas, offset gap vs the primary, `replica-read-only`, `min-replicas-to-write`, `cluster-allow-reads-when-down`. Engine-version quirks (no `CLUSTER SHARDS` before 7.0, ...) come back as `notes`, not errors |
 | `node_cluster` | Cluster mode: `CLUSTER INFO`, slots per primary, `CLUSTER SHARDS` |
 | `node_cluster_nodes` | `CLUSTER NODES` parsed into shards (primary, replicas, slots, failing nodes) and per-shard endpoints |
@@ -34,6 +35,7 @@ All 34 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `node_cluster_memory` | Same fan-out for memory: per-shard used/maxmemory/fragmentation/evictions, skew and >90% findings |
 | `node_acl_log` | `ACL WHOAMI` + `ACL LOG` (optional count): auth failures and denied commands aggregated by reason and user, client info reduced and redacted, findings on bursts. `ACL LIST`, `GETUSER`, `SETUSER`, `DELUSER` and `LOG RESET` stay refused |
 | `memcached_stats` | Memcached `stats` summary (hit ratio, memory, evictions) or a raw stats group |
+| `memcached_cluster_stats` | Fan-out over `MEMCACHED_NODES` (bounded concurrency, per-node timeout), only `stats`, `stats slabs`, `stats items`. Findings first: evictions, hit-ratio outliers vs the median, item/memory imbalance, `listen_disabled_num`, connections near maxconns, slab classes evicting or out of memory, one class holding most pages. A dead node gives `status: partial` |
 
 **Control plane** (boto3, optional)
 
@@ -54,6 +56,7 @@ All 34 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `aws_subnet_groups` | `DescribeCacheSubnetGroups`: AZ spread (Multi-AZ needs 2+) |
 | `aws_triage` | One call per replication group: status/Multi-AZ/failover, last 6h events, CloudWatch peaks per member (EngineCPU, memory %, Evictions, ReplicationLag, CurrConnections), pending service updates, newest snapshot. Worst-first findings (max 30); a failing section is reported `unavailable` |
 | `aws_cluster_overview` | One findings-first call per replication group: shards, replicas per shard, AZ spread, failover, engine version joined with per-node CloudWatch (EngineCPU, memory %, ReplicationLag, Evictions, CurrConnections, NewConnections). Flags nodes above 1.5x the peer median, reader endpoint gaps and right-sizing (memory p95 < 30% and CPU p95 < 20%; data tiering for r6gd). Worst-first, bounded; `GetMetricData` denied gives `status: partial` |
+| `aws_alarms` | `DescribeAlarms` (AWS/ElastiCache, paginated, optional `replication_group_id`): alarms in ALARM, INSUFFICIENT_DATA or with actions disabled, and members with no alarm on EngineCPUUtilization, DatabaseMemoryUsagePercentage, Evictions, ReplicationLag, CurrConnections, SwapUsage (plus ThrottledCmds on Serverless). Denied `DescribeAlarms` gives `partial: true` |
 | `aws_parameter_drift` | Diff of two parameter groups: only modified parameters whose values differ, family mismatch, important parameters flagged |
 
 `aws_replication_groups` also returns per-group findings (Multi-AZ, failover, encryption, auth, snapshots, old Redis OSS,
@@ -126,7 +129,8 @@ Generated from `safe_client.py`; the tests fail if this drifts from the code.
         "elasticache:DescribeServiceUpdates",
         "elasticache:DescribeUpdateActions",
         "elasticache:DescribeCacheSubnetGroups",
-        "cloudwatch:GetMetricData"
+        "cloudwatch:GetMetricData",
+        "cloudwatch:DescribeAlarms"
       ],
       "Resource": "*"
     }
@@ -152,6 +156,8 @@ Generated from `safe_client.py`; the tests fail if this drifts from the code.
 | `ELASTICACHE_DB` | `0` | |
 | `ELASTICACHE_TIMEOUT` | `5` | Socket timeout (s), must be greater than 0 |
 | `MEMCACHED_HOST` / `MEMCACHED_PORT` | / `11211` | For `memcached_stats` |
+| `MEMCACHED_NODES` | | Comma-separated `host:port` list (max 64, IPv6 as `[::1]:11211`) for `memcached_cluster_stats`; invalid entries stop startup |
+| `MCP_MAX_OUTPUT_CHARS` | `60000` | Cap on any tool result (JSON characters, 1000 to 5000000). Longer lists are cut to their head; `findings`, `summary`, `notes` and counts stay; the result gets `truncated=true`, `omitted` and a hint |
 | `AWS_REGION`, `AWS_PROFILE` | | Standard boto3 credential chain |
 | `ELASTICACHE_CONTROL_PLANE` | `true` | `false` disables all `aws_*` calls |
 

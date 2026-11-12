@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import functools
+import json
 import logging
 import os
+from collections.abc import Callable
 from functools import lru_cache
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from . import dataplane, memcached
-from .config import ControlPlaneConfig, DataPlaneConfig, MemcachedConfig
+from .config import ControlPlaneConfig, DataPlaneConfig, MemcachedConfig, max_output_chars
 from .connection import build_client
 from .controlplane import ControlPlane
 from .safe_client import SafeRedis
@@ -31,6 +34,88 @@ ElastiCache/CloudWatch APIs and are optional. Start with `node_health` and
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True)
 
 mcp = FastMCP("mcp-elasticache-ops", instructions=INSTRUCTIONS)
+
+# ------------------------------------------------------------------ output size cap
+
+_KEEP_WHOLE = frozenset({"findings", "summary", "notes"})  # never trimmed: they are what the caller needs first
+_KEEP_LEVELS = (50, 20, 10, 5, 2, 1, 0)
+TRUNCATION_HINT = (
+    "The result exceeded MCP_MAX_OUTPUT_CHARS={limit} characters, so long lists were cut to their first items "
+    "(findings, notes, summaries and counts are intact). Narrow the call by id (replication_group_id, "
+    "cache_cluster_id, parameter group) or lower top/count/hours to see the rest."
+)
+
+
+def _json_size(value: Any) -> int:
+    return len(json.dumps(value, default=str, ensure_ascii=False))
+
+
+def _trim(value: Any, keep: int) -> tuple[Any, int]:
+    """Copy of ``value`` with every list cut to ``keep`` items; returns ``(copy, omitted)``. Never mutates."""
+    if isinstance(value, list):
+        head = value[:keep]
+        omitted = len(value) - len(head)
+        out = []
+        for item in head:
+            trimmed, n = _trim(item, keep)
+            out.append(trimmed)
+            omitted += n
+        return out, omitted
+    if isinstance(value, dict):
+        limit = max(keep, 20)  # wide maps (per-node, per-group) keep a bit more than lists
+        items = list(value.items())
+        omitted = max(0, len(items) - limit)
+        out_dict = {}
+        for key, item in items[:limit]:
+            if key in _KEEP_WHOLE:
+                out_dict[key] = item
+            else:
+                out_dict[key], n = _trim(item, keep)
+                omitted += n
+        return out_dict, omitted
+    return value, 0
+
+
+def cap_output(result: Any, limit: int) -> Any:
+    """Keep a tool result under ``limit`` JSON characters by trimming long lists to their head.
+
+    Small results come back unchanged (same object). Larger ones get progressively shorter heads
+    (50, 20, 10, 5, 2, 1, 0 items) until they fit; top-level scalars, ``findings``, ``summary`` and
+    ``notes`` stay. The output gains ``truncated=true``, ``omitted`` (items dropped), ``original_chars``
+    and ``truncation_hint``. The input is never modified.
+    """
+    if not isinstance(result, dict):
+        return result
+    size = _json_size(result)
+    if size <= limit:
+        return result
+    trimmed: dict = result
+    omitted = 0
+    for keep in _KEEP_LEVELS:
+        trimmed, omitted = _trim(result, keep)
+        if _json_size(trimmed) <= limit:
+            break
+    return {
+        **trimmed,
+        "truncated": True,
+        "omitted": omitted,
+        "original_chars": size,
+        "truncation_hint": TRUNCATION_HINT.format(limit=limit),
+    }
+
+
+def _capped(fn: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        return cap_output(fn(*args, **kwargs), max_output_chars())
+
+    wrapper.__capped__ = True  # type: ignore[attr-defined]
+    return wrapper
+
+
+def read_tool(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Register ``fn`` as a read-only MCP tool whose result is size-capped."""
+    return mcp.tool(annotations=READ_ONLY)(_capped(fn))
 
 
 @lru_cache(maxsize=1)
@@ -62,7 +147,7 @@ def _memcached_target() -> MemcachedConfig:
 # ------------------------------------------------------------------ data plane
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def node_health() -> dict:
     """One-shot health summary of the configured Redis/Valkey endpoint: engine and
     version, role, clients, hit ratio, memory vs maxmemory, fragmentation,
@@ -70,7 +155,16 @@ def node_health() -> dict:
     return dataplane.health_summary(redis_client(), _serverless())
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
+def node_triage() -> dict:
+    """On-call snapshot of the connected endpoint in one call: health, memory, replication, clients,
+    failed/rejected commandstats, top-5 slowlog and latency. Findings from every section are merged,
+    worst-first (max 30), with a short per-section summary; a section that fails is reported as
+    unavailable and the rest still run. Start here, then drill into the specific node_ tool."""
+    return dataplane.triage(redis_client(), _node_client, _serverless())
+
+
+@read_tool
 def node_info(
     section: Annotated[
         str | None,
@@ -83,7 +177,7 @@ def node_info(
     return dataplane.server_info(redis_client(), section)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def node_memory() -> dict:
     """Memory breakdown: used/RSS/peak/dataset/overhead, maxmemory and policy,
     fragmentation ratio with a verdict, evictions, MEMORY STATS and MEMORY DOCTOR
@@ -91,7 +185,7 @@ def node_memory() -> dict:
     return dataplane.memory_report(redis_client(), _serverless())
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def node_config() -> dict:
     """Allowlisted CONFIG GET view (maxmemory policy, timeout, appendonly, output buffer limits,
     keyspace notifications, slowlog and latency thresholds, io-threads) with findings. Secret
@@ -100,7 +194,7 @@ def node_config() -> dict:
     return dataplane.config_view(redis_client())
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def node_slowlog(
     count: Annotated[int, Field(ge=1, le=1024, description="Entries to fetch")] = 25,
     include_args: Annotated[bool, Field(description="Return full command arguments (may expose values)")] = False,
@@ -110,28 +204,28 @@ def node_slowlog(
     return dataplane.slowlog(redis_client(), count, include_args, _serverless())
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def node_clients(top: Annotated[int, Field(ge=1, le=500)] = 20) -> dict:
     """CLIENT LIST aggregated by source IP, client name, ACL user and last command,
     idle-time stats and the clients holding the most buffer memory."""
     return dataplane.client_list(redis_client(), top)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def node_latency(ping_samples: Annotated[int, Field(ge=1, le=500)] = 20) -> dict:
     """Client-side PING RTT percentiles plus LATENCY LATEST events from the server
     latency monitor (needs latency-monitor-threshold > 0)."""
     return dataplane.latency(redis_client(), ping_samples)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def node_commandstats(top: Annotated[int, Field(ge=1, le=500)] = 20) -> dict:
     """Commands ranked by total CPU time (INFO commandstats), with calls, usec per
     call, rejected and failed calls."""
     return dataplane.commandstats(redis_client(), top)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def node_keyspace_sample(
     sample_size: Annotated[int, Field(ge=1, le=100_000, description="Max keys to inspect")] = 1000,
     match: Annotated[str | None, Field(description="SCAN MATCH glob, e.g. 'session:*'")] = None,
@@ -141,15 +235,21 @@ def node_keyspace_sample(
     max_seconds: Annotated[
         float, Field(gt=0, le=60, description="Wall-clock budget; returns partial=true when exceeded")
     ] = 10.0,
+    top_prefixes: Annotated[int, Field(ge=1, le=50, description="Key prefixes to report")] = 10,
 ) -> dict:
     """Big keys (bytes and element count), hot keys (LFU policies) or coldest keys,
     type distribution and TTL coverage from a bounded SCAN. Metadata only; values
     are never read. Stops at max_seconds and reports partial=true. On cluster-mode-enabled
-    groups this samples the connected node's slots only: use node_cluster_keyspace_sample for every shard."""
-    return dataplane.keyspace_sample(redis_client(), sample_size, match, top, scan_count, pause_ms, max_seconds)
+    groups this samples the connected node's slots only: use node_cluster_keyspace_sample for every shard.
+    `prefixes` groups the sampled keys by normalised prefix (user:123:cart -> user:*:cart) with key count,
+    estimated bytes scaled to dbsize, % of keys without TTL and types; findings call out large no-TTL prefixes
+    when the policy is noeviction or memory is near maxmemory."""
+    return dataplane.keyspace_sample(
+        redis_client(), sample_size, match, top, scan_count, pause_ms, max_seconds, top_prefixes=top_prefixes
+    )
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def node_replication() -> dict:
     """Replication role, replicas with byte lag, link status and backlog size, plus findings:
     replica links that are down, lagging replicas (also against the primary's offset when run on a
@@ -158,7 +258,7 @@ def node_replication() -> dict:
     return dataplane.replication(redis_client(), _node_client)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def node_acl_log(count: Annotated[int, Field(ge=1, le=128, description="ACL LOG entries to fetch")] = 25) -> dict:
     """ACL WHOAMI and recent ACL LOG entries (auth failures, denied commands, key/channel denials)
     with reason, user, client address and count; key and channel names are hidden. Findings flag
@@ -166,21 +266,21 @@ def node_acl_log(count: Annotated[int, Field(ge=1, le=128, description="ACL LOG 
     return dataplane.acl_log(redis_client(), count)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def node_cluster() -> dict:
     """Cluster-mode view: CLUSTER INFO, slots per primary and CLUSTER SHARDS when
     available. Reports cluster mode disabled otherwise."""
     return dataplane.cluster(redis_client(), _serverless())
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def node_cluster_nodes() -> dict:
     """CLUSTER NODES parsed into per-shard primary/replica endpoints, slot counts and
     failing nodes, plus how to target each shard with ELASTICACHE_HOST."""
     return dataplane.cluster_nodes(redis_client(), _serverless())
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def node_cluster_health(
     max_workers: Annotated[int, Field(ge=1, le=32, description="Concurrent node probes")] = 8,
     per_node_timeout: Annotated[float, Field(gt=0, le=60, description="Seconds to wait per node")] = 5.0,
@@ -190,7 +290,7 @@ def node_cluster_health(
     return dataplane.cluster_health(redis_client(), _node_client, max_workers, per_node_timeout)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def node_cluster_keyspace_sample(
     sample_size: Annotated[
         int, Field(ge=1, le=100_000, description="Max keys to inspect, split across primaries")
@@ -204,6 +304,7 @@ def node_cluster_keyspace_sample(
     ] = 10.0,
     max_workers: Annotated[int, Field(ge=1, le=32, description="Concurrent shard samplers")] = 8,
     per_node_timeout: Annotated[float, Field(gt=0, le=60, description="Extra seconds to wait for a stuck shard")] = 5.0,
+    top_prefixes: Annotated[int, Field(ge=1, le=50, description="Key prefixes to report")] = 10,
 ) -> dict:
     """node_keyspace_sample on every shard primary of a cluster-mode group: top big/hot/cold keys merged
     with a `shard` label, per-shard status (ok, partial, unreachable) and skew findings. A dead shard is
@@ -219,10 +320,11 @@ def node_cluster_keyspace_sample(
         max_seconds,
         max_workers,
         per_node_timeout,
+        top_prefixes,
     )
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def node_cluster_slowlog(
     count: Annotated[int, Field(ge=1, le=1024, description="Entries to return overall")] = 25,
     include_args: Annotated[bool, Field(description="Return full command arguments (may expose values)")] = False,
@@ -234,7 +336,7 @@ def node_cluster_slowlog(
     return dataplane.cluster_slowlog(redis_client(), _node_client, count, include_args, max_workers, per_node_timeout)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def node_cluster_memory(
     max_workers: Annotated[int, Field(ge=1, le=32, description="Concurrent shard probes")] = 8,
     per_node_timeout: Annotated[float, Field(gt=0, le=60, description="Seconds to wait per node")] = 5.0,
@@ -244,7 +346,7 @@ def node_cluster_memory(
     return dataplane.cluster_memory(redis_client(), _node_client, max_workers, per_node_timeout)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def memcached_stats(
     group: Annotated[
         Literal["", "settings", "slabs", "items", "conns"], Field(description="stats group; empty for general")
@@ -258,30 +360,40 @@ def memcached_stats(
     return memcached.summary(cfg.host, cfg.port, cfg.timeout)
 
 
+@read_tool
+def memcached_cluster_stats() -> dict:
+    """Memcached fleet view over MEMCACHED_NODES (host:port list): queries every node with bounded
+    concurrency and a per-node timeout, only `stats`, `stats slabs` and `stats items`. Findings first:
+    evictions, hit-ratio outliers vs the median, item/memory imbalance, listen_disabled_num, connections
+    near maxconns, slab classes evicting or running out of memory. A dead node makes the result partial."""
+    cfg = MemcachedConfig.from_env()
+    return memcached.cluster_stats(cfg.nodes, cfg.timeout)
+
+
 # --------------------------------------------------------------- control plane
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def aws_replication_groups(replication_group_id: str | None = None) -> dict:
     """DescribeReplicationGroups: status, engine, cluster mode, node type, Multi-AZ,
     failover, encryption, shards with primary/reader endpoints and member roles."""
     return control_plane().replication_groups(replication_group_id)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def aws_cache_clusters(cache_cluster_id: str | None = None, show_nodes: bool = True) -> dict:
     """DescribeCacheClusters: per-node-cluster engine version, node type, parameter
     group and apply status, maintenance window, pending changes and node endpoints."""
     return control_plane().cache_clusters(cache_cluster_id, show_nodes)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def aws_serverless_caches() -> dict:
     """DescribeServerlessCaches for ElastiCache Serverless (Valkey/Redis OSS/Memcached)."""
     return control_plane().serverless_caches()
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def aws_events(
     source_identifier: str | None = None,
     source_type: Annotated[
@@ -296,14 +408,14 @@ def aws_events(
     return control_plane().events(source_identifier, source_type, hours)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def aws_parameters(parameter_group: str, only_modified: bool = True) -> dict:
     """DescribeCacheParameters for a parameter group; by default only values changed
     from the engine defaults (Source=user)."""
     return control_plane().parameters(parameter_group, only_modified)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def aws_snapshots(
     replication_group_id: str | None = None,
     cache_cluster_id: str | None = None,
@@ -315,33 +427,33 @@ def aws_snapshots(
     return control_plane().snapshots(replication_group_id, cache_cluster_id, source, stale_hours)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def aws_users(engine: Annotated[Literal["redis", "valkey"] | None, Field(description="Engine filter")] = None) -> dict:
     """DescribeUsers (RBAC): authentication type and access strings, never passwords.
     Flags users with '~* +@all' access and users without a password."""
     return control_plane().users(engine)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def aws_user_groups() -> dict:
     """DescribeUserGroups: members, attached replication groups/serverless caches, pending changes."""
     return control_plane().user_groups()
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def aws_global_replication_groups() -> dict:
     """DescribeGlobalReplicationGroups: global datastore members, regions, roles and status."""
     return control_plane().global_replication_groups()
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def aws_reserved_nodes() -> dict:
     """DescribeReservedCacheNodes plus running nodes: reservation coverage per node type and
     engine, on-demand nodes not covered, unused or soon-expiring reservations."""
     return control_plane().reserved_nodes()
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def aws_service_updates(
     status: Annotated[Literal["available", "cancelled", "expired"], Field(description="Update status")] = "available",
 ) -> dict:
@@ -349,13 +461,13 @@ def aws_service_updates(
     return control_plane().service_updates(status)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def aws_subnet_groups() -> dict:
     """DescribeCacheSubnetGroups: VPC, subnets and AZ spread (flags groups in fewer than 2 AZs)."""
     return control_plane().subnet_groups()
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def aws_metrics(
     cache_cluster_id: Annotated[
         str | None,
@@ -379,7 +491,7 @@ def aws_metrics(
     )
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def aws_parameter_drift(
     group_a: Annotated[str, Field(description="First cache parameter group name (e.g. production)")],
     group_b: Annotated[str, Field(description="Second cache parameter group name (e.g. staging)")],
@@ -389,7 +501,7 @@ def aws_parameter_drift(
     return control_plane().parameter_drift(group_a, group_b)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
 def aws_triage(replication_group_id: Annotated[str, Field(description="ReplicationGroupId to triage")]) -> dict:
     """One-call incident summary for a replication group: status, Multi-AZ/failover, last 6h events,
     CloudWatch peaks per member, pending service updates and snapshot age. Findings are worst-first
@@ -397,7 +509,21 @@ def aws_triage(replication_group_id: Annotated[str, Field(description="Replicati
     return control_plane().triage(replication_group_id)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@read_tool
+def aws_alarms(
+    replication_group_id: Annotated[
+        str | None,
+        Field(description="Limit to one replication group; omit to check every group, cluster and serverless cache"),
+    ] = None,
+) -> dict:
+    """CloudWatch alarm coverage for ElastiCache (DescribeAlarms, read-only). Findings first: alarms in
+    ALARM, INSUFFICIENT_DATA or with actions disabled, and members with no alarm on EngineCPUUtilization,
+    DatabaseMemoryUsagePercentage, Evictions, ReplicationLag, CurrConnections, SwapUsage (plus ThrottledCmds
+    on Serverless). Returns partial=true if DescribeAlarms is denied."""
+    return control_plane().alarms(replication_group_id)
+
+
+@read_tool
 def aws_cluster_overview(
     replication_group_id: Annotated[str, Field(description="ReplicationGroupId to summarise")],
     minutes: Annotated[int, Field(ge=5, le=20160, description="CloudWatch window (multiple of 5 min is fine)")] = 360,

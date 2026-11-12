@@ -39,6 +39,8 @@ ENV_VARS = (
     "AWS_DEFAULT_REGION",
     "MEMCACHED_HOST",
     "MEMCACHED_PORT",
+    "MEMCACHED_NODES",
+    "MCP_MAX_OUTPUT_CHARS",
     "ELASTICACHE_CONTROL_PLANE",
     "AWS_PROFILE",
 )
@@ -237,3 +239,42 @@ def test_token_expiry_constant_matches_elasticache_limit():
     from mcp_elasticache_ops.connection import IAM_TOKEN_TTL_SECONDS
 
     assert dt.timedelta(seconds=IAM_TOKEN_TTL_SECONDS) == dt.timedelta(minutes=15)
+
+
+# ------------------------------------------------------- MEMCACHED_NODES / MCP_MAX_OUTPUT_CHARS
+
+
+def test_memcached_nodes_default_and_parsed(monkeypatch):
+    assert MemcachedConfig.from_env().nodes == ()
+    monkeypatch.setenv("MEMCACHED_NODES", " a:11211, b.example.com:11212 ,a:11211,[::1]:11213")
+    assert MemcachedConfig.from_env().nodes == (("a", 11211), ("b.example.com", 11212), ("::1", 11213))
+
+
+@pytest.mark.parametrize("raw", ["a", "a:", ":11211", "a:0", "a:70000", "a:x", "a b:1", ","])
+def test_memcached_nodes_invalid(monkeypatch, raw):
+    monkeypatch.setenv("MEMCACHED_NODES", raw)
+    with pytest.raises(ConfigError, match="MEMCACHED_NODES"):
+        MemcachedConfig.from_env()
+
+
+def test_memcached_nodes_limit(monkeypatch):
+    monkeypatch.setenv("MEMCACHED_NODES", ",".join(f"h{i}:11211" for i in range(65)))
+    with pytest.raises(ConfigError, match="limit"):
+        MemcachedConfig.from_env()
+
+
+def test_max_output_chars_default_and_override(monkeypatch):
+    from mcp_elasticache_ops.config import DEFAULT_MAX_OUTPUT_CHARS, max_output_chars
+
+    assert max_output_chars() == DEFAULT_MAX_OUTPUT_CHARS == 60000
+    monkeypatch.setenv("MCP_MAX_OUTPUT_CHARS", "2500")
+    assert max_output_chars() == 2500
+
+
+@pytest.mark.parametrize("raw", ["abc", "10", "0", "-5", "99999999", "1.5"])
+def test_max_output_chars_invalid(monkeypatch, raw):
+    from mcp_elasticache_ops.config import max_output_chars
+
+    monkeypatch.setenv("MCP_MAX_OUTPUT_CHARS", raw)
+    with pytest.raises(ConfigError, match="MCP_MAX_OUTPUT_CHARS"):
+        max_output_chars()

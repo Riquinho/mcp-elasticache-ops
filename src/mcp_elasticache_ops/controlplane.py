@@ -126,6 +126,19 @@ IMPORTANT_PARAMETERS = {
     "tcp-keepalive",
 }
 
+# Alarms every production node should have (CloudWatch metric names, AWS/ElastiCache namespace).
+RECOMMENDED_ALARMS = [
+    "EngineCPUUtilization",
+    "DatabaseMemoryUsagePercentage",
+    "Evictions",
+    "ReplicationLag",
+    "CurrConnections",
+    "SwapUsage",
+]
+MEMCACHED_RECOMMENDED_ALARMS = ["CPUUtilization", "Evictions", "CurrConnections", "SwapUsage"]
+SERVERLESS_RECOMMENDED_ALARMS = [m for m in RECOMMENDED_ALARMS if m != "ReplicationLag"] + ["ThrottledCmds"]
+ALARM_NAMESPACE = "AWS/ElastiCache"
+
 _SEVERITY_ORDER = {"critical": 0, "important": 1, "warning": 2, "medium": 3, "low": 4, "info": 5}
 
 
@@ -245,6 +258,173 @@ class ControlPlane:
                     break
             findings = [f for c in items for f in _serverless_cache_findings(c)]
             return {"count": len(items), "findings": _sorted_findings(findings), "serverless_caches": _jsonable(items)}
+
+        return self._guard(run)
+
+    def _alarm_targets(self, replication_group_id: str | None) -> list[dict]:
+        """What should be alarmed: replication groups (members), standalone clusters, serverless caches."""
+        targets: list[dict] = []
+        kwargs = {"ReplicationGroupId": replication_group_id} if replication_group_id else {}
+        groups = self._paginate("describe_replication_groups", "ReplicationGroups", **kwargs)
+        for g in groups:
+            members = [str(m) for m in g.get("MemberClusters", [])]
+            targets.append(
+                {
+                    "id": g.get("ReplicationGroupId"),
+                    "kind": "replication-group",
+                    "members": members,
+                    "metrics": [m for m in RECOMMENDED_ALARMS if m != "ReplicationLag" or len(members) > 1],
+                }
+            )
+        if replication_group_id:
+            return targets
+        in_group = {m for t in targets for m in t["members"]}
+        for c in self._paginate("describe_cache_clusters", "CacheClusters"):
+            cid = str(c.get("CacheClusterId"))
+            if cid in in_group or c.get("ReplicationGroupId"):
+                continue
+            memcached = str(c.get("Engine", "")).lower() == "memcached"
+            targets.append(
+                {
+                    "id": cid,
+                    "kind": "cache-cluster",
+                    "members": [cid],
+                    "metrics": [
+                        m
+                        for m in (MEMCACHED_RECOMMENDED_ALARMS if memcached else RECOMMENDED_ALARMS)
+                        if m != "ReplicationLag"
+                    ],
+                }
+            )
+        ec = self.client("elasticache")
+        token = None
+        while True:
+            page = ec.describe_serverless_caches(**({"NextToken": token} if token else {}))
+            for c in page.get("ServerlessCaches", []):
+                sid = str(c.get("ServerlessCacheName"))
+                targets.append(
+                    {"id": sid, "kind": "serverless", "members": [sid], "metrics": list(SERVERLESS_RECOMMENDED_ALARMS)}
+                )
+            token = page.get("NextToken")
+            if not token:
+                return targets
+
+    def _describe_alarms(self) -> list[dict]:
+        cw = self.client("cloudwatch")
+        out: list[dict] = []
+        token = None
+        while True:
+            page = cw.describe_alarms(AlarmTypes=["MetricAlarm"], **({"NextToken": token} if token else {}))
+            out.extend(a for a in page.get("MetricAlarms", []) if a.get("Namespace") == ALARM_NAMESPACE)
+            token = page.get("NextToken")
+            if not token:
+                return out
+
+    def alarms(self, replication_group_id: str | None = None) -> dict:
+        """CloudWatch alarm coverage for ElastiCache: findings first, then the alarms and per-target gaps.
+
+        Flags alarms in ALARM, INSUFFICIENT_DATA or with actions disabled, and recommended metrics
+        (``RECOMMENDED_ALARMS``, plus ThrottledCmds for Serverless) that no alarm covers per member.
+        """
+
+        def run() -> dict:
+            targets = self._alarm_targets(replication_group_id)
+            notes: list[str] = []
+            try:
+                found = self._describe_alarms()
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "ClientError")
+                return {
+                    "partial": True,
+                    "count": 0,
+                    "targets": [{"id": t["id"], "kind": t["kind"], "members": t["members"]} for t in targets],
+                    "alarms": [],
+                    "findings": [
+                        finding("warning", f"cloudwatch:DescribeAlarms failed ({code}): alarm coverage not checked")
+                    ],
+                    "notes": ["grant cloudwatch:DescribeAlarms to see alarm state and coverage"],
+                }
+            ids = {m for t in targets for m in t["members"]} | {str(t["id"]) for t in targets}
+            if replication_group_id or targets:
+                scoped = []
+                for a in found:
+                    dims = {d.get("Name"): d.get("Value") for d in a.get("Dimensions", [])}
+                    ref = dims.get("CacheClusterId") or dims.get("ReplicationGroupId") or dims.get("clusterId")
+                    if ref in ids or not targets:
+                        scoped.append((a, dims))
+            else:
+                scoped = [(a, {d.get("Name"): d.get("Value") for d in a.get("Dimensions", [])}) for a in found]
+            findings: list[dict] = []
+            views = []
+            for a, dims in scoped:
+                ref = dims.get("CacheClusterId") or dims.get("ReplicationGroupId") or dims.get("clusterId")
+                state = a.get("StateValue")
+                name = a.get("AlarmName")
+                views.append(
+                    {
+                        "name": name,
+                        "metric": a.get("MetricName"),
+                        "resource": ref,
+                        "state": state,
+                        "actions_enabled": bool(a.get("ActionsEnabled")),
+                        "has_actions": bool(a.get("AlarmActions")),
+                    }
+                )
+                if state == "ALARM":
+                    reason = str(a.get("StateReason", ""))[:200]
+                    findings.append(
+                        finding("critical", f"alarm {name} is in ALARM: {reason}", resource=ref, alarm=name)
+                    )
+                elif state == "INSUFFICIENT_DATA":
+                    findings.append(
+                        finding(
+                            "warning", f"alarm {name} is INSUFFICIENT_DATA: it cannot fire", resource=ref, alarm=name
+                        )
+                    )
+                if not a.get("ActionsEnabled"):
+                    findings.append(
+                        finding(
+                            "warning",
+                            f"alarm {name} has actions disabled: it will not notify",
+                            resource=ref,
+                            alarm=name,
+                        )
+                    )
+            target_views = []
+            for t in targets:
+                covered: dict[str, set[str]] = defaultdict(set)
+                for a, dims in scoped:
+                    metric = str(a.get("MetricName"))
+                    if dims.get("ReplicationGroupId") == t["id"]:
+                        covered[metric].update(t["members"])
+                    elif (dims.get("CacheClusterId") or dims.get("clusterId")) in t["members"]:
+                        covered[metric].add(str(dims.get("CacheClusterId") or dims.get("clusterId")))
+                missing = {}
+                for metric in t["metrics"]:
+                    gap = [m for m in t["members"] if m not in covered[metric]]
+                    if gap:
+                        missing[metric] = gap
+                        findings.append(
+                            finding(
+                                "warning",
+                                f"no alarm on {metric} for {', '.join(gap)} ({t['kind']} {t['id']})",
+                                resource=t["id"],
+                                metric=metric,
+                                members=gap,
+                            )
+                        )
+                target_views.append(
+                    {"id": t["id"], "kind": t["kind"], "members": t["members"], "missing_alarms": missing}
+                )
+            if not targets and not replication_group_id:
+                notes.append("no replication groups, clusters or serverless caches found in this region")
+            return {
+                "count": len(views),
+                "findings": _sorted_findings(findings),
+                "targets": target_views,
+                "alarms": views,
+                **({"notes": notes} if notes else {}),
+            }
 
         return self._guard(run)
 

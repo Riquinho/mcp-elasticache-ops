@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased (round 04)
+
+### Added
+- `node_triage`: one-call snapshot (health, memory, replication, clients, failed commandstats, slowlog, latency),
+  findings merged worst-first (max 30), a failing section never kills the rest.
+- `aws_alarms`: CloudWatch alarm coverage (`DescribeAlarms`, read-only); IAM policy gains `cloudwatch:DescribeAlarms`.
+- `memcached_cluster_stats` and `MEMCACHED_NODES`: fan-out with bounded concurrency, slab/item analysis, outlier findings.
+- `node_keyspace_sample` / `node_cluster_keyspace_sample`: `prefixes` grouped by normalised key prefix, `top_prefixes`.
+- `node_cluster_nodes` / `node_cluster_health`: `topology_findings` (fail/handshake/noaddr, resharding, primaries without
+  replica, slot imbalance) and a `CLUSTER SHARDS` cross-check on 7.0+ with a fallback note on older engines.
+- `MCP_MAX_OUTPUT_CHARS` (default 60000): every tool result is capped; lists are cut to their head, findings and
+  summaries stay, `truncated`/`omitted` are set.
+
+### Changed
+- Tool count is now 37 (was 34).
+
 ## Unreleased (round 01)
 
 ### Security

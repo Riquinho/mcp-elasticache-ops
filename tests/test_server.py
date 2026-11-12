@@ -31,7 +31,7 @@ async def test_all_tools_read_only():
     async with Client(server.mcp) as c:
         tools = await c.list_tools()
     names = {t.name for t in tools}
-    assert len(tools) == 34
+    assert len(tools) == 37
     assert {
         "node_health",
         "node_info",
@@ -70,6 +70,7 @@ async def test_all_tools_read_only():
         "node_acl_log",
         "aws_cluster_overview",
     } <= names  # round 03
+    assert {"node_triage", "aws_alarms", "memcached_cluster_stats"} <= names  # round 04
     for t in tools:
         assert t.annotations.read_only_hint is True, t.name
         assert t.annotations.destructive_hint is False, t.name
@@ -107,3 +108,76 @@ async def test_node_config_end_to_end(env):
         cfg = _data(await c.call_tool("node_config", {}))
     assert "findings" in cfg and "available" in cfg
     assert "requirepass" not in cfg.get("config", {})
+
+
+# ------------------------------------------------------------------ output cap
+
+
+async def test_every_registered_tool_is_wrapped_with_the_output_cap():
+    tools = await server.mcp.list_tools()
+    assert len(tools) == 37
+    unwrapped = [t.name for t in tools if not getattr(t.fn, "__capped__", False)]
+    assert unwrapped == []
+
+
+def test_cap_output_small_result_is_returned_untouched():
+    small = {"findings": [{"severity": "info", "message": "x"}], "rows": list(range(10))}
+    assert server.cap_output(small, 60000) is small
+    assert server.cap_output(["not", "a", "dict"], 5) == ["not", "a", "dict"]
+
+
+def _big():
+    return {
+        "status": "ok",
+        "count": 3000,
+        "findings": [{"severity": "warning", "message": f"finding {i}"} for i in range(5)],
+        "summary": {"nodes": 3000},
+        "notes": ["keep me"],
+        "rows": [{"id": i, "payload": "x" * 40} for i in range(3000)],
+        "nested": {"a": {"series": list(range(5000))}},
+    }
+
+
+def test_cap_output_trims_lists_keeps_findings_and_does_not_mutate():
+    import copy
+
+    original = _big()
+    snapshot = copy.deepcopy(original)
+    out = server.cap_output(original, 8000)
+    assert original == snapshot  # input untouched
+    assert out is not original
+    assert out["truncated"] is True and out["omitted"] > 0
+    assert out["original_chars"] > 8000
+    assert "MCP_MAX_OUTPUT_CHARS=8000" in out["truncation_hint"]
+    assert out["findings"] == snapshot["findings"] and out["summary"] == snapshot["summary"]
+    assert out["notes"] == ["keep me"] and out["count"] == 3000 and out["status"] == "ok"
+    assert out["rows"] == snapshot["rows"][: len(out["rows"])]  # head of the list
+    assert len(out["rows"]) < 3000
+    assert len(json.dumps(out)) <= 8000 + 400  # the added keys are the only overshoot
+
+
+def test_cap_output_adds_no_flags_when_it_fits():
+    out = server.cap_output(_big(), 10_000_000)
+    assert "truncated" not in out
+
+
+def test_tool_wrapper_reads_limit_from_env(monkeypatch):
+    monkeypatch.setattr(server.dataplane, "triage", lambda *a, **k: _big())
+    monkeypatch.setattr(server, "redis_client", lambda: object())
+    monkeypatch.setattr(server, "_serverless", lambda: False)
+    monkeypatch.setenv("MCP_MAX_OUTPUT_CHARS", "6000")
+    out = server.node_triage()
+    assert out["truncated"] is True and len(out["rows"]) < 3000
+    monkeypatch.setenv("MCP_MAX_OUTPUT_CHARS", "5000000")
+    assert "truncated" not in server.node_triage()
+
+
+def test_tool_wrapper_rejects_invalid_limit(monkeypatch):
+    from mcp_elasticache_ops.config import ConfigError
+
+    monkeypatch.setattr(server.dataplane, "triage", lambda *a, **k: {})
+    monkeypatch.setattr(server, "redis_client", lambda: object())
+    monkeypatch.setattr(server, "_serverless", lambda: False)
+    monkeypatch.setenv("MCP_MAX_OUTPUT_CHARS", "lots")
+    with pytest.raises(ConfigError, match="MCP_MAX_OUTPUT_CHARS"):
+        server.node_triage()

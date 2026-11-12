@@ -613,3 +613,171 @@ def test_paginate_refuses_write_operations(op):
     cp = ControlPlane(ControlPlaneConfig(region=REGION), session_factory=lambda: pytest.fail("must not connect"))
     with pytest.raises(ValueError, match="non-read-only"):
         cp._paginate(op, "Items")
+
+
+# ------------------------------------------------------------------- alarms
+
+ALARM_METRICS = [
+    "EngineCPUUtilization",
+    "DatabaseMemoryUsagePercentage",
+    "Evictions",
+    "ReplicationLag",
+    "CurrConnections",
+    "SwapUsage",
+]
+
+
+def _alarm(metric, cluster, state="OK", actions=True, namespace="AWS/ElastiCache", dim="CacheClusterId"):
+    return {
+        "AlarmName": f"{cluster}-{metric}",
+        "Namespace": namespace,
+        "MetricName": metric,
+        "Dimensions": [{"Name": dim, "Value": cluster}],
+        "StateValue": state,
+        "StateReason": f"{metric} crossed the threshold",
+        "ActionsEnabled": actions,
+        "AlarmActions": ["arn:aws:sns:us-east-1:123456789012:oncall"],
+    }
+
+
+def _rg(members=("rg1-001", "rg1-002")):
+    return {"ReplicationGroups": [{"ReplicationGroupId": "rg1", "MemberClusters": list(members)}]}
+
+
+def test_alarms_full_coverage_has_no_findings(aws):
+    cp, ec, cw = aws
+    ec.add_response("describe_replication_groups", _rg(), {"ReplicationGroupId": "rg1"})
+    cw.add_response(
+        "describe_alarms",
+        {"MetricAlarms": [_alarm(m, c) for m in ALARM_METRICS for c in ("rg1-001", "rg1-002")]},
+        None,
+    )
+    out = cp.alarms("rg1")
+    assert out["count"] == 12
+    assert out["findings"] == []
+    assert out["targets"][0]["missing_alarms"] == {}
+
+
+def test_alarms_paginated_filtered_and_flags_state_problems(aws):
+    cp, ec, cw = aws
+    ec.add_response("describe_replication_groups", _rg(), {"ReplicationGroupId": "rg1"})
+    page1 = [_alarm(m, "rg1-001") for m in ALARM_METRICS if m != "DatabaseMemoryUsagePercentage"]
+    page1.append(_alarm("CPUUtilization", "other-001"))  # another cluster: ignored
+    page1.append(_alarm("EngineCPUUtilization", "rg1-001", namespace="AWS/EC2"))  # other namespace: ignored
+    page2 = [_alarm(m, "rg1-002") for m in ALARM_METRICS]
+    page2[0] = _alarm("EngineCPUUtilization", "rg1-002", state="ALARM")
+    page2[1] = _alarm("DatabaseMemoryUsagePercentage", "rg1-002", state="INSUFFICIENT_DATA")
+    page2[2] = _alarm("Evictions", "rg1-002", actions=False)
+    cw.add_response("describe_alarms", {"MetricAlarms": page1, "NextToken": "t1"}, None)
+    cw.add_response("describe_alarms", {"MetricAlarms": page2}, {"AlarmTypes": ["MetricAlarm"], "NextToken": "t1"})
+    out = cp.alarms("rg1")
+    assert out["count"] == 11
+    msgs = [f["message"] for f in out["findings"]]
+    assert out["findings"][0]["severity"] == "critical" and "rg1-002-EngineCPUUtilization is in ALARM" in msgs[0]
+    assert any("rg1-002-DatabaseMemoryUsagePercentage is INSUFFICIENT_DATA" in m for m in msgs)
+    assert any("rg1-002-Evictions has actions disabled" in m for m in msgs)
+    assert any("no alarm on DatabaseMemoryUsagePercentage for rg1-001" in m for m in msgs)
+    assert not any("other-001" in m for m in msgs)
+    assert out["targets"][0]["missing_alarms"] == {"DatabaseMemoryUsagePercentage": ["rg1-001"]}
+
+
+def test_alarms_missing_everything(aws):
+    cp, ec, cw = aws
+    ec.add_response("describe_replication_groups", _rg(), {"ReplicationGroupId": "rg1"})
+    cw.add_response("describe_alarms", {"MetricAlarms": []}, None)
+    out = cp.alarms("rg1")
+    assert out["count"] == 0
+    assert set(out["targets"][0]["missing_alarms"]) == set(ALARM_METRICS)
+    assert len(out["findings"]) == 6 and all(f["severity"] == "warning" for f in out["findings"])
+
+
+def test_alarms_single_node_group_does_not_need_replication_lag(aws):
+    cp, ec, cw = aws
+    ec.add_response("describe_replication_groups", _rg(("rg1-001",)), {"ReplicationGroupId": "rg1"})
+    cw.add_response("describe_alarms", {"MetricAlarms": []}, None)
+    assert "ReplicationLag" not in cp.alarms("rg1")["targets"][0]["missing_alarms"]
+
+
+def test_alarms_access_denied_is_partial(aws):
+    cp, ec, cw = aws
+    ec.add_response("describe_replication_groups", _rg(), {"ReplicationGroupId": "rg1"})
+    cw.add_client_error("describe_alarms", service_error_code="AccessDenied")
+    out = cp.alarms("rg1")
+    assert out["partial"] is True and out["alarms"] == []
+    assert out["targets"][0]["id"] == "rg1"
+    assert "cloudwatch:DescribeAlarms failed (AccessDenied)" in out["findings"][0]["message"]
+
+
+def test_alarms_whole_region_covers_clusters_and_serverless(aws):
+    cp, ec, cw = aws
+    ec.add_response("describe_replication_groups", _rg(), None)
+    ec.add_response(
+        "describe_cache_clusters",
+        {
+            "CacheClusters": [
+                {"CacheClusterId": "rg1-001", "ReplicationGroupId": "rg1", "Engine": "valkey"},
+                {"CacheClusterId": "mc1", "Engine": "memcached"},
+            ]
+        },
+        None,
+    )
+    ec.add_response("describe_serverless_caches", {"ServerlessCaches": [{"ServerlessCacheName": "sc1"}]}, None)
+    cw.add_response(
+        "describe_alarms",
+        {"MetricAlarms": [_alarm("ThrottledCmds", "sc1", dim="clusterId"), _alarm("Evictions", "mc1")]},
+        None,
+    )
+    out = cp.alarms()
+    kinds = {t["id"]: t for t in out["targets"]}
+    assert set(kinds) == {"rg1", "mc1", "sc1"}
+    assert "ThrottledCmds" not in kinds["sc1"]["missing_alarms"]  # covered through the clusterId dimension
+    assert "EngineCPUUtilization" in kinds["sc1"]["missing_alarms"]
+    assert "CPUUtilization" in kinds["mc1"]["missing_alarms"] and "Evictions" not in kinds["mc1"]["missing_alarms"]
+    assert "EngineCPUUtilization" not in kinds["mc1"]["missing_alarms"]
+    assert out["count"] == 2
+
+
+def test_alarms_replication_group_dimension_covers_all_members(aws):
+    cp, ec, cw = aws
+    ec.add_response("describe_replication_groups", _rg(), {"ReplicationGroupId": "rg1"})
+    cw.add_response(
+        "describe_alarms",
+        {"MetricAlarms": [_alarm(m, "rg1", dim="ReplicationGroupId") for m in ALARM_METRICS]},
+        None,
+    )
+    assert cp.alarms("rg1")["findings"] == []
+
+
+def test_alarms_disabled_control_plane():
+    cp = ControlPlane(ControlPlaneConfig(region=REGION, enabled=False), session_factory=lambda: pytest.fail("no"))
+    assert "unavailable" in cp.alarms()
+
+
+async def test_aws_alarms_tool_registered_read_only_and_delegates(monkeypatch):
+    seen = {}
+
+    class Plane:
+        def alarms(self, rg=None):
+            seen["rg"] = rg
+            return {"count": 0, "findings": [], "targets": [], "alarms": []}
+
+    monkeypatch.setattr(server, "control_plane", lambda: Plane())
+    async with Client(server.mcp) as c:
+        tool = next(t for t in await c.list_tools() if t.name == "aws_alarms")
+        assert tool.annotations.read_only_hint is True
+        await c.call_tool("aws_alarms", {"replication_group_id": "rg1"})
+    assert seen["rg"] == "rg1"
+
+
+def test_iam_policy_allows_describe_alarms_and_nothing_else_beyond_describe_list_get():
+    import json
+    import re
+    from pathlib import Path
+
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    block = re.search(r"```json\n(\{\s*\"Version\".*?\})\n```", readme, flags=re.S)
+    actions = [a for st in json.loads(block.group(1))["Statement"] for a in st["Action"]]
+    assert "cloudwatch:DescribeAlarms" in actions
+    assert "cloudwatch:GetMetricData" in actions
+    for action in actions:
+        assert re.match(r"^(elasticache|cloudwatch):(Describe|List|GetMetricData)", action), action

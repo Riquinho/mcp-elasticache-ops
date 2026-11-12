@@ -112,6 +112,7 @@ class MemcachedConfig:
     host: str | None = None
     port: int = 11211
     timeout: float = 5.0
+    nodes: tuple[tuple[str, int], ...] = ()
 
     @classmethod
     def from_env(cls) -> MemcachedConfig:
@@ -119,6 +120,7 @@ class MemcachedConfig:
             host=os.getenv("MEMCACHED_HOST") or None,
             port=_int("MEMCACHED_PORT", 11211, 1, 65535),
             timeout=_float("ELASTICACHE_TIMEOUT", 5.0, 0, 600),
+            nodes=memcached_nodes(os.getenv("MEMCACHED_NODES")),
         )
 
 
@@ -137,3 +139,37 @@ class ControlPlaneConfig:
             profile=os.getenv("AWS_PROFILE") or None,
             enabled=_bool(os.getenv("ELASTICACHE_CONTROL_PLANE"), default=True),
         )
+
+
+DEFAULT_MAX_OUTPUT_CHARS = 60_000
+
+
+def max_output_chars() -> int:
+    """``MCP_MAX_OUTPUT_CHARS``: JSON size above which a tool result is trimmed (default 60000)."""
+    return _int("MCP_MAX_OUTPUT_CHARS", DEFAULT_MAX_OUTPUT_CHARS, 1_000, 5_000_000)
+
+
+def _host_port(entry: str) -> tuple[str, int]:
+    host, sep, port = entry.strip().rpartition(":")
+    host = host.strip("[]")  # bracketed IPv6 literal
+    if not sep or not host or not port.isdigit() or not 1 <= int(port) <= 65535 or any(c.isspace() for c in host):
+        raise ConfigError(f"MEMCACHED_NODES entries must be host:port (port 1-65535), got {entry!r}")
+    return host, int(port)
+
+
+def memcached_nodes(raw: str | None) -> tuple[tuple[str, int], ...]:
+    """Parse ``MEMCACHED_NODES`` (comma-separated ``host:port``); duplicates are dropped, order is kept."""
+    if raw is None or raw.strip() == "":
+        return ()
+    entries = [e for e in raw.split(",") if e.strip()]
+    if not entries:
+        raise ConfigError(f"MEMCACHED_NODES has no usable entries: {raw!r}")
+    seen: dict[tuple[str, int], None] = {}
+    for entry in entries:
+        seen[_host_port(entry)] = None
+    if len(seen) > MAX_MEMCACHED_NODES:
+        raise ConfigError(f"MEMCACHED_NODES lists {len(seen)} nodes, the limit is {MAX_MEMCACHED_NODES}")
+    return tuple(seen)
+
+
+MAX_MEMCACHED_NODES = 64

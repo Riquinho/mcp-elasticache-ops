@@ -537,6 +537,126 @@ def config_view(r: redis.Redis) -> dict:
 DEFAULT_SAMPLE_SECONDS = 10.0
 MAX_SAMPLE_SECONDS = 60.0
 PIPELINE_CHUNK = 100
+DEFAULT_TOP_PREFIXES = 10
+MAX_TOP_PREFIXES = 50
+PREFIX_PRESSURE_RATIO = 0.8  # memory share of maxmemory at which a no-TTL prefix becomes a finding
+PREFIX_SHARE_PCT = 10.0  # a prefix must hold at least this share of sampled memory to be flagged
+PREFIX_NO_TTL_PCT = 90.0
+
+_KEY_SEPARATORS = re.compile(r"([:/.])")
+_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_HEX_ID = re.compile(r"[0-9a-fA-F]{8,}")
+
+
+def _is_variable_segment(segment: str) -> bool:
+    if segment.isdigit() or _UUID.fullmatch(segment):
+        return True
+    # long hex tokens (object ids, hashes); needing a digit keeps plain words such as "defaced" intact
+    return bool(_HEX_ID.fullmatch(segment)) and any(c.isdigit() for c in segment)
+
+
+def normalize_key(key: Any) -> str:
+    """Collapse the variable parts of a key: ``user:123:cart`` -> ``user:*:cart``.
+
+    The key is split on ``:``, ``/`` and ``.`` (separators are kept); a segment that is all digits, a UUID or a
+    hex token of 8+ characters becomes ``*``. Redis Cluster hash-tag braces around a segment are preserved.
+    """
+    out = []
+    for part in _KEY_SEPARATORS.split(str(_s(key))):
+        core = part.strip("{}")
+        out.append(part.replace(core, "*", 1) if core and _is_variable_segment(core) else part)
+    return "".join(out)
+
+
+def _prefix_entries(rows: list[dict], dbsize: int) -> list[dict]:
+    """Aggregate sampled rows by normalised prefix; bytes and key counts are scaled up to ``dbsize``."""
+    scale = dbsize / len(rows) if rows and dbsize > len(rows) else 1.0
+    agg: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        entry = agg.setdefault(
+            normalize_key(row["key"]),
+            {"sampled_keys": 0, "sampled_bytes": 0, "no_ttl_keys": 0, "types": Counter()},
+        )
+        entry["sampled_keys"] += 1
+        entry["sampled_bytes"] += row["bytes"] or 0
+        entry["no_ttl_keys"] += 1 if row["ttl_ms"] == -1 else 0
+        entry["types"][row["type"]] += 1
+    return [
+        {
+            "prefix": prefix,
+            "sampled_keys": e["sampled_keys"],
+            "est_keys": round(e["sampled_keys"] * scale),
+            "est_bytes": round(e["sampled_bytes"] * scale),
+            "no_ttl_keys": e["no_ttl_keys"],
+            "types": dict(e["types"]),
+        }
+        for prefix, e in agg.items()
+    ]
+
+
+def _merge_prefix_entries(groups: list[list[dict]]) -> list[dict]:
+    """Sum prefix entries produced by several shards (inputs are not modified)."""
+    merged: dict[str, dict[str, Any]] = {}
+    for group in groups:
+        for e in group:
+            m = merged.setdefault(
+                e["prefix"],
+                {
+                    "prefix": e["prefix"],
+                    "sampled_keys": 0,
+                    "est_keys": 0,
+                    "est_bytes": 0,
+                    "no_ttl_keys": 0,
+                    "types": {},
+                },
+            )
+            for field_name in ("sampled_keys", "est_keys", "est_bytes", "no_ttl_keys"):
+                m[field_name] += e[field_name]
+            for t, n in e["types"].items():
+                m["types"][t] = m["types"].get(t, 0) + n
+    return list(merged.values())
+
+
+def _prefix_report(
+    entries: list[dict], top_prefixes: int, policy: str, usage: float | None, total_bytes: int | None = None
+) -> dict[str, Any]:
+    """Top prefixes by estimated bytes plus findings when no-TTL data sits under memory pressure."""
+    top_prefixes = max(1, min(int(top_prefixes), MAX_TOP_PREFIXES))
+    ranked = sorted(entries, key=lambda e: (e["est_bytes"], e["sampled_keys"]), reverse=True)
+    total = total_bytes if total_bytes is not None else sum(e["est_bytes"] for e in ranked)
+
+    def view(e: dict) -> dict:
+        return {
+            "prefix": e["prefix"],
+            "sampled_keys": e["sampled_keys"],
+            "est_keys": e["est_keys"],
+            "est_bytes": e["est_bytes"],
+            "pct_of_memory": round(100 * e["est_bytes"] / total, 1) if total else 0.0,
+            "no_ttl_keys": e["no_ttl_keys"],
+            "no_ttl_pct": round(100 * e["no_ttl_keys"] / e["sampled_keys"], 1) if e["sampled_keys"] else 0.0,
+            "types": dict(sorted(e["types"].items())),
+        }
+
+    rows = [view(e) for e in ranked]
+    pressure = policy == "noeviction" or (usage is not None and usage >= PREFIX_PRESSURE_RATIO)
+    findings = []
+    if pressure:
+        why = f"maxmemory-policy {policy or '?'}" + (f", memory at {usage:.0%} of maxmemory" if usage else "")
+        for row in rows:
+            if row["pct_of_memory"] >= PREFIX_SHARE_PCT and row["no_ttl_pct"] >= PREFIX_NO_TTL_PCT:
+                findings.append(
+                    _finding(
+                        "critical" if usage is not None and usage >= 0.9 else "warning",
+                        f"prefix {row['prefix']} has {row['pct_of_memory']:g}% of sampled memory and "
+                        f"{row['no_ttl_pct']:g}% of its keys have no TTL ({why})",
+                        prefix=row["prefix"],
+                    )
+                )
+    return {
+        "prefixes": rows[:top_prefixes],
+        "prefixes_summary": {"distinct": len(rows), "shown": min(len(rows), top_prefixes), "est_bytes_total": total},
+        "findings": findings,
+    }
 
 
 def keyspace_sample(
@@ -548,6 +668,7 @@ def keyspace_sample(
     pause_ms: int = 0,
     max_seconds: float = DEFAULT_SAMPLE_SECONDS,
     clock: Callable[[], float] = time.monotonic,
+    top_prefixes: int = DEFAULT_TOP_PREFIXES,
 ) -> dict:
     """Big/hot key finder based on a bounded SCAN.
 
@@ -557,7 +678,8 @@ def keyspace_sample(
     stops at the ``max_seconds`` wall-clock budget (hard cap 60 s), returning
     what it has with ``partial=True``. Hot keys need an LFU ``maxmemory-policy``
     (OBJECT FREQ); otherwise idle time is reported. Only the connected node is
-    sampled, which in cluster mode means only that node's slots.
+    sampled, which in cluster mode means only that node's slots. ``prefixes`` groups the sampled keys by
+    normalised prefix (see ``normalize_key``) from data already fetched, so it costs no extra commands.
     """
     sample_size = max(1, min(int(sample_size), 100_000))
     max_seconds = max(0.01, min(float(max_seconds), MAX_SAMPLE_SECONDS))
@@ -622,9 +744,13 @@ def keyspace_sample(
     no_ttl = sum(1 for row in rows if row["ttl_ms"] == -1)
     top = max(1, int(top))
     partial = partial_reason is not None
+    dbsize = r.dbsize()
+    maxmemory = _num(mem_info.get("maxmemory"))
+    usage = round(_num(mem_info.get("used_memory")) / maxmemory, 4) if maxmemory else None
+    prefix_report = _prefix_report(_prefix_entries(rows, dbsize), top_prefixes, policy, usage)
     result: dict[str, Any] = {
         "sampled_keys": len(rows),
-        "dbsize": r.dbsize(),
+        "dbsize": dbsize,
         "complete_scan": cursor == 0 and len(keys) < sample_size and not partial,
         "partial": partial,
         "partial_reason": partial_reason,
@@ -634,6 +760,8 @@ def keyspace_sample(
         "maxmemory_policy": policy,
         "by_type": dict(by_type),
         "keys_without_ttl": no_ttl,
+        "usage_of_maxmemory": usage,
+        **prefix_report,
         "big_keys_by_bytes": sorted(rows, key=lambda x: x["bytes"] or 0, reverse=True)[:top],
         # STRLEN is bytes, so strings rank in big_keys_by_bytes; length ranks collection elements.
         "big_keys_by_length": sorted(
@@ -835,6 +963,9 @@ def cluster(r: redis.Redis, serverless: bool = False) -> dict:
 
 TOTAL_SLOTS = 16384
 _BAD_FLAGS = {"fail", "fail?", "handshake", "noaddr"}
+SLOT_IMBALANCE_RATIO = 0.10  # a shard whose slot count is off the average by more than this is flagged
+_MIGRATING = re.compile(r"\[(\d+)->-([0-9a-f]+)\]")
+_IMPORTING = re.compile(r"\[(\d+)-<-([0-9a-f]+)\]")
 
 
 def parse_cluster_nodes(text: str) -> list[dict]:
@@ -849,6 +980,8 @@ def parse_cluster_nodes(text: str) -> list[dict]:
         hostport = hostport.split("@", 1)[0]
         ip, _, port = hostport.rpartition(":")
         slots = [t for t in parts[8:] if not t.startswith("[")]
+        migrating = [{"slot": int(m[1]), "to": m[2]} for t in parts[8:] if (m := _MIGRATING.fullmatch(t))]
+        importing = [{"slot": int(m[1]), "from": m[2]} for t in parts[8:] if (m := _IMPORTING.fullmatch(t))]
         slot_count = 0
         for tok in slots:
             lo, _, hi = tok.partition("-")
@@ -865,6 +998,8 @@ def parse_cluster_nodes(text: str) -> list[dict]:
                 "link_state": parts[7],
                 "slots": slots,
                 "slot_count": slot_count,
+                "migrating": migrating,
+                "importing": importing,
                 "myself": "myself" in flags,
                 "failing": bool(_BAD_FLAGS & set(flags)) or parts[7] != "connected",
             }
@@ -872,12 +1007,140 @@ def parse_cluster_nodes(text: str) -> list[dict]:
     return nodes
 
 
+def cluster_topology_findings(nodes: list[dict]) -> list[dict]:
+    """Severity-ranked topology findings from parsed CLUSTER NODES entries.
+
+    Flags fail/fail?/handshake/noaddr nodes and disconnected links, slots being migrated or imported
+    (resharding in progress), primaries without a replica once replication is in use, and shards whose slot
+    count is more than ``SLOT_IMBALANCE_RATIO`` away from the average.
+    """
+    findings: list[dict] = []
+
+    def label(n: dict) -> str:
+        return _endpoint(n) if n["port"] else n["id"]
+
+    for n in nodes:
+        flags = set(n["flags"])
+        ep = label(n)
+        if "fail" in flags:
+            findings.append(_finding("critical", f"node {ep} is flagged fail: the cluster considers it down", node=ep))
+        if "fail?" in flags:
+            findings.append(
+                _finding("warning", f"node {ep} is flagged fail? (possible failure, not yet confirmed)", node=ep)
+            )
+        if "handshake" in flags:
+            findings.append(
+                _finding("warning", f"node {ep} is still in handshake: not yet part of the cluster", node=ep)
+            )
+        if "noaddr" in flags:
+            findings.append(_finding("warning", f"node {ep} has no known address (noaddr)", node=ep))
+        if n["link_state"] != "connected" and "fail" not in flags:
+            findings.append(_finding("warning", f"node {ep} link state is {n['link_state']}", node=ep))
+        if n.get("migrating") or n.get("importing"):
+            out, into = n.get("migrating", []), n.get("importing", [])
+            first = ", ".join(str(m["slot"]) for m in [*out, *into][:5])
+            findings.append(
+                _finding(
+                    "info",
+                    f"resharding in progress on {ep}: {len(out)} slot(s) migrating out, "
+                    f"{len(into)} importing (slots {first})",
+                    node=ep,
+                )
+            )
+    primaries = [n for n in nodes if n["role"] == "primary" and n["slot_count"] > 0]
+    replica_of = Counter(n["master_id"] for n in nodes if n["role"] == "replica")
+    if replica_of:
+        for p in primaries:
+            if not replica_of[p["id"]]:
+                findings.append(
+                    _finding(
+                        "warning",
+                        f"primary {label(p)} has no replica: no failover target for its {p['slot_count']} slots",
+                        node=label(p),
+                    )
+                )
+    elif primaries:
+        findings.append(_finding("info", "no shard has a replica: node failure loses data and slots until replaced"))
+    if len(primaries) > 1:
+        avg = statistics.mean(p["slot_count"] for p in primaries)
+        for p in primaries:
+            if abs(p["slot_count"] - avg) / avg > SLOT_IMBALANCE_RATIO:
+                findings.append(
+                    _finding(
+                        "warning",
+                        f"shard {label(p)} owns {p['slot_count']} slots, "
+                        f"{p['slot_count'] / avg:.0%} of the average {avg:.0f}",
+                        node=label(p),
+                    )
+                )
+    return _sorted_findings(findings)
+
+
+def _pairs(raw: Any) -> dict[str, Any]:
+    """CLUSTER SHARDS entries arrive as dicts (RESP3, newer redis-py) or flat key/value lists (RESP2)."""
+    if isinstance(raw, dict):
+        return {str(_s(k)): v for k, v in raw.items()}
+    items = list(raw)
+    return {str(_s(items[i])): items[i + 1] for i in range(0, len(items) - 1, 2)}
+
+
+def cluster_shards_check(raw: Any, lag_bytes_threshold: int = REPL_LAG_BYTES_WARN) -> tuple[list[dict], list[dict]]:
+    """Cross-check CLUSTER SHARDS (7.0+): node health and replication offset lag per replica.
+
+    Returns ``(findings, shards)``; ``shards`` lists slot count, primary and each replica's health and byte lag.
+    """
+    findings: list[dict] = []
+    shards: list[dict] = []
+
+    def endpoint(n: dict) -> str:
+        host = _s(n.get("endpoint") or n.get("hostname") or n.get("ip"))
+        return f"{host}:{n.get('port') or n.get('tls-port')}"
+
+    for entry in raw or []:
+        shard = _pairs(entry)
+        nodes = [_pairs(n) for n in shard.get("nodes") or []]
+        slots = [int(x) for x in shard.get("slots") or []]
+        slot_count = sum(slots[i + 1] - slots[i] + 1 for i in range(0, len(slots) - 1, 2))
+        primary = next((n for n in nodes if _s(n.get("role")) == "master"), None)
+        primary_offset = int(_num(primary.get("replication-offset"))) if primary else None
+        replicas = []
+        for n in nodes:
+            health = str(_s(n.get("health", "online")))
+            ep = endpoint(n)
+            if health != "online":
+                findings.append(
+                    _finding(
+                        "critical" if health == "fail" else "warning",
+                        f"CLUSTER SHARDS: node {ep} health is {health}",
+                        node=ep,
+                    )
+                )
+            if n is primary:
+                continue
+            lag = primary_offset - int(_num(n.get("replication-offset"))) if primary_offset is not None else None
+            replicas.append({"endpoint": ep, "health": health, "lag_bytes": lag})
+            if lag is not None and lag > lag_bytes_threshold:
+                findings.append(_finding("warning", f"replica {ep} is {lag} bytes behind its primary", node=ep))
+        shards.append(
+            {
+                "slot_count": slot_count,
+                "primary": endpoint(primary) if primary else None,
+                "replicas": replicas,
+            }
+        )
+    return findings, shards
+
+
 def _endpoint(n: dict) -> str:
     return f"{n.get('hostname') or n['ip']}:{n['port']}"
 
 
-def cluster_nodes(r: redis.Redis, serverless: bool = False) -> dict:
-    """Per-shard endpoints from CLUSTER NODES, with a recommendation for fan-out."""
+def cluster_nodes(r: redis.Redis, serverless: bool = False, cross_check: bool = True) -> dict:
+    """Per-shard endpoints from CLUSTER NODES, with a recommendation for fan-out.
+
+    ``topology_findings`` ranks node flags, resharding, replica coverage and slot imbalance. With
+    ``cross_check`` CLUSTER SHARDS (7.0+) adds replica offset lag; older engines get a note instead.
+    """
     cluster_info, info_err = _try(r.info, "cluster")
     if cluster_info is not None and not int(_num(cluster_info.get("cluster_enabled"))):
         return {"cluster_enabled": False, "note": "cluster mode disabled (single shard); use the primary endpoint"}
@@ -915,12 +1178,28 @@ def cluster_nodes(r: redis.Redis, serverless: bool = False) -> dict:
     if covered != TOTAL_SLOTS:
         findings.append(f"{covered} of {TOTAL_SLOTS} slots covered by primaries")
     findings += [f"node {_endpoint(n)} is {','.join(n['flags'])}/{n['link_state']}" for n in nodes if n["failing"]]
+    topology = cluster_topology_findings(nodes)
+    notes: list[str] = []
+    shards_check = None
+    if cross_check:
+        raw_shards, shards_err = _try(r.execute_command, "CLUSTER", "SHARDS")
+        if raw_shards is None:
+            server, _ = _try(r.info, "server")
+            notes.append(
+                command_support_note("CLUSTER SHARDS", server, shards_err) + "; topology from CLUSTER NODES only"
+            )
+        else:
+            check_findings, shards_check = cluster_shards_check(raw_shards)
+            topology = _sorted_findings([*topology, *check_findings])
     return {
         "cluster_enabled": True,
         "nodes": nodes,
         "shards": shards,
         "slots_covered": covered,
         "findings": findings,
+        "topology_findings": topology,
+        **({"shards_check": shards_check} if shards_check is not None else {}),
+        **({"notes": notes} if notes else {}),
         "recommendation": (
             "Per-key tools only see the connected node. To inspect each shard, set ELASTICACHE_HOST to each "
             "primary endpoint above (and replicas for read-side checks), or use node_cluster_health for a fan-out."
@@ -1008,6 +1287,7 @@ def cluster_health(
         "nodes_probed": len(results),
         "slots_covered": topo["slots_covered"],
         "shards": topo["shards"],
+        "topology_findings": topo["topology_findings"],
         "per_node": results,
         "findings": findings or ["no skew, lag or coverage problems detected"],
     }
@@ -1045,7 +1325,7 @@ def _fan_out_primaries(
     within ``total_seconds``; a shard that hangs is abandoned ``per_node_timeout`` seconds after that,
     and a dead shard never fails the call. Clients come from ``client_factory`` (``SafeRedis`` only).
     """
-    topo = cluster_nodes(r)
+    topo = cluster_nodes(r, cross_check=False)
     if not topo.get("cluster_enabled") or "nodes" not in topo:
         return topo, {}
     primaries = [n for n in topo["nodes"] if n["role"] == "primary" and n["port"]]
@@ -1133,13 +1413,15 @@ def cluster_keyspace_sample(
     max_seconds: float = DEFAULT_SAMPLE_SECONDS,
     max_workers: int = 8,
     per_node_timeout: float = 5.0,
+    top_prefixes: int = DEFAULT_TOP_PREFIXES,
 ) -> dict:
     """``keyspace_sample`` on every shard primary, merged with a ``shard`` label on each key.
 
     ``sample_size`` and the ``max_seconds`` wall-clock budget are split across the primaries (the budget
     by the waves of the worker pool), so the whole call returns within ``max_seconds`` plus at most
     ``per_node_timeout`` for a stuck shard. Each shard reports ``ok``, ``partial`` (its own budget ran out)
-    or ``unreachable``; the merged top-N lists come from whatever the reachable shards returned.
+    or ``unreachable``; the merged top-N lists come from whatever the reachable shards returned. Prefix
+    aggregates are summed across shards (each shard reports its 50 largest prefixes, the merge keeps ``top_prefixes``).
     """
     started = time.monotonic()
     max_seconds = max(0.01, min(float(max_seconds), MAX_SAMPLE_SECONDS))
@@ -1147,12 +1429,16 @@ def cluster_keyspace_sample(
 
     def work(client: redis.Redis, budget: float, shards: int) -> dict:
         per_shard = max(1, math.ceil(max(1, min(int(sample_size), 100_000)) / shards))
-        return keyspace_sample(client, per_shard, match, top, scan_count, pause_ms, budget)
+        return keyspace_sample(
+            client, per_shard, match, top, scan_count, pause_ms, budget, top_prefixes=MAX_TOP_PREFIXES
+        )
 
     topo, outcomes = _fan_out_primaries(r, client_factory, work, max_workers, max_seconds, per_node_timeout)
     if not outcomes:
         if topo.get("cluster_enabled") is False:
-            single = keyspace_sample(r, sample_size, match, top, scan_count, pause_ms, max_seconds)
+            single = keyspace_sample(
+                r, sample_size, match, top, scan_count, pause_ms, max_seconds, top_prefixes=top_prefixes
+            )
             return {**single, "cluster_enabled": False, "note": "cluster mode disabled; sampled the single node"}
         return topo
     for o in outcomes.values():
@@ -1164,12 +1450,19 @@ def cluster_keyspace_sample(
     per_shard: dict[str, dict] = {}
     totals = {"sampled_keys": 0, "dbsize": 0, "keys_without_ttl": 0}
     policy = ""
+    prefix_groups: list[list[dict]] = []
+    prefix_total = 0
+    usage: float | None = None
     for ep, o in outcomes.items():
         if o["status"] == "unreachable":
             per_shard[ep] = o
             continue
         d = o["data"]
         policy = policy or d["maxmemory_policy"]
+        prefix_groups.append(d["prefixes"])
+        prefix_total += d["prefixes_summary"]["est_bytes_total"]
+        if d["usage_of_maxmemory"] is not None:
+            usage = max(usage or 0.0, d["usage_of_maxmemory"])
         for name in ("big_keys_by_bytes", "big_keys_by_length", "hot_keys_by_lfu", "coldest_keys_by_idle"):
             merged[name] += _labelled(d.get(name, []), ep)
         for t, v in d["by_type"].items():
@@ -1190,6 +1483,8 @@ def cluster_keyspace_sample(
     findings += _skew_findings({ep: s["dbsize"] for ep, s in per_shard.items() if "dbsize" in s}, "key count")
     if topo["findings"]:
         findings += [_finding("warning", f) for f in topo["findings"]]
+    prefix_report = _prefix_report(_merge_prefix_entries(prefix_groups), top_prefixes, policy, usage, prefix_total)
+    findings += prefix_report.pop("findings")
     counts = _shard_counts(outcomes)
     result: dict[str, Any] = {
         "cluster_enabled": True,
@@ -1201,6 +1496,7 @@ def cluster_keyspace_sample(
         "maxmemory_policy": policy,
         **totals,
         "by_type": dict(by_type),
+        **prefix_report,
         "big_keys_by_bytes": sorted(merged["big_keys_by_bytes"], key=lambda x: x["bytes"] or 0, reverse=True)[:top],
         "big_keys_by_length": sorted(merged["big_keys_by_length"], key=lambda x: x["length"] or 0, reverse=True)[:top],
         "per_shard": per_shard,
@@ -1445,4 +1741,179 @@ def acl_log(r: redis.Redis, count: int = 25) -> dict:
         "by_user": dict(by_user),
         "entries": entries,
         "findings": _sorted_findings(findings),
+    }
+
+
+# ------------------------------------------------------------------------- triage
+
+TRIAGE_MAX_FINDINGS = 30
+TRIAGE_BIG_BUFFER_BYTES = 10 * 1024 * 1024
+TRIAGE_SLOW_US = 100_000
+TRIAGE_PING_P99_MS = 50.0
+TRIAGE_LATENCY_EVENT_MS = 100
+
+
+def _safe(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> tuple[Any, str | None]:
+    """``_try`` that also absorbs connection and timeout errors, so one section never kills the call."""
+    try:
+        return _try(fn, *args, **kwargs)
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _health_severity(message: str) -> str:
+    if message.startswith(("replica link", "memory at")):
+        return "critical"
+    return "warning"
+
+
+def _triage_health(d: dict) -> tuple[dict, list[dict]]:
+    if "role" not in d:
+        return {"status": "unavailable", "notes": d.get("notes", [])}, []
+    keys = ("engine", "version", "role", "connected_clients", "hit_ratio", "ops_per_sec", "evicted_keys")
+    findings = [_finding(_health_severity(f), f) for f in d["findings"] if not f.startswith("no issues detected")]
+    return {k: d[k] for k in keys if k in d}, findings
+
+
+def _triage_memory(d: dict) -> tuple[dict, list[dict]]:
+    if "used_memory" not in d:
+        return {"status": "unavailable", "notes": d.get("notes", [])}, []
+    keys = ("used_memory", "maxmemory", "usage_of_maxmemory", "mem_fragmentation_ratio", "fragmentation_verdict")
+    return {k: d[k] for k in keys}, []  # usage, eviction and fragmentation findings come from the health section
+
+
+def _triage_replication(d: dict) -> tuple[dict, list[dict]]:
+    summary = {
+        "role": d["role"],
+        "connected_replicas": d["connected_replicas"],
+        "master_link_status": d["master_link_status"],
+    }
+    return summary, list(d["findings"])
+
+
+def _triage_clients(d: dict) -> tuple[dict, list[dict]]:
+    findings = []
+    over_1h = d["idle_seconds"]["over_1h"]
+    if over_1h >= IDLE_CLIENTS_WARN:
+        findings.append(
+            _finding("info", f"{over_1h} clients idle for over an hour (connection leak or missing timeout)")
+        )
+    heavy = [
+        c for c in d["top_by_buffer_memory"] if _num(c.get("omem")) + _num(c.get("qbuf")) >= TRIAGE_BIG_BUFFER_BYTES
+    ]
+    for c in heavy[:3]:
+        findings.append(
+            _finding(
+                "warning",
+                f"client id={c.get('id')} ({c.get('addr')}) holds {int(_num(c.get('omem')) + _num(c.get('qbuf')))} "
+                "bytes of query/output buffer",
+            )
+        )
+    return {"total": d["total"], "idle_over_1h": over_1h}, findings
+
+
+def _triage_commandstats(d: dict) -> tuple[dict, list[dict]]:
+    rows = [c for c in d["top_by_total_time"] if c["failed_calls"] or c["rejected_calls"]]
+    rows.sort(key=lambda c: c["failed_calls"] + c["rejected_calls"], reverse=True)
+    findings = []
+    for c in rows[:5]:
+        total = max(c["calls"], 1)
+        bad = c["failed_calls"] + c["rejected_calls"]
+        severity = "warning" if c["rejected_calls"] or bad / total > 0.05 else "info"
+        findings.append(
+            _finding(
+                severity,
+                f"{c['command']}: {c['failed_calls']} failed and {c['rejected_calls']} rejected of {c['calls']} calls",
+                command=c["command"],
+            )
+        )
+    summary = {
+        "commands": d["commands"],
+        "failed_calls": sum(c["failed_calls"] for c in rows),
+        "rejected_calls": sum(c["rejected_calls"] for c in rows),
+    }
+    return summary, findings
+
+
+def _triage_slowlog(d: dict) -> tuple[dict, list[dict]]:
+    if d.get("notes"):
+        return {"status": "unavailable", "notes": d["notes"]}, []
+    entries = d["entries"]
+    findings = []
+    if entries:
+        worst = max(entries, key=lambda e: _num(e["duration_us"]))
+        slow = _num(worst["duration_us"])
+        findings.append(
+            _finding(
+                "warning" if slow >= TRIAGE_SLOW_US else "info",
+                f"slowest recent command: {worst['command']} took {int(slow)} us "
+                f"({d['slowlog_len']} entries in slowlog)",
+            )
+        )
+    return {
+        "slowlog_len": d["slowlog_len"],
+        "top": [{"command": e["command"], "duration_us": e["duration_us"]} for e in entries],
+    }, findings
+
+
+def _triage_latency(d: dict) -> tuple[dict, list[dict]]:
+    rtt = d["ping_rtt_ms"]
+    findings = []
+    if rtt["p99"] >= TRIAGE_PING_P99_MS:
+        findings.append(_finding("warning", f"PING p99 is {rtt['p99']} ms (p50 {rtt['p50']} ms)"))
+    events = d["latency_latest"] if isinstance(d["latency_latest"], list) else []
+    for e in sorted(events, key=lambda e: _num(e["max_ms"]), reverse=True)[:3]:
+        severity = "warning" if _num(e["max_ms"]) >= TRIAGE_LATENCY_EVENT_MS else "info"
+        findings.append(
+            _finding(severity, f"latency event {e['event']}: latest {e['latest_ms']} ms, max {e['max_ms']} ms")
+        )
+    return {"ping_p50_ms": rtt["p50"], "ping_p99_ms": rtt["p99"], "events": len(events)}, findings
+
+
+def triage(
+    r: redis.Redis, client_factory: Callable[[str, int], redis.Redis] | None = None, serverless: bool = False
+) -> dict:
+    """One-call data-plane on-call snapshot.
+
+    Runs health, memory, replication, clients, commandstats, slowlog (top 5) and latency by reusing the
+    section functions (no extra Redis commands). A section that fails becomes ``unavailable`` and the
+    result ``partial``; findings from every section are merged, severity-sorted and capped at
+    ``TRIAGE_MAX_FINDINGS``. On Serverless an unavailable section is an info finding, not a warning.
+    """
+    plan: list[tuple[str, Callable[[], Any], Callable[[Any], tuple[dict, list[dict]]]]] = [
+        ("health", lambda: health_summary(r, serverless), _triage_health),
+        ("memory", lambda: memory_report(r, serverless), _triage_memory),
+        ("replication", lambda: replication(r, client_factory), _triage_replication),
+        ("clients", lambda: client_list(r, 5), _triage_clients),
+        ("commandstats", lambda: commandstats(r, 500), _triage_commandstats),
+        ("slowlog", lambda: slowlog(r, 5, False, serverless), _triage_slowlog),
+        ("latency", lambda: latency(r, 5), _triage_latency),
+    ]
+    sections: dict[str, dict] = {}
+    findings: list[dict] = []
+    for name, fetch, summarize in plan:
+        data, err = _safe(fetch)
+        if data is None:
+            summary: dict[str, Any] = {"status": "unavailable", "error": err}
+            section_findings: list[dict] = []
+        else:
+            summary, section_findings = summarize(data)
+            summary = {"status": "ok", **summary}
+        if summary["status"] == "unavailable":
+            detail = err or "; ".join(summary.get("notes") or []) or "no data"
+            section_findings = [_finding("info" if serverless else "warning", f"{name} section unavailable: {detail}")]
+        sections[name] = summary
+        findings += [{**f, "section": name} for f in section_findings]
+    findings = _sorted_findings(findings)
+    total = len(findings)
+    partial = any(s["status"] != "ok" for s in sections.values())
+    if not findings:
+        findings = [_finding("info", "no issues detected by the triage sections", section="triage")]
+    return {
+        "status": "partial" if partial else "ok",
+        "serverless": serverless,
+        "findings": findings[:TRIAGE_MAX_FINDINGS],
+        "findings_total": total,
+        **({"findings_omitted": total - TRIAGE_MAX_FINDINGS} if total > TRIAGE_MAX_FINDINGS else {}),
+        "sections": sections,
     }

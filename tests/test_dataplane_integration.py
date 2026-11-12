@@ -65,6 +65,16 @@ def test_keyspace_sample_finds_big_keys(safe):
     assert ks["by_type"]["string"]["keys"] == 321
     assert ks["keys_without_ttl"] == ks["sampled_keys"] - 20
     assert "coldest_keys_by_idle" in ks
+    by_prefix = {p["prefix"]: p for p in ks["prefixes"]}
+    assert by_prefix["small:*"]["sampled_keys"] == 300 and by_prefix["small:*"]["no_ttl_pct"] == 100.0
+    assert by_prefix["session:*"]["sampled_keys"] == 20 and by_prefix["session:*"]["no_ttl_keys"] == 0
+    assert ks["prefixes_summary"]["distinct"] == len(by_prefix) >= 5
+
+
+def test_triage_integration(safe):
+    out = dataplane.triage(safe, None)
+    assert out["findings"] and set(out["sections"]) >= {"health", "memory", "slowlog", "latency"}
+    assert out["sections"]["health"]["status"] == "ok"
 
 
 def test_keyspace_sample_bounded_and_match(safe):
