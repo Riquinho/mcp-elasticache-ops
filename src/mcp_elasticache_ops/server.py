@@ -467,7 +467,9 @@ def aws_events(
     hours: Annotated[int, Field(ge=1, le=336)] = 24,
     region: Region = None,
 ) -> dict:
-    """DescribeEvents: failovers, node replacements, maintenance, snapshots."""
+    """DescribeEvents, findings first: events classified critical (failover, failure, not available),
+    warning (replacement, reboot, restart, maintenance) or info, worst then newest, plus counts per
+    source and the 100 newest raw events (`truncated` says more exist). Invalid source_type is refused."""
     return _cp(region).events(source_identifier, source_type, hours)
 
 
@@ -645,23 +647,31 @@ def aws_alarms(
     ] = None,
     region: Region = None,
 ) -> dict:
-    """CloudWatch alarm coverage for ElastiCache (DescribeAlarms, read-only). Findings first: alarms in
-    ALARM, INSUFFICIENT_DATA or with actions disabled, and members with no alarm on EngineCPUUtilization,
-    DatabaseMemoryUsagePercentage, Evictions, ReplicationLag, CurrConnections, SwapUsage (plus ThrottledCmds
-    on Serverless). Returns partial=true if DescribeAlarms is denied."""
-    return _cp(region).alarms(replication_group_id)
+    """CloudWatch alarm coverage (DescribeAlarms, read-only). Findings first: alarms in ALARM,
+    INSUFFICIENT_DATA or with actions disabled, and members with no alarm on the core metrics (CPU, memory,
+    evictions, lag, connections, swap). partial=true if DescribeAlarms is denied. Without a group id it
+    covers every region in ELASTICACHE_REGIONS (findings carry `region`, failures in region_errors)."""
+    if replication_group_id:
+        return _cp(region).alarms(replication_group_id)
+    return control_plane().alarms_fan_out(None, region)
 
 
 @read_tool
 def aws_cluster_overview(
-    replication_group_id: Annotated[str, Field(description="ReplicationGroupId to summarise")],
+    replication_group_id: Annotated[
+        str | None,
+        Field(description="ReplicationGroupId to summarise; omit for a fleet pass over every configured region"),
+    ] = None,
     minutes: Annotated[int, Field(ge=5, le=20160, description="CloudWatch window (multiple of 5 min is fine)")] = 360,
     region: Region = None,
 ) -> dict:
     """One findings-first call per replication group: shards, replicas, AZ spread, failover and engine
-    version joined with per-node CloudWatch signals. Flags nodes above 1.5x peer median, reader endpoint
-    gaps and right-sizing hints. Worst-first, bounded; status partial if GetMetricData is denied."""
-    return _cp(region).cluster_overview(replication_group_id, minutes)
+    version joined with per-node CloudWatch signals; flags outlier nodes, reader gaps and right-sizing.
+    Without a group id: fleet mode over every region in ELASTICACHE_REGIONS (findings carry `region`,
+    failures in region_errors)."""
+    if replication_group_id:
+        return _cp(region).cluster_overview(replication_group_id, minutes)
+    return control_plane().cluster_overview_fan_out(None, minutes, region)
 
 
 # ------------------------------------------------------------------- on-call prompts
@@ -724,7 +734,7 @@ def oncall_replication_lag(replication_group_id: RunbookGroup) -> str:
 3. `node_replication` on the primary: replica offsets, link status, backlog size. A replica with
    master_link_status down or a growing offset gap is the culprit; `node_cluster_nodes` shows which shard.
 4. `aws_metrics` (replication_group_id="{replication_group_id}", metrics ReplicationLag, ReplicationBytes,
-   EngineCPUUtilization, NetworkBandwidthAllowanceExceeded, minutes=360). Heavy ReplicationBytes with bandwidth
+   EngineCPUUtilization, NetworkBandwidthInAllowanceExceeded, NetworkBandwidthOutAllowanceExceeded, minutes=360). Heavy ReplicationBytes with bandwidth
    allowance exceeded means writes outrun the network of the node type.
 5. Global datastore: `aws_global_replication_groups` (also with region set to the secondary region) reports
    GlobalDatastoreReplicationLag per secondary and flags secondaries with another node type or engine version.

@@ -44,13 +44,13 @@ All 42 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `aws_replication_groups` | `DescribeReplicationGroups`: status, cluster mode, node type, Multi-AZ, members/roles |
 | `aws_cache_clusters` | `DescribeCacheClusters`: engine version, parameter group apply status, nodes |
 | `aws_serverless_caches` | `DescribeServerlessCaches` |
-| `aws_events` | `DescribeEvents`: failovers, node replacements, maintenance, snapshots |
+| `aws_events` | `DescribeEvents`, findings-first: failover/failure events are critical, replacement/reboot/maintenance warning, the rest info. Newest first, grouped by severity and source; `source_type` is validated before any call; at most 100 raw events (`truncated` says when more exist) |
 | `aws_parameters` | `DescribeCacheParameters` (user-modified by default) |
 | `aws_metrics` | CloudWatch `AWS/ElastiCache` metrics: findings first, then min/avg/max/latest; series only with `include_series`; `replication_group_id` queries every member node |
 | `aws_snapshots` | `DescribeSnapshots`: retention gaps, failed and missing automatic backups, old manual snapshots |
 | `aws_serverless_snapshots` | `DescribeServerlessCacheSnapshots` + `DescribeServerlessCaches`: caches with no available snapshot in `stale_hours` (default 24), failed snapshots, newest snapshot about to expire, snapshots without a customer KMS key, unset per-cache retention; a failing cache listing degrades to `partial` |
-| `aws_users` | `DescribeUsers` (RBAC): `~* +@all` access strings and users without a password; no secret material is returned |
-| `aws_user_groups` | `DescribeUserGroups`: unattached groups, non-active status |
+| `aws_users` | `DescribeUsers` (RBAC): `~* +@all` access strings and users without a password; critical when the active `default` user has no password or `+@all` and is attached to a cache, warning for dangerous commands on prod-like caches. No secret material is returned |
+| `aws_user_groups` | `DescribeUserGroups`: unattached groups, non-active status, groups holding only the `default` user |
 | `aws_global_replication_groups` | `DescribeGlobalReplicationGroups`: members per region, status, missing secondary. Per secondary region (max 6): `GlobalDatastoreReplicationLag` (> 1 s warning, > 10 s critical), node type or engine version that differs from the primary, members not `associated`/`available` |
 | `aws_reserved_nodes` | `DescribeReservedCacheNodes` vs running nodes: coverage by exact node type and engine, unused reservations, reservations expiring with nodes still running; a failing cluster listing degrades to `partial` with the reservation list intact |
 | `aws_reserved_offerings` | `DescribeReservedCacheNodesOfferings` for a `node_type` and `engine` (opt-in, capped at 20): 1y/3y offerings, uncovered running nodes and the cheapest offering per term (upfront + hourly). Never purchases |
@@ -59,7 +59,7 @@ All 42 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `aws_triage` | One call per replication group: status/Multi-AZ/failover, last 6h events, CloudWatch peaks per member (EngineCPU, memory %, Evictions, ReplicationLag, CurrConnections), pending service updates, newest snapshot. Worst-first findings (max 30); a failing section is reported `unavailable` |
 | `aws_serverless_triage` | One call per serverless cache: status and usage limits, snapshot health, 6h `ThrottledCmds`, ECPU and storage against the limits. Worst-first findings (max 30); a failing section (for example `AccessDenied`) is reported `unavailable`. Describe/GetMetricData calls only |
 | `aws_cluster_overview` | One findings-first call per replication group: shards, replicas per shard, AZ spread, failover, engine version joined with per-node CloudWatch (EngineCPU, memory %, ReplicationLag, Evictions, CurrConnections, NewConnections). Flags nodes above 1.5x the peer median, reader endpoint gaps and right-sizing (memory p95 < 30% and CPU p95 < 20%; data tiering for r6gd). Worst-first, bounded; `GetMetricData` denied gives `status: partial` |
-| `aws_alarms` | `DescribeAlarms` (AWS/ElastiCache, paginated, optional `replication_group_id`): alarms in ALARM, INSUFFICIENT_DATA or with actions disabled, and members with no alarm on EngineCPUUtilization, DatabaseMemoryUsagePercentage, Evictions, ReplicationLag, CurrConnections, SwapUsage (plus ThrottledCmds on Serverless). Denied `DescribeAlarms` gives `partial: true` |
+| `aws_alarms` | `DescribeAlarms` (AWS/ElastiCache, paginated, optional `replication_group_id`): alarms in ALARM, INSUFFICIENT_DATA or with actions disabled, and members with no alarm on EngineCPUUtilization, DatabaseMemoryUsagePercentage, Evictions, ReplicationLag, CurrConnections, SwapUsage (plus ThrottledCmds on Serverless). Denied `DescribeAlarms` gives `partial: true`. Without `replication_group_id` it fans out over every configured region with per-region error isolation (`region_errors`) and a shared deadline |
 | `aws_engine_versions` | `DescribeCacheEngineVersions` for `redis`, `valkey` or `memcached` (optional `version_prefix`): versions with parameter group family and upgrade targets (latest minor of each major, latest Valkey for Redis OSS) |
 | `aws_parameter_groups` | `DescribeCacheParameterGroups` joined with running clusters: family, users of each group, unused custom groups (info), family differing from the running engine (warning) |
 | `aws_parameter_drift` | Diff of two parameter groups: only modified parameters whose values differ, family mismatch, important parameters flagged |
@@ -113,6 +113,14 @@ and says what to conclude from each. Each takes `replication_group_id`.
 - `oncall_evictions_memory`: `aws_triage`, `aws_metrics`, `node_memory`, `node_cluster_memory`, `node_keyspace_sample`, `aws_parameters`
 - `oncall_replication_lag`: `aws_triage`, `aws_events`, `node_replication`, `aws_metrics`, `aws_global_replication_groups`
 - `oncall_connection_storm`: `aws_triage`, `aws_metrics`, `node_clients`, `node_latency`, `node_acl_log`, `aws_alarms`
+
+### Network allowance and auth signals
+
+Redis nodes are checked against the four real ENA allowance metrics (`NetworkBandwidthInAllowanceExceeded`,
+`NetworkBandwidthOutAllowanceExceeded`, `NetworkPacketsPerSecondAllowanceExceeded`,
+`NetworkConntrackAllowanceExceeded`) plus `FreeableMemory`; each warning names the limit that was hit. The auth
+metrics `AuthenticationFailures`, `CommandAuthorizationFailures` and `KeyAuthorizationFailures` raise a finding on any
+sustained count and point at `node_acl_log`. All of this uses `GetMetricData` only.
 
 ### Finding thresholds
 
@@ -282,6 +290,11 @@ scripts/integration.sh           # starts valkey/valkey:8-alpine (--rm, removed 
 IMAGE=redis:7-alpine scripts/integration.sh
 scripts/cluster-integration.sh   # 3-node valkey cluster via tests/docker-compose.cluster.yml, torn down with `down -v`
 ```
+
+Disk gate: the integration scripts pull images and grow the WSL vhdx, so run them only with at least 5G free on the
+system drive (`df -h /c`). Below that, skip integration and rely on the unit suite. CI runs the integration job
+weekly (`on.schedule`) as well as on push, so drift in the live-server tests shows up without a code change. Tests that
+start Docker must remove their own containers and volumes (`--rm`, `down -v`).
 
 The cluster test (`tests/test_dataplane_integration.py`, marker `integration`, needs `CLUSTER_TEST_HOST` and
 `CLUSTER_TEST_PORT`) runs `node_cluster_nodes` and the cluster fan-out against that cluster. CI runs it in the

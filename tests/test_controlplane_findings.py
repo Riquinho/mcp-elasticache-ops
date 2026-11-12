@@ -1041,3 +1041,298 @@ def test_serverless_triage_tags_use_the_cache_arn():
     out = plane(ec).serverless_triage("sc")
     assert out["ownership"] == {"environment": "staging"}
     assert ("list_tags_for_resource", {"ResourceName": "arn:sc"}) in ec.calls
+
+
+# --------------------------------------------- ENA network allowance metrics
+
+
+@pytest.mark.parametrize(
+    ("metric", "tag"),
+    [
+        ("NetworkBandwidthInAllowanceExceeded", "in"),
+        ("NetworkBandwidthOutAllowanceExceeded", "out"),
+        ("NetworkPacketsPerSecondAllowanceExceeded", "pps"),
+        ("NetworkConntrackAllowanceExceeded", "conntrack"),
+    ],
+)
+def test_network_allowance_exceeded_warns_naming_the_limit(metric, tag):
+    out = _metrics_for(metric, [0.0, 5.0, 0.0, 7.0])
+    hits = [f for f in out["findings"] if metric in f["message"]]
+    assert len(hits) == 1
+    assert hits[0]["severity"] == "warning"
+    assert f"({tag})" in hits[0]["message"] and "12 times" in hits[0]["message"]
+    assert "larger node type or more shards/replicas" in hits[0]["message"]
+    quiet = _metrics_for(metric, [0.0, 0.0, 0.0, 0.0])
+    assert not any(metric in f["message"] for f in quiet["findings"])
+
+
+def test_network_allowance_metrics_use_sum_and_real_names():
+    for name in controlplane.NETWORK_ALLOWANCE_METRICS:
+        assert name in controlplane.REDIS_METRICS and name in controlplane.SUM_STAT_METRICS
+    assert "FreeableMemory" in controlplane.REDIS_METRICS
+    assert "FreeableMemory" in controlplane.MEMCACHED_METRICS
+
+
+# --------------------------------------------- aws_events findings first
+
+
+def _ev(source, msg, minutes_ago, source_type="replication-group"):
+    return {
+        "SourceIdentifier": source,
+        "SourceType": source_type,
+        "Message": msg,
+        "Date": NOW - dt.timedelta(minutes=minutes_ago),
+    }
+
+
+def test_events_failover_is_critical_and_listed_before_info():
+    ec = Fake(
+        {
+            "describe_events": {
+                "Events": [
+                    _ev("rg1", "Snapshot complete for rg1-001", 1),
+                    _ev("rg1", "Failover from primary node rg1-001 to replica node rg1-002 completed", 30),
+                    _ev("rg1", "Cache node rg1-003 replacement scheduled during maintenance", 20),
+                ]
+            }
+        }
+    )
+    out = plane(ec).events("rg1", "replication-group", 6)
+    assert [f["severity"] for f in out["findings"]] == ["critical", "warning", "info"]
+    assert "Failover" in out["findings"][0]["message"]
+    assert out["by_severity"] == {"info": 1, "critical": 1, "warning": 1}
+    assert out["by_source"] == {"rg1": 3} and out["truncated"] is False
+    assert [c[0] for c in ec.calls] == ["describe_events"]
+    assert ec.calls[0][1]["Duration"] == 360 and ec.calls[0][1]["SourceType"] == "replication-group"
+
+
+@pytest.mark.parametrize(
+    ("msg", "sev"),
+    [
+        ("Snapshot failed for node x", "critical"),
+        ("Cache cluster not available", "critical"),
+        ("Cache node rebooted", "warning"),
+        ("Snapshot complete", "info"),
+    ],
+)
+def test_events_classification(msg, sev):
+    out = plane(Fake({"describe_events": {"Events": [_ev("c", msg, 5, "cache-cluster")]}})).events()
+    assert out["findings"][0]["severity"] == sev
+
+
+def test_events_caps_the_raw_list_and_counts_every_source():
+    events = [_ev("a" if i % 3 else "b", f"Snapshot complete {i}", i) for i in range(300)]
+    out = plane(Fake({"describe_events": {"Events": events}})).events()
+    assert out["count"] == 300 and len(out["events"]) == 100 and out["truncated"] is True
+    assert sum(out["by_source"].values()) == 300 and out["by_source"] == {"a": 200, "b": 100}
+    assert out["events"][0]["Message"] == "Snapshot complete 0"  # newest first
+    assert len(out["findings"]) <= controlplane.MAX_EVENT_FINDINGS and out["findings_truncated"] is True
+
+
+def test_events_invalid_source_type_makes_no_boto_call():
+    ec = Fake()
+    out = plane(ec).events(source_type="bogus")
+    assert out["error"] == "InvalidArgument" and "replication-group" in out["message"]
+    assert ec.calls == []
+
+
+@pytest.mark.parametrize(("hours", "minutes"), [(0, 60), (99999, 14 * 24 * 60)])
+def test_events_duration_is_clamped(hours, minutes):
+    ec = Fake({"describe_events": {"Events": []}})
+    plane(ec).events(hours=hours)
+    assert ec.calls[0][1]["Duration"] == minutes
+
+
+# --------------------------------------------- ACL / auth failure signal
+
+
+@pytest.mark.parametrize("metric", list(controlplane.AUTH_FAILURE_METRICS))
+def test_auth_failure_metrics_are_requested_and_summed(metric):
+    assert metric in controlplane.REDIS_METRICS and metric in controlplane.SUM_STAT_METRICS
+    cw = Fake({"get_metric_data": metric_result({})})
+    plane(Fake(), cw).metrics("n-001", minutes=60, period_seconds=300)
+    queries = cw.calls[0][1]["MetricDataQueries"]
+    stat = {q["MetricStat"]["Metric"]["MetricName"]: q["MetricStat"]["Stat"] for q in queries}
+    assert stat[metric] == "Sum"
+
+
+@pytest.mark.parametrize("metric", list(controlplane.AUTH_FAILURE_METRICS))
+def test_sustained_auth_failures_warn_and_point_at_acl_log(metric):
+    out = _metrics_for(metric, [3.0] * 8)
+    f = _finding_for(out, metric)
+    assert f["severity"] == "warning" and "node_acl_log" in f["message"] and "sustained" in f["message"]
+
+
+def test_transient_auth_failures_are_info_and_zero_is_silent():
+    spike = _metrics_for("AuthenticationFailures", [5.0] + [0.0] * 11)
+    assert _finding_for(spike, "AuthenticationFailures")["severity"] == "info"
+    quiet = _metrics_for("AuthenticationFailures", [0.0] * 12)
+    assert not any("AuthenticationFailures" in f["message"] for f in quiet["findings"])
+
+
+def _user(uid, name, access, auth="password"):
+    return {
+        "UserId": uid,
+        "UserName": name,
+        "Status": "active",
+        "Engine": "redis",
+        "AccessString": access,
+        "Authentication": {"Type": auth},
+    }
+
+
+def _ugroup(gid, user_ids, rgs=()):
+    return {
+        "UserGroupId": gid,
+        "Status": "active",
+        "Engine": "redis",
+        "UserIds": user_ids,
+        "ReplicationGroups": list(rgs),
+    }
+
+
+def _users_out(users, groups):
+    return plane(Fake({"describe_users": {"Users": users}, "describe_user_groups": {"UserGroups": groups}})).users()
+
+
+@pytest.mark.parametrize(
+    ("user", "expect"),
+    [
+        (_user("d", "default", "on ~* +@all", "no-password"), True),
+        (_user("d", "default", "on ~* +@all"), True),
+        (_user("d", "default", "on ~* -@all +get", "no-password"), True),
+        (_user("d", "default", "on ~app:* -@all +get"), False),
+        (_user("d", "default", "off ~* +@all", "no-password"), False),
+        (_user("a", "app", "on ~* +@all", "no-password"), False),
+    ],
+)
+def test_default_user_attached_to_replication_group_is_critical(user, expect):
+    out = _users_out([user], [_ugroup("ug", [user["UserId"]], ["rg-prod"])])
+    hits = [f for f in out["findings"] if f["message"].startswith("the default user is active")]
+    assert bool(hits) is expect
+    if expect:
+        assert hits[0]["severity"] == "critical" and hits[0]["replication_groups"] == ["rg-prod"]
+
+
+def test_default_user_not_attached_to_any_cache_is_not_cross_referenced():
+    out = _users_out([_user("d", "default", "on ~* +@all", "no-password")], [_ugroup("ug", ["d"])])
+    assert not [f for f in out["findings"] if f["message"].startswith("the default user is active")]
+
+
+@pytest.mark.parametrize(
+    ("access", "rg", "expected"),
+    [
+        ("on ~app:* +@read +@dangerous", "rg-prod", "warning"),
+        ("on ~app:* +@read +flushall", "rg-prod", "warning"),
+        ("on ~app:* +@read +config|get", "rg-prod", "info"),
+        ("on ~app:* +@read +@dangerous -@dangerous", "rg-prod", None),
+        ("on ~app:* +@read +@dangerous", "rg-dev", None),
+        ("on ~app:* +@read +get", "rg-prod", None),
+    ],
+)
+def test_dangerous_commands_on_prod_like_group(access, rg, expected):
+    out = _users_out([_user("app", "app", access)], [_ugroup("ug", ["app"], [rg])])
+    hits = [f for f in out["findings"] if "dangerous commands" in f["message"]]
+    assert (hits[0]["severity"] if hits else None) == expected
+
+
+def test_user_group_with_only_the_default_user_warns():
+    users = [_user("d", "default", "off"), _user("app", "app", "on ~* +get")]
+    groups = [_ugroup("only-default", ["d"], ["rg"]), _ugroup("ok", ["d", "app"], ["rg"])]
+    cp = plane(Fake({"describe_users": {"Users": users}, "describe_user_groups": {"UserGroups": groups}}))
+    flagged = {f["resource"] for f in cp.user_groups()["findings"] if "no non-default user" in f["message"]}
+    assert flagged == {"only-default"}
+
+
+def test_acl_findings_use_no_new_aws_actions():
+    ec = Fake({"describe_users": {"Users": []}, "describe_user_groups": {"UserGroups": []}})
+    cp = plane(ec)
+    cp.users()
+    cp.user_groups()
+    assert {c[0] for c in ec.calls} == {"describe_users", "describe_user_groups"}
+
+
+# --------------------------------------------- region fan-out for alarms and cluster overview
+
+
+def _fleet_plane(by_region):
+    class Session:
+        def client(self, service, region_name=None, config=None):
+            ec, cw = by_region[region_name]
+            return {"elasticache": ec, "cloudwatch": cw}[service]
+
+    cfg = ControlPlaneConfig(region=REGION, regions=tuple(by_region))
+    return ControlPlane(cfg, session_factory=Session, clock=lambda: NOW)
+
+
+def _alarming_region():
+    ec = Fake(
+        {
+            "describe_replication_groups": {
+                "ReplicationGroups": [{"ReplicationGroupId": "a1", "MemberClusters": ["a1-001"]}]
+            }
+        }
+    )
+    alarm = {
+        "AlarmName": "a1-cpu",
+        "Namespace": "AWS/ElastiCache",
+        "MetricName": "EngineCPUUtilization",
+        "StateValue": "ALARM",
+        "ActionsEnabled": True,
+        "AlarmActions": ["arn:sns"],
+        "Dimensions": [{"Name": "CacheClusterId", "Value": "a1-001"}],
+    }
+    return ec, Fake({"describe_alarms": {"MetricAlarms": [alarm]}})
+
+
+def test_alarms_fleet_isolates_a_denied_region_and_tags_findings():
+    denied_ec = Fake({"describe_replication_groups": denied("DescribeReplicationGroups")})
+    cp = _fleet_plane({REGION: _alarming_region(), "eu-west-1": (denied_ec, Fake())})
+    out = cp.alarms_fan_out()
+    assert out["region_errors"]["eu-west-1"]["error"] == "AccessDenied"
+    assert out["findings"] and all(f["region"] == REGION for f in out["findings"])
+    assert any(f["severity"] == "critical" and f.get("alarm") == "a1-cpu" for f in out["findings"])
+    assert [a["region"] for a in out["alarms"]] == [REGION]
+
+
+def test_alarms_with_a_group_id_stays_in_one_region():
+    ec, cw = _alarming_region()
+    other = Fake()
+    cp = _fleet_plane({REGION: (ec, cw), "eu-west-1": (other, Fake())})
+    out = cp.alarms_fan_out("a1")
+    assert "regions" not in out and other.calls == []
+
+
+def _overview_region(status="modifying"):
+    ec = Fake({"describe_replication_groups": {"ReplicationGroups": [rg(status=status)]}})
+    return ec, Fake({"get_metric_data": metric_result({})})
+
+
+def test_cluster_overview_fleet_merges_regions_and_isolates_errors():
+    denied_ec = Fake({"describe_replication_groups": denied("DescribeReplicationGroups")})
+    cp = _fleet_plane({REGION: _overview_region(), "eu-west-1": (denied_ec, Fake())})
+    out = cp.cluster_overview_fan_out(None)
+    assert out["region_errors"]["eu-west-1"]["error"] == "AccessDenied"
+    assert [g["region"] for g in out["groups"]] == [REGION] and out["groups"][0]["replication_group_id"] == "prod"
+    assert out["findings"] and all(
+        f["region"] == REGION and f["replication_group_id"] == "prod" for f in out["findings"]
+    )
+
+
+def test_cluster_overview_fleet_merges_findings_from_two_regions_worst_first():
+    cp = _fleet_plane({REGION: _overview_region("available"), "eu-west-1": _overview_region("modifying")})
+    out = cp.cluster_overview_fan_out(None)
+    assert {g["region"] for g in out["groups"]} == {REGION, "eu-west-1"}
+    sevs = [f["severity"] for f in out["findings"]]
+    assert sevs == sorted(sevs, key=lambda s: controlplane._SEVERITY_ORDER[s])
+    assert {f["region"] for f in out["findings"]} <= {REGION, "eu-west-1"}
+    assert any(f["region"] == "eu-west-1" for f in out["findings"])
+
+
+def test_fleet_stops_when_the_shared_deadline_is_used_up(monkeypatch):
+    cp = _fleet_plane({REGION: _overview_region(), "eu-west-1": _overview_region()})
+    clock = iter([0.0, 0.0, 0.0] + [1000.0] * 50)
+    monkeypatch.setattr(controlplane, "_monotonic", lambda: next(clock))
+    out = cp.cluster_overview_fan_out(None)
+    assert out["region_errors"]["eu-west-1"]["error"] == "DeadlineExceeded"
+    assert [g["region"] for g in out["groups"]] == [REGION]

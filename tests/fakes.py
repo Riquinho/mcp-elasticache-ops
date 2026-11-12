@@ -129,3 +129,183 @@ class FakeRedis:
         if isinstance(value, Exception):
             raise value
         return value
+
+
+# --------------------------------------------------------------------------- runtime read-only audit
+# Recording fakes used by tests/test_server.py to prove, tool by tool, that nothing but read calls leaves
+# the process: AWS operations are recorded at botocore level, Redis commands at the SafeRedis level and
+# Memcached commands at the socket level.
+
+AUDIT_AWS_RESPONSES: dict[str, dict[str, Any]] = {
+    "DescribeReplicationGroups": {
+        "ReplicationGroups": [
+            {
+                "ReplicationGroupId": "audit-rg",
+                "Status": "available",
+                "MemberClusters": ["audit-rg-001"],
+                "CacheNodeType": "cache.r6g.large",
+                "ClusterEnabled": False,
+                "MultiAZ": "disabled",
+                "AutomaticFailover": "disabled",
+                "ARN": "arn:aws:elasticache:us-east-1:123456789012:replicationgroup:audit-rg",
+                "NodeGroups": [
+                    {
+                        "NodeGroupId": "0001",
+                        "Status": "available",
+                        "NodeGroupMembers": [
+                            {
+                                "CacheClusterId": "audit-rg-001",
+                                "PreferredAvailabilityZone": "us-east-1a",
+                                "CurrentRole": "primary",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    },
+    "DescribeCacheClusters": {
+        "CacheClusters": [
+            {
+                "CacheClusterId": "audit-rg-001",
+                "ReplicationGroupId": "audit-rg",
+                "Engine": "redis",
+                "EngineVersion": "7.1.0",
+                "CacheNodeType": "cache.r6g.large",
+                "CacheClusterStatus": "available",
+            }
+        ]
+    },
+    "DescribeServerlessCaches": {
+        "ServerlessCaches": [{"ServerlessCacheName": "audit-sc", "Status": "available", "Engine": "valkey"}]
+    },
+    "GetMetricData": {"MetricDataResults": []},
+}
+
+
+class AwsAudit:
+    """boto3 session factory whose clients never touch the network and record every operation name."""
+
+    def __init__(self) -> None:
+        self.operations: list[tuple[str, str]] = []  # (service, OperationName as sent to AWS)
+
+    def __call__(self) -> Any:
+        audit = self
+
+        class Session:
+            def client(self, service, region_name=None, config=None):
+                import boto3
+                from botocore.awsrequest import AWSResponse
+
+                client = boto3.client(service, region_name=region_name or "us-east-1", config=config)
+
+                def before_call(model, **_kwargs):
+                    audit.operations.append((service, model.name))
+                    http = AWSResponse("https://audit.invalid", 200, {}, None)
+                    return http, dict(AUDIT_AWS_RESPONSES.get(model.name, {}))
+
+                client.meta.events.register("before-call", before_call)
+                return client
+
+        return Session()
+
+
+def _audit_reply(args: tuple) -> Any:
+    name = str(args[0]).upper()
+    key = f"{name} {args[1]}".upper() if len(args) > 1 and name in {"CONFIG", "CLIENT", "SLOWLOG", "ACL"} else name
+    if name == "INFO":
+        return {
+            "redis_version": "7.1.0",
+            "redis_mode": "standalone",
+            "role": "master",
+            "used_memory": 1_000_000,
+            "maxmemory": 0,
+            "connected_clients": 1,
+            "cluster_enabled": 0,
+            "total_connections_received": 1,
+            "total_commands_processed": 1,
+        }
+    if name == "SCAN":
+        return (0, [b"audit:key"])
+    return {
+        "PING": True,
+        "DBSIZE": 1,
+        "TYPE": "string",
+        "PTTL": -1,
+        "TTL": -1,
+        "MEMORY USAGE": 64,
+        "SLOWLOG GET": [],
+        "SLOWLOG LEN": 0,
+        "CLIENT LIST": [],
+        "ACL LOG": [],
+        "LATENCY LATEST": [],
+        "CONFIG GET": {},
+        "CLUSTER INFO": {"cluster_state": "ok"},
+        "CLUSTER NODES": {},
+        "ROLE": ["master", 0, []],
+    }.get(key, 1)
+
+
+class AuditRedis:
+    """Factory for SafeRedis clients that validate (via the real allowlist) and record every command."""
+
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+        self.violations: list[str] = []
+
+    def build(self, *_args: Any, **_kwargs: Any) -> Any:
+        from mcp_elasticache_ops.safe_client import SafePipeline, SafeRedis, check, command_key
+
+        audit = self
+
+        def record(args: tuple) -> None:
+            try:
+                check(args)
+            except PermissionError:
+                audit.violations.append(" ".join(str(a) for a in args))
+                raise
+            audit.commands.append(command_key(args))
+
+        class AuditPipeline(SafePipeline):
+            def execute(self, raise_on_error: bool = True):
+                stack = list(self.command_stack)
+                self.reset()
+                for args, _ in stack:
+                    record(args)
+                return [_audit_reply(args) for args, _ in stack]
+
+        class Client(SafeRedis):
+            def execute_command(self, *args, **options):
+                record(args)
+                return _audit_reply(args)
+
+            def pipeline(self, transaction: bool = False, shard_hint=None):
+                return AuditPipeline(self.connection_pool, self.response_callbacks, False, shard_hint)
+
+        return Client()
+
+
+class AuditSocket:
+    """Memcached socket stand-in: records each command line and answers like a tiny server."""
+
+    def __init__(self, sent: list[str]) -> None:
+        self.sent = sent
+        self._reply = b""
+
+    def __enter__(self) -> AuditSocket:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def sendall(self, data: bytes) -> None:
+        command = data.decode("ascii").strip()
+        self.sent.append(command)
+        if command == "version":
+            self._reply = b"VERSION 1.6.21\r\n"
+        else:
+            self._reply = b"STAT pid 1\r\nSTAT curr_connections 3\r\nSTAT limit_maxbytes 1048576\r\nEND\r\n"
+
+    def recv(self, _size: int) -> bytes:
+        reply, self._reply = self._reply, b""
+        return reply

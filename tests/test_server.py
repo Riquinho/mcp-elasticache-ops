@@ -1,3 +1,4 @@
+import contextlib
 import json
 from urllib.parse import urlparse
 
@@ -362,3 +363,119 @@ async def test_oncall_high_cpu_runs_the_documented_sequence():
     order = ["`aws_triage`", "`node_triage`", "`node_cluster_slowlog`", "`aws_metrics`"]
     positions = [text.index(t) for t in order]
     assert positions == sorted(positions)
+
+
+# ------------------------------------------------------------ runtime read-only audit
+
+AUDIT_CALLS: list[tuple[str, dict]] = [
+    ("node_health", {}),
+    ("node_triage", {}),
+    ("node_info", {}),
+    ("node_memory", {}),
+    ("node_config", {}),
+    ("node_slowlog", {}),
+    ("node_clients", {}),
+    ("node_latency", {}),
+    ("node_commandstats", {}),
+    ("node_keyspace_sample", {"sample_size": 10}),
+    ("node_replication", {}),
+    ("node_acl_log", {}),
+    ("node_cluster", {}),
+    ("node_cluster_nodes", {}),
+    ("node_cluster_health", {}),
+    ("node_cluster_keyspace_sample", {"sample_size": 10}),
+    ("node_cluster_slowlog", {}),
+    ("node_cluster_memory", {}),
+    ("memcached_stats", {}),
+    ("memcached_stats", {"group": "slabs"}),
+    ("memcached_cluster_stats", {}),
+    ("aws_replication_groups", {}),
+    ("aws_replication_groups", {"replication_group_id": "audit-rg", "region": "eu-west-1"}),
+    ("aws_cache_clusters", {}),
+    ("aws_serverless_caches", {}),
+    ("aws_events", {"source_type": "replication-group", "source_identifier": "audit-rg"}),
+    ("aws_parameters", {"parameter_group": "default.redis7"}),
+    ("aws_snapshots", {}),
+    ("aws_serverless_snapshots", {}),
+    ("aws_users", {}),
+    ("aws_user_groups", {}),
+    ("aws_global_replication_groups", {}),
+    ("aws_reserved_nodes", {}),
+    ("aws_reserved_offerings", {"node_type": "cache.r6g.large", "engine": "redis"}),
+    ("aws_engine_versions", {"engine": "redis"}),
+    ("aws_parameter_groups", {}),
+    ("aws_service_updates", {}),
+    ("aws_subnet_groups", {}),
+    ("aws_metrics", {"replication_group_id": "audit-rg"}),
+    ("aws_metrics", {"cache_cluster_id": "sc", "serverless": True}),
+    ("aws_parameter_drift", {"group_a": "a", "group_b": "b"}),
+    ("aws_triage", {"replication_group_id": "audit-rg"}),
+    ("aws_serverless_triage", {"serverless_cache_name": "audit-sc"}),
+    ("aws_alarms", {}),  # fleet mode over both configured regions
+    ("aws_alarms", {"replication_group_id": "audit-rg"}),
+    ("aws_cluster_overview", {}),  # fleet mode
+    ("aws_cluster_overview", {"replication_group_id": "audit-rg"}),
+]
+
+
+@pytest.fixture()
+def audit(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from mcp_elasticache_ops import memcached
+    from mcp_elasticache_ops.config import ControlPlaneConfig
+    from mcp_elasticache_ops.controlplane import ControlPlane
+
+    from .fakes import AuditRedis, AuditSocket, AwsAudit
+
+    for var in ("AWS_PROFILE", "AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "none"))
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "none"))
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.setenv("MEMCACHED_HOST", "10.0.0.9")
+    monkeypatch.setenv("MEMCACHED_NODES", "10.0.0.9:11211,10.0.0.10:11211")
+    aws, redis_audit, memcached_sent = AwsAudit(), AuditRedis(), []
+    plane = ControlPlane(
+        ControlPlaneConfig(region="us-east-1", regions=("us-east-1", "eu-west-1")), session_factory=aws
+    )
+    client = redis_audit.build()
+    monkeypatch.setattr(server, "control_plane", lambda: plane)
+    monkeypatch.setattr(server, "redis_client", lambda: client)
+    monkeypatch.setattr(server, "build_client", lambda *a, **k: redis_audit.build())
+    monkeypatch.setattr(
+        memcached, "socket", SimpleNamespace(create_connection=lambda *a, **k: AuditSocket(memcached_sent))
+    )
+    return SimpleNamespace(aws=aws, redis=redis_audit, memcached=memcached_sent)
+
+
+async def test_every_tool_only_issues_read_operations(audit):
+    import re
+
+    from mcp_elasticache_ops import memcached
+    from mcp_elasticache_ops.safe_client import READ_ONLY_COMMANDS
+
+    async with Client(server.mcp) as c:
+        registered = {t.name for t in await c.list_tools()}
+        exercised = {name for name, _ in AUDIT_CALLS}
+        assert registered == exercised, (
+            f"tools missing from AUDIT_CALLS: {sorted(registered - exercised)}; "
+            f"stale entries: {sorted(exercised - registered)}"
+        )
+        for name, args in AUDIT_CALLS:
+            with contextlib.suppress(ToolError):  # thin canned replies; only attempted calls matter
+                await c.call_tool(name, args)
+    assert audit.aws.operations, "no AWS operation was recorded at all"
+    for service, op in audit.aws.operations:
+        assert service in {"elasticache", "cloudwatch"}, (service, op)
+        assert re.match(r"^(Describe|List|GetMetricData)", op), f"{service}:{op} is not a read operation"
+    assert {op for _, op in audit.aws.operations} >= {"DescribeReplicationGroups", "GetMetricData", "DescribeAlarms"}
+    regions_hit = {op for _, op in audit.aws.operations}
+    assert regions_hit  # fleet mode ran through the recording session as well
+    assert audit.redis.violations == []
+    assert audit.redis.commands, "no Redis command was recorded at all"
+    assert set(audit.redis.commands) <= READ_ONLY_COMMANDS
+    assert audit.memcached, "no memcached command was recorded at all"
+    assert set(audit.memcached) <= memcached.ALLOWED_COMMANDS

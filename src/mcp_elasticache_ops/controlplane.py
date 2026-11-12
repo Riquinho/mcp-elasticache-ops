@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import re
+import time
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from typing import Any
@@ -23,6 +24,23 @@ from botocore.config import Config as BotocoreConfig
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError, NoRegionError
 
 from .config import REGION_PATTERN, ControlPlaneConfig
+
+# ENA allowance counters: packets queued or dropped because the node exceeded a network limit.
+# Metric -> (direction/limit label, what it means).
+NETWORK_ALLOWANCE_LIMITS = {
+    "NetworkBandwidthInAllowanceExceeded": ("inbound bandwidth", "in"),
+    "NetworkBandwidthOutAllowanceExceeded": ("outbound bandwidth", "out"),
+    "NetworkPacketsPerSecondAllowanceExceeded": ("packets per second", "pps"),
+    "NetworkConntrackAllowanceExceeded": ("connection tracking", "conntrack"),
+}
+NETWORK_ALLOWANCE_METRICS = tuple(NETWORK_ALLOWANCE_LIMITS)
+
+# ACL/auth rejections (Redis/Valkey): metric -> what the client got wrong.
+AUTH_FAILURE_METRICS = {
+    "AuthenticationFailures": "failed logins (wrong credentials, a rotated token or password)",
+    "CommandAuthorizationFailures": "commands denied by the ACL (access string too tight)",
+    "KeyAuthorizationFailures": "key accesses denied by the ACL (key patterns too tight)",
+}
 
 # Metrics worth looking at first, per engine family. Units follow CloudWatch.
 REDIS_METRICS = [
@@ -40,8 +58,10 @@ REDIS_METRICS = [
     "ReplicationBytes",
     "NetworkBytesIn",
     "NetworkBytesOut",
-    "NetworkBandwidthAllowanceExceeded",
+    *NETWORK_ALLOWANCE_METRICS,
     "SwapUsage",
+    "FreeableMemory",
+    *AUTH_FAILURE_METRICS,
 ]
 MEMCACHED_METRICS = [
     "CPUUtilization",
@@ -51,6 +71,7 @@ MEMCACHED_METRICS = [
     "GetHits",
     "GetMisses",
     "SwapUsage",
+    "FreeableMemory",
 ]
 SERVERLESS_METRICS = [
     "ElastiCacheProcessingUnits",
@@ -63,7 +84,8 @@ SUM_STAT_METRICS = {
     "Evictions",
     "NewConnections",
     "ThrottledCmds",
-    "NetworkBandwidthAllowanceExceeded",
+    *NETWORK_ALLOWANCE_METRICS,
+    *AUTH_FAILURE_METRICS,
     "ElastiCacheProcessingUnits",
 }
 
@@ -108,6 +130,10 @@ OVERVIEW_METRICS = [
 ]
 OVERVIEW_P95 = ("EngineCPUUtilization", "DatabaseMemoryUsagePercentage")
 MAX_OVERVIEW_FINDINGS = 30
+FLEET_DEADLINE_SECONDS = 60.0  # shared budget for a multi-region fleet call; later regions/groups are skipped
+MAX_FLEET_FINDINGS = 60
+MAX_FLEET_GROUPS_PER_REGION = 20
+_monotonic = time.monotonic  # patched by tests; never patch the time module itself
 MAX_OVERVIEW_SHARDS = 50
 OUTLIER_RATIO = 1.5
 # Ignore outliers below these floors: 3x of almost nothing is still almost nothing.
@@ -212,6 +238,17 @@ def _error_result(code: str, message: str) -> dict:
     return {"error": code, "message": message, **({"hint": hint} if hint else {})}
 
 
+def _fleet_deadline_error() -> dict:
+    return {
+        "error": "DeadlineExceeded",
+        "message": f"fleet call budget of {FLEET_DEADLINE_SECONDS:.0f}s used up before this region; query it alone",
+    }
+
+
+def _fleet_failed(result: dict) -> bool:
+    return "error" in result or "unavailable" in result
+
+
 def finding(severity: str, message: str, **extra: Any) -> dict:
     return {"severity": severity, "message": message, **extra}
 
@@ -299,6 +336,117 @@ class ControlPlane:
             "error": "ReplicationGroupNotFoundFault",
             "message": f"replication group {replication_group_id} not found in {', '.join(map(str, targets))}",
         }
+        if failures:
+            out["region_errors"] = failures
+        return out
+
+    def alarms_fan_out(self, replication_group_id: str | None = None, region: str | None = None) -> dict:
+        """``alarms`` per region in ELASTICACHE_REGIONS when no group is named (fleet mode).
+
+        Findings and alarms carry their ``region``; a region that fails (AccessDenied, timeout, deadline) is
+        listed in ``region_errors`` and never hides the others."""
+        targets = self._target_regions(region)
+        if replication_group_id or len(targets) == 1:
+            return self.in_region(region if replication_group_id else targets[0]).alarms(replication_group_id)
+        deadline = _monotonic() + FLEET_DEADLINE_SECONDS
+        findings: list[dict] = []
+        alarms: list[dict] = []
+        tgts: list[dict] = []
+        failures: dict[str, dict] = {}
+        partial = False
+        for target in targets:
+            if _monotonic() >= deadline:
+                failures[str(target)] = _fleet_deadline_error()
+                continue
+            result = self.in_region(target).alarms(None)
+            if _fleet_failed(result):
+                failures[str(target)] = result
+                continue
+            partial = partial or bool(result.get("partial"))
+            findings += [{**f, "region": target} for f in result.get("findings", [])]
+            alarms += [{**a, "region": target} for a in result.get("alarms", [])]
+            tgts += [{**t, "region": target} for t in result.get("targets", [])]
+        ordered = _sorted_findings(findings)
+        out: dict[str, Any] = {
+            "regions": [str(t) for t in targets],
+            "count": len(alarms),
+            "findings": ordered[:MAX_FLEET_FINDINGS],
+            "findings_total": len(ordered),
+            "truncated": len(ordered) > MAX_FLEET_FINDINGS,
+            "targets": tgts,
+            "alarms": alarms,
+        }
+        if partial:
+            out["partial"] = True
+        if failures:
+            out["region_errors"] = failures
+        return out
+
+    def _group_ids(self) -> dict:
+        return self._guard(
+            lambda: {
+                "ids": sorted(
+                    str(g.get("ReplicationGroupId"))
+                    for g in self._paginate("describe_replication_groups", "ReplicationGroups")
+                )
+            }
+        )
+
+    def cluster_overview_fan_out(
+        self, replication_group_id: str | None, minutes: int = OVERVIEW_WINDOW_MINUTES, region: str | None = None
+    ) -> dict:
+        """``cluster_overview`` for one group, or for every group of every configured region (fleet mode).
+
+        Fleet mode inspects at most MAX_FLEET_GROUPS_PER_REGION groups per region within one shared deadline and
+        returns one row per group plus the merged, region-tagged findings."""
+        if replication_group_id:
+            return self.in_region(region).cluster_overview(replication_group_id, minutes)
+        targets = self._target_regions(region)
+        deadline = _monotonic() + FLEET_DEADLINE_SECONDS
+        findings: list[dict] = []
+        rows: list[dict] = []
+        failures: dict[str, dict] = {}
+        skipped: list[str] = []
+        for target in targets:
+            plane = self.in_region(target)
+            if _monotonic() >= deadline:
+                failures[str(target)] = _fleet_deadline_error()
+                continue
+            listed = plane._group_ids()
+            if _fleet_failed(listed):
+                failures[str(target)] = listed
+                continue
+            ids = listed["ids"]
+            skipped += [f"{target or 'default'}/{gid}" for gid in ids[MAX_FLEET_GROUPS_PER_REGION:]]
+            for gid in ids[:MAX_FLEET_GROUPS_PER_REGION]:
+                if _monotonic() >= deadline:
+                    skipped.append(f"{target or 'default'}/{gid}")
+                    continue
+                result = plane.cluster_overview(gid, minutes)
+                if _fleet_failed(result):
+                    failures[str(target)] = result
+                    break  # the same denial or timeout would hit every other group of this region
+                rows.append(
+                    {
+                        "region": target,
+                        "replication_group_id": gid,
+                        "status": result.get("status"),
+                        "overall": result.get("overall"),
+                        "findings_total": result.get("findings_total"),
+                    }
+                )
+                findings += [{**f, "region": target, "replication_group_id": gid} for f in result["findings"]]
+        ordered = _sorted_findings(findings)
+        out: dict[str, Any] = {
+            "regions": [str(t) for t in targets],
+            "window_minutes": int(minutes),
+            "groups": rows,
+            "findings": ordered[:MAX_FLEET_FINDINGS],
+            "findings_total": len(ordered),
+            "truncated": len(ordered) > MAX_FLEET_FINDINGS,
+        }
+        if skipped:
+            out["skipped_groups"] = skipped
         if failures:
             out["region_errors"] = failures
         return out
@@ -665,14 +813,44 @@ class ControlPlane:
         return self._guard(run)
 
     def events(self, source_identifier: str | None = None, source_type: str | None = None, hours: int = 24) -> dict:
+        """DescribeEvents, findings first: classified events (worst, then newest), counts per source, capped raw list."""
+        if source_type and source_type not in EVENT_SOURCE_TYPES:
+            return {
+                "error": "InvalidArgument",
+                "message": f"source_type must be one of: {', '.join(sorted(EVENT_SOURCE_TYPES))}",
+            }
+
         def run() -> dict:
-            kwargs: dict[str, Any] = {"Duration": max(1, min(int(hours), 14 * 24)) * 60}
+            window = max(1, min(int(hours), 14 * 24))
+            kwargs: dict[str, Any] = {"Duration": window * 60}
             if source_identifier:
                 kwargs["SourceIdentifier"] = source_identifier
             if source_type:
                 kwargs["SourceType"] = source_type
             events = self._paginate("describe_events", "Events", **kwargs)
-            return {"count": len(events), "events": _jsonable(events)}
+            events.sort(key=_event_time, reverse=True)
+            by_source = Counter(str(e.get("SourceIdentifier") or "unknown") for e in events)
+            classified = [(_event_severity(str(e.get("Message", ""))), e) for e in events]
+            findings = [
+                finding(
+                    sev,
+                    f"event {_event_stamp(e)}: {e.get('Message', '')}",
+                    resource=e.get("SourceIdentifier"),
+                    source_type=e.get("SourceType"),
+                )
+                for sev, e in classified
+            ]
+            findings = _sorted_findings(findings)  # stable: newest first inside a severity
+            return {
+                "window_hours": window,
+                "count": len(events),
+                "findings": findings[:MAX_EVENT_FINDINGS],
+                "findings_truncated": len(findings) > MAX_EVENT_FINDINGS,
+                "by_severity": dict(Counter(sev for sev, _ in classified)),
+                "by_source": dict(by_source.most_common()),
+                "events": _jsonable(events[:MAX_EVENTS_RETURNED]),
+                "truncated": len(events) > MAX_EVENTS_RETURNED,
+            }
 
         return self._guard(run)
 
@@ -721,12 +899,23 @@ class ControlPlane:
         return self._guard(run)
 
     # ------------------------------------------------------------ users / ACL
+    @staticmethod
+    def _best_effort(fetch: Callable[[], list[dict]]) -> list[dict] | None:
+        """Extra context for findings: ``None`` (never an error) when the call fails."""
+        try:
+            return fetch()
+        except (BotoCoreError, ClientError):
+            return None
+
     def users(self, engine: str | None = None) -> dict:
         def run() -> dict:
             kwargs: dict[str, Any] = {"Engine": engine} if engine else {}
             users = self._paginate("describe_users", "Users", **kwargs)
+            groups = self._best_effort(lambda: self._paginate("describe_user_groups", "UserGroups"))
             views = [_user_view(u) for u in users]
             findings = [{**f, "resource": v["id"]} for v in views for f in v["findings"]]
+            if groups is not None:
+                findings += _acl_user_findings(users, groups)
             return {"count": len(views), "findings": _sorted_findings(findings), "users": views}
 
         return self._guard(run)
@@ -734,6 +923,7 @@ class ControlPlane:
     def user_groups(self) -> dict:
         def run() -> dict:
             groups = self._paginate("describe_user_groups", "UserGroups")
+            users = self._best_effort(lambda: self._paginate("describe_users", "Users"))
             views = []
             findings = []
             for g in groups:
@@ -751,6 +941,7 @@ class ControlPlane:
                     findings.append(finding("info", "user group is not attached to any cache", resource=view["id"]))
                 if view["status"] not in (None, "active"):
                     findings.append(finding("warning", f"user group status is {view['status']}", resource=view["id"]))
+            findings += _acl_group_findings(groups, users)
             return {"count": len(views), "findings": _sorted_findings(findings), "user_groups": views}
 
         return self._guard(run)
@@ -1974,6 +2165,7 @@ def _sustain_thresholds() -> dict[str, float]:
         "EngineCPUUtilization": 80.0,
         "DatabaseMemoryUsagePercentage": 80.0,
         "CurrConnections": 0.8 * MAXCLIENTS_DEFAULT,
+        **dict.fromkeys(AUTH_FAILURE_METRICS, 0.0),  # any failure counts; sustained = in half the periods
     }
 
 
@@ -2091,12 +2283,23 @@ def _metric_findings(resource: str, summary: dict[str, dict]) -> list[dict]:
     throttled = get("ThrottledCmds", "sum")
     if throttled:
         add("warning", f"{throttled:.0f} throttled commands in the window")
-    bw = get("NetworkBandwidthAllowanceExceeded", "sum")
-    if bw:
-        add(
-            "warning",
-            f"network bandwidth allowance exceeded {bw:.0f} times (packets shaped); consider a larger node type",
-        )
+    for metric, (limit, tag) in NETWORK_ALLOWANCE_LIMITS.items():
+        exceeded = get(metric, "sum")
+        if exceeded:
+            add(
+                "warning",
+                f"{metric} ({tag}): {limit} allowance exceeded {exceeded:.0f} times in the window "
+                "(packets queued or dropped); consider a larger node type or more shards/replicas",
+            )
+    for metric, meaning in AUTH_FAILURE_METRICS.items():
+        failures = get(metric, "sum")
+        if failures:
+            sev, how = _breach(summary[metric], "warning")
+            add(
+                sev,
+                f"{metric}: {failures:.0f} {meaning} in the window{how}; likely wrong credentials, a rotated "
+                "token or an ACL that is too tight, `node_acl_log` shows the user, command and client",
+            )
     out += _credit_findings(resource, summary)
     return out
 
@@ -2194,6 +2397,44 @@ def _triage_rg_findings(g: dict) -> list[dict]:
 
 _CRITICAL_EVENT_WORDS = ("failure", "failed", "unreachable", "unavailable")
 _WARNING_EVENT_WORDS = ("failover", "replac", "reboot", "restart", "removed", "recover")
+
+
+EVENT_SOURCE_TYPES = frozenset(
+    {
+        "cache-cluster",
+        "cache-parameter-group",
+        "cache-security-group",
+        "cache-subnet-group",
+        "replication-group",
+        "serverless-cache",
+        "user",
+        "user-group",
+    }
+)
+MAX_EVENTS_RETURNED = 100
+MAX_EVENT_FINDINGS = 50
+# aws_events treats a failover as critical (a primary was lost) and maintenance as a warning.
+_EVENTS_CRITICAL_WORDS = (*_CRITICAL_EVENT_WORDS, "not available", "failover")
+_EVENTS_WARNING_WORDS = ("replac", "reboot", "restart", "removed", "recover", "maintenance")
+
+
+def _event_severity(message: str) -> str:
+    low = message.lower()
+    if any(w in low for w in _EVENTS_CRITICAL_WORDS):
+        return "critical"
+    if any(w in low for w in _EVENTS_WARNING_WORDS):
+        return "warning"
+    return "info"
+
+
+def _event_time(event: dict) -> float:
+    when = event.get("Date")
+    return when.timestamp() if isinstance(when, dt.datetime) else 0.0
+
+
+def _event_stamp(event: dict) -> str:
+    when = event.get("Date")
+    return when.isoformat() if isinstance(when, dt.datetime) else str(when)
 
 
 def _triage_event_findings(events: list[dict]) -> tuple[list[dict], int]:
@@ -2629,6 +2870,88 @@ def _serverless_snapshot_findings(
                 )
             )
     return findings
+
+
+_DANGEROUS_ACL_RULES = {"@dangerous", "flushall", "config"}
+
+
+def _access_tokens(u: dict) -> list[str]:
+    return str(u.get("AccessString", "")).lower().split()
+
+
+def _dangerous_grants(tokens: list[str]) -> list[str]:
+    """Dangerous rules still granted after the whole access string is applied (last rule wins)."""
+    state: dict[str, bool] = {}
+    for token in tokens:
+        if token[:1] in "+-":
+            name = token[1:].split("|", 1)[0]
+            if name in _DANGEROUS_ACL_RULES:
+                state[name] = token[0] == "+"
+    return sorted(name for name, granted in state.items() if granted)
+
+
+def _acl_user_findings(users: list[dict], groups: list[dict]) -> list[dict]:
+    """Cross-reference users with the user groups attached to replication groups or serverless caches."""
+    attached: dict[str, list[str]] = defaultdict(list)  # user id -> caches reached through its groups
+    group_ids: dict[str, list[str]] = defaultdict(list)
+    for g in groups:
+        caches = [*g.get("ReplicationGroups", []), *g.get("ServerlessCaches", [])]
+        for uid in g.get("UserIds", []):
+            attached[uid] += caches
+            group_ids[uid].append(str(g.get("UserGroupId")))
+    out: list[dict] = []
+    for u in users:
+        uid = str(u.get("UserId"))
+        tokens = _access_tokens(u)
+        caches = sorted(set(attached.get(uid, [])))
+        auth = u.get("Authentication") or {}
+        open_login = (
+            auth.get("Type") == "no-password" or "nopass" in tokens or bool({"+@all", "allcommands"} & set(tokens))
+        )
+        if str(u.get("UserName", "")).lower() == "default" and "on" in tokens and caches and open_login:
+            why = "no password" if auth.get("Type") == "no-password" or "nopass" in tokens else "+@all"
+            out.append(
+                finding(
+                    "critical",
+                    f"the default user is active with {why} and is attached to {', '.join(caches)}: any client "
+                    "can connect without credentials; switch it off (`off -@all`) or give it a password and "
+                    "least-privilege access string",
+                    resource=uid,
+                    replication_groups=caches,
+                )
+            )
+        grants = _dangerous_grants(tokens)
+        if grants and "on" in tokens and "+@all" not in tokens:
+            label = " ".join([*caches, *group_ids.get(uid, [])])
+            prod = bool(re.search(r"prod|prd|live", label.lower()))
+            if prod:
+                sev = "info" if grants == ["config"] else "warning"
+                out.append(
+                    finding(
+                        sev,
+                        f"user can run dangerous commands ({', '.join('+' + g for g in grants)}) on a "
+                        f"production-like cache ({', '.join(caches) or label}); restrict to what the app needs",
+                        resource=uid,
+                    )
+                )
+    return out
+
+
+def _acl_group_findings(groups: list[dict], users: list[dict] | None) -> list[dict]:
+    """User groups that only hold the default user: clients would have to authenticate as ``default``."""
+    names = {str(u.get("UserId")): str(u.get("UserName", "")).lower() for u in users or []}
+    out = []
+    for g in groups:
+        ids = [str(i) for i in g.get("UserIds", [])]
+        if ids and all(names.get(i, i.lower()) == "default" for i in ids):
+            out.append(
+                finding(
+                    "warning",
+                    "user group has no non-default user: clients can only authenticate as the default user",
+                    resource=g.get("UserGroupId"),
+                )
+            )
+    return out
 
 
 def _user_view(u: dict) -> dict:
