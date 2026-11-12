@@ -1,9 +1,67 @@
 # mcp-elasticache-ops
 
-Read-only MCP server for operating and monitoring Amazon ElastiCache (Valkey / Redis OSS / Memcached),
-built on [FastMCP](https://gofastmcp.com). It answers the questions an on-call DBRE asks first —
-*is it healthy, where is the memory, what is slow, who is connected, which keys are big or hot,
-what did AWS do to the cluster* — without ever being able to change data or configuration.
+**Ask your AI assistant why your ElastiCache is slow. It can look at everything and change nothing.**
+
+[![CI](https://github.com/ritojoao/mcp-elasticache-ops/actions/workflows/ci.yml/badge.svg)](https://github.com/ritojoao/mcp-elasticache-ops/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)
+![MCP](https://img.shields.io/badge/MCP-server-8A2BE2)
+![Read-only](https://img.shields.io/badge/access-read--only-brightgreen)
+
+A [Model Context Protocol](https://modelcontextprotocol.io) server for Amazon ElastiCache (Valkey, Redis OSS,
+Memcached), built on [FastMCP](https://gofastmcp.com). Point Claude, Cursor or any MCP client at your cluster and
+get the answers an on-call engineer needs in seconds: *is it healthy, where is the memory, what is slow, who is
+connected, which keys are big or hot, what did AWS do to the cluster.*
+
+## Why
+
+- **Safe by construction.** Every Redis command passes an allowlist of 53 read-only commands. `SET`, `DEL`,
+  `FLUSHALL`, `CONFIG SET`, `EVAL` and even `GET` are refused before they reach the network. Key values are never
+  read. The AWS side only calls `Describe*`, `List*` and `GetMetricData`. Tests fail if this ever drifts.
+- **Built for incidents.** `node_triage` and `aws_triage` return a worst-first list of findings in one call, so the
+  model starts from the diagnosis instead of from raw `INFO` output.
+- **Data plane and control plane together.** 65 tools join what Redis says (memory, slowlog, clients, replication,
+  cluster slots) with what AWS says (events, CloudWatch, parameter groups, security posture), across regions.
+- **Runbooks included.** Four MCP prompts walk the model through high CPU, evictions, replication lag and
+  connection storms, naming the tool to call at each step and what to conclude from it.
+- **Production-minded.** TLS and IAM auth, bounded `SCAN` sampling, output size caps, per-call timeouts, secrets
+  never returned by any tool.
+
+## What it looks like
+
+> **You:** orders-prod is slow since 14:00. What is going on?
+>
+> **Assistant:** (calls `aws_triage`, `node_triage`, `node_commandstats`) Evictions started at 14:02 on shard 2
+> after `maxmemory` was reached. Policy is `allkeys-lru` and one hash prefix holds most of the sampled memory.
+> A maintenance event also touched the replica at 13:55. Next step: raise the node type or set a TTL on that prefix.
+
+## Quick start
+
+```bash
+uvx --from git+https://github.com/ritojoao/mcp-elasticache-ops mcp-elasticache-ops
+```
+
+Claude Desktop / Claude Code:
+
+```json
+{
+  "mcpServers": {
+    "elasticache-ops": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/ritojoao/mcp-elasticache-ops", "mcp-elasticache-ops"],
+      "env": {
+        "ELASTICACHE_HOST": "my-rg.xxxxxx.ng.0001.use1.cache.amazonaws.com",
+        "ELASTICACHE_TLS": "true",
+        "AWS_REGION": "us-east-1",
+        "AWS_PROFILE": "readonly"
+      }
+    }
+  }
+}
+```
+
+Give the AWS profile only `elasticache:Describe*` and `cloudwatch:GetMetricData` (see
+[Minimal IAM policy](#minimal-iam-policy)). Full options are in [Configuration](#configuration).
 
 Inspired by the scope of [call518/MCP-PostgreSQL-Ops](https://github.com/call518/MCP-PostgreSQL-Ops),
 written from scratch for ElastiCache.
@@ -187,8 +245,8 @@ and `node_memory` emit:
 ## Safety model
 
 - Every Redis command goes through `SafeRedis`, an allowlist of read-only commands (`INFO`, `SCAN`,
-  `TYPE`, `MEMORY USAGE`, `OBJECT FREQ`, `SLOWLOG GET`, `CLIENT LIST`, ...). Anything else —
-  `SET`, `DEL`, `FLUSHALL`, `CONFIG SET`, `CLIENT KILL`, `EVAL`, `MULTI`, even `GET` — raises
+  `TYPE`, `MEMORY USAGE`, `OBJECT FREQ`, `SLOWLOG GET`, `CLIENT LIST`, ...). Anything else -
+  `SET`, `DEL`, `FLUSHALL`, `CONFIG SET`, `CLIENT KILL`, `EVAL`, `MULTI`, even `GET` - raises
   `ReadOnlyViolation` before it reaches the network. Values are never read.
 - `KEYS` is refused; key sampling uses bounded `SCAN` with a hard cap.
 - `CONFIG GET` is allowed only for an explicit set of non-sensitive parameters (`maxmemory*`, `slowlog-*`,
