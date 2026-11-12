@@ -72,9 +72,11 @@ def test_maintenance_reports_both_rules_from_describe_cache_clusters():
 def test_field_names_used_exist_in_the_botocore_describe_shapes():
     # Read the shipped model file directly: no loader, so env vars or earlier tests cannot hide it.
     base = os.path.join(os.path.dirname(botocore.__file__), "data", "elasticache")
-    path = max(
-        (os.path.join(root, f) for root, _, files in os.walk(base) for f in files if f.startswith("service-2.json")),
-    )
+    found = [os.path.join(r, f) for r, _, files in os.walk(base) for f in files if f.startswith("service-2.json")]
+    data = os.path.dirname(base)
+    listing = len(os.listdir(data)) if os.path.isdir(data) else "no"
+    assert found, f"no elasticache model under {base}; botocore {botocore.__version__}; {listing} data entries"
+    path = max(found)
     opener = gzip.open if path.endswith(".gz") else open
     with opener(path, "rt", encoding="utf-8") as fh:
         model = ServiceModel(json.load(fh), service_name="elasticache")
