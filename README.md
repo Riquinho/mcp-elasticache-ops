@@ -27,6 +27,41 @@ connected, which keys are big or hot, what did AWS do to the cluster.*
 - **Production-minded.** TLS and IAM auth, bounded `SCAN` sampling, output size caps, per-call timeouts, secrets
   never returned by any tool.
 
+## Without / with
+
+**Without:** you SSH to a bastion, run `redis-cli INFO`, `SLOWLOG GET`, `CLIENT LIST`, open CloudWatch, open the
+events page, and stitch it together while the pager keeps ringing. Or you hand an AI agent a Redis MCP server that
+can also run `FLUSHALL`.
+
+**With:** you ask one question. The assistant calls the right read-only tools, correlates Redis and AWS, and answers
+with evidence. Nothing it can call is able to write.
+
+| | Write-capable Redis MCP servers | mcp-elasticache-ops |
+|---|---|---|
+| Can the model delete or overwrite keys | Yes | No, refused before the network |
+| Reads key values | Often | Never |
+| AWS control plane (events, CloudWatch, parameter groups) | Usually not | Yes, `Describe*` and `List*` only |
+| Incident triage in one call | No | `node_triage`, `aws_triage` |
+| Runbooks as MCP prompts | No | 4 |
+
+## Example prompts
+
+```text
+Is orders-prod healthy? Check every node and the AWS side.
+Why did evictions start at 14:00?
+Which keys are the biggest in this cluster? Sample, do not scan everything.
+Is replication lagging on any replica, and did AWS do maintenance recently?
+Who is connected to the primary and is one client hogging connections?
+Audit the security posture of my replication groups: encryption, auth, subnet groups.
+```
+
+## Use cases
+
+- **On-call triage.** Get a ranked diagnosis before you open a single dashboard.
+- **Capacity reviews.** Memory, evictions, hit rate and big keys across regions.
+- **Safe AI access to production.** Let a team use an assistant on prod caches without a write path.
+- **Audits.** Encryption, auth, parameter groups and pending maintenance in one pass.
+
 ## What it looks like
 
 > **You:** orders-prod is slow since 14:00. What is going on?
@@ -245,8 +280,8 @@ and `node_memory` emit:
 ## Safety model
 
 - Every Redis command goes through `SafeRedis`, an allowlist of read-only commands (`INFO`, `SCAN`,
-  `TYPE`, `MEMORY USAGE`, `OBJECT FREQ`, `SLOWLOG GET`, `CLIENT LIST`, ...). Anything else -
-  `SET`, `DEL`, `FLUSHALL`, `CONFIG SET`, `CLIENT KILL`, `EVAL`, `MULTI`, even `GET` - raises
+  `TYPE`, `MEMORY USAGE`, `OBJECT FREQ`, `SLOWLOG GET`, `CLIENT LIST`, ...). Anything else, such as
+  `SET`, `DEL`, `FLUSHALL`, `CONFIG SET`, `CLIENT KILL`, `EVAL`, `MULTI`, even `GET`, raises
   `ReadOnlyViolation` before it reaches the network. Values are never read.
 - `KEYS` is refused; key sampling uses bounded `SCAN` with a hard cap.
 - `CONFIG GET` is allowed only for an explicit set of non-sensitive parameters (`maxmemory*`, `slowlog-*`,
