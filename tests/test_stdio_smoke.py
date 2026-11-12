@@ -2,15 +2,12 @@
 
 import asyncio
 import json
-import shutil
+import sys
 
-import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from mcp_elasticache_ops import server
-
-pytestmark = pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not on PATH")
 
 
 def result_is_crash(text: str) -> bool:
@@ -24,8 +21,10 @@ def result_is_crash(text: str) -> bool:
 
 async def _session_checks() -> tuple[int, bool, str]:
     params = StdioServerParameters(
-        command="uv",
-        args=["run", "python", "-I", "-m", "mcp_elasticache_ops"],
+        # The running interpreter, not `uv run`: with a scrubbed env uv may re-sync or recreate the project venv
+        # in the middle of the suite and delete packages (botocore data) other tests still need.
+        command=sys.executable,
+        args=["-I", "-m", "mcp_elasticache_ops"],
         # nothing from the parent env except the mcp SDK's safe defaults; no ELASTICACHE_HOST, AWS creds or tokens
         env={"ELASTICACHE_PORT": "1", "ELASTICACHE_TIMEOUT": "0.2"},
     )
