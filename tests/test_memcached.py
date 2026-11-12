@@ -219,8 +219,8 @@ def test_only_stats_and_version_reach_the_socket(fake_cluster):
         memcached.stats("a", 11211, group, 2)
     memcached._query("a", 11211, "version", 2)
     assert sent
-    allowed = {"stats", "stats settings", "stats slabs", "stats items", "stats conns", "version"}
-    assert allowed == memcached.ALLOWED_COMMANDS  # allowlist unchanged
+    allowed = {"stats", "stats settings", "stats slabs", "stats items", "stats conns", "version", "config get cluster"}
+    assert allowed == memcached.ALLOWED_COMMANDS  # round 12 added exactly one read-only form
     assert {s.decode().strip() for s in sent} <= allowed
     assert all(s.endswith(b"\r\n") and s.count(b"\r\n") == 1 for s in sent)
 
@@ -376,3 +376,107 @@ def test_aws_cache_clusters_is_quiet_for_a_current_memcached_version():
         out = cp.cache_clusters()
     text = " | ".join(f["message"] for f in out["findings"])
     assert "end-of-life" not in text and "no longer offered" not in text and "auto-discovery" not in text
+
+
+# ------------------------------------------------------------------ auto-discovery check
+
+CONFIG_REPLY = (
+    b"CONFIG cluster 0 100\r\n3\nmc.0001.use1.cache.amazonaws.com|10.0.0.1|11211 "
+    b"mc.0002.use1.cache.amazonaws.com|10.0.0.2|11211\n\r\nEND\r\n"
+)
+
+
+def _aws_cluster(*addresses, version="1.6.22", status="available"):
+    return {
+        "CacheClusterId": "mc",
+        "Engine": "memcached",
+        "EngineVersion": version,
+        "ConfigurationEndpoint": {"Address": "mc.cfg.use1.cache.amazonaws.com", "Port": 11211},
+        "CacheNodes": [{"CacheNodeStatus": status, "Endpoint": {"Address": a, "Port": 11211}} for a in addresses],
+    }
+
+
+def test_parse_config_cluster():
+    parsed = memcached.parse_config_cluster(["CONFIG cluster 0 100", "3\nh1|1.1.1.1|11211 h2||11212", ""])
+    assert parsed["config_version"] == 3
+    assert [(n["host"], n["port"]) for n in parsed["nodes"]] == [("h1", 11211), ("h2", 11212)]
+    with pytest.raises(ValueError):
+        memcached.parse_config_cluster(["garbage"])
+    with pytest.raises(ValueError):
+        memcached.parse_config_cluster(["1 nohostport"])
+
+
+def test_discovery_matches(fake_cluster):
+    nodes, sent = fake_cluster
+    nodes[("mc.cfg", 11211)] = {"config get cluster": CONFIG_REPLY, "version": b"VERSION 1.6.22\r\n"}
+    cluster = _aws_cluster("mc.0001.use1.cache.amazonaws.com", "mc.0002.use1.cache.amazonaws.com")
+    out = memcached.discovery_report(cluster, "mc.cfg", 11211, 2)
+    assert out["status"] == "ok" and out["config_version"] == 3
+    assert out["findings"][0]["severity"] == "info" and "matches" in out["findings"][0]["message"]
+    assert {s.decode().strip() for s in sent} == {"config get cluster", "version"}
+
+
+def test_discovery_flags_missing_stale_and_version(fake_cluster):
+    nodes, _ = fake_cluster
+    nodes[("mc.cfg", 11211)] = {"config get cluster": CONFIG_REPLY, "version": b"VERSION 1.5.16\r\n"}
+    cluster = _aws_cluster("mc.0001.use1.cache.amazonaws.com", "mc.0003.use1.cache.amazonaws.com")
+    out = memcached.discovery_report(cluster, "mc.cfg", 11211, 2)
+    msgs = [(f["severity"], f["message"]) for f in out["findings"]]
+    assert msgs[0][0] == "critical" and "mc.0003" in msgs[0][1] and "missing from the discovery config" in msgs[0][1]
+    assert any(sev == "warning" and "mc.0002" in m and "stale" in m for sev, m in msgs)
+    assert any("1.5.16" in m and "1.6.22" in m for _, m in msgs)
+
+
+def test_discovery_node_still_creating_is_info_only(fake_cluster):
+    nodes, _ = fake_cluster
+    nodes[("mc.cfg", 11211)] = {"config get cluster": CONFIG_REPLY, "version": b"VERSION 1.6.22\r\n"}
+    cluster = _aws_cluster("mc.0001.use1.cache.amazonaws.com", "mc.0002.use1.cache.amazonaws.com")
+    cluster["CacheNodes"].append({"CacheNodeStatus": "creating", "Endpoint": {"Address": "mc.0009.x", "Port": 11211}})
+    out = memcached.discovery_report(cluster, "mc.cfg", 11211, 2)
+    assert [f["severity"] for f in out["findings"]] == ["info"] and "creating" in out["findings"][0]["message"]
+
+
+def test_discovery_unreachable_endpoint_is_a_finding(fake_cluster):
+    nodes, _ = fake_cluster
+    nodes[("nowhere", 11211)] = ConnectionRefusedError("refused")
+    out = memcached.discovery_report(_aws_cluster("a"), "nowhere", 11211, 2)
+    assert out["status"] == "error" and out["findings"][0]["severity"] == "warning"
+
+
+@pytest.mark.parametrize(
+    "verb",
+    ["set k 0 0 1", "flush_all", "config set cluster 0 1", "config get cluster extra", "CONFIG GET CLUSTER", "get k"],
+)
+def test_other_memcached_verbs_stay_blocked(verb):
+    assert verb not in memcached.ALLOWED_COMMANDS
+    with pytest.raises(ValueError, match="not allowed"):
+        memcached._query("127.0.0.1", 1, verb, 1)
+
+
+def test_controlplane_memcached_discovery_end_to_end(fake_cluster):
+    from mcp_elasticache_ops.config import ControlPlaneConfig
+    from mcp_elasticache_ops.controlplane import ControlPlane
+
+    nodes, _ = fake_cluster
+    nodes[("mc.cfg.use1.cache.amazonaws.com", 11211)] = {
+        "config get cluster": CONFIG_REPLY,
+        "version": b"VERSION 1.6.22\r\n",
+    }
+    cluster = _aws_cluster("mc.0001.use1.cache.amazonaws.com")
+
+    class Client:
+        def describe_cache_clusters(self, **kwargs):
+            assert kwargs["CacheClusterId"] == "mc" and kwargs["ShowCacheNodeInfo"] is True
+            return {"CacheClusters": [cluster]}
+
+    class Session:
+        def client(self, service, region_name=None, config=None):
+            return Client()
+
+    def plane():
+        return ControlPlane(ControlPlaneConfig(region="us-east-1"), session_factory=Session)
+
+    out = plane().memcached_discovery("mc")
+    assert out["status"] == "ok" and any("mc.0002" in f["message"] for f in out["findings"])
+    cluster["Engine"] = "redis"
+    assert plane().memcached_discovery("mc")["error"] == "NotMemcached"

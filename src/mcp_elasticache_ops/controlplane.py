@@ -16,13 +16,19 @@ import datetime as dt
 import re
 import time
 from collections import Counter, defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import boto3
 from botocore.config import Config as BotocoreConfig
-from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError, NoRegionError
+from botocore.exceptions import (
+    BotoCoreError,
+    ClientError,
+    NoCredentialsError,
+    NoRegionError,
+)
 
+from . import memcached
 from .config import REGION_PATTERN, ControlPlaneConfig
 
 # ENA allowance counters: packets queued or dropped because the node exceeded a network limit.
@@ -87,6 +93,7 @@ SUM_STAT_METRICS = {
     *NETWORK_ALLOWANCE_METRICS,
     *AUTH_FAILURE_METRICS,
     "ElastiCacheProcessingUnits",
+    "GetTypeCmds",
 }
 
 # Burstable (cache.t*) nodes throttle to baseline CPU when the credit balance hits zero; only these
@@ -106,6 +113,14 @@ TREND_MIN_POINTS = 8  # need this many points to compare the first and last quar
 TREND_MIN_GROWTH = 2.0  # percentage points between the quarters before memory growth is worth a hint
 TREND_WARN_HOURS = 24.0  # estimated time to a full memory below this is a warning, else info
 
+MAX_PAGES = 50  # pages followed per list call; a stuck or endless token stops here
+COST_WINDOW_DAYS = 14
+COST_METRICS = ["DatabaseMemoryUsagePercentage", "EngineCPUUtilization", "GetTypeCmds"]
+COST_SERVERLESS_METRICS = ["ElastiCacheProcessingUnits", "BytesUsedForCache"]
+MAX_COST_GROUPS = 20  # GetMetricData calls per region in aws_cost_overview (one per group)
+MIN_COST_POINTS = 24  # hourly points needed before a 14-day peak means anything
+OVERSIZED_MEMORY_PEAK = 30.0  # peak DatabaseMemoryUsagePercentage under this: the node type is oversized
+OLD_MANUAL_SNAPSHOT_DAYS = 90
 MAX_TAG_CALLS = 3  # ListTagsForResource calls per tool call (replication group, then a member cluster)
 MAX_TAGS_SHOWN = 25
 MAX_TAG_VALUE_CHARS = 120
@@ -238,6 +253,26 @@ def _error_result(code: str, message: str) -> dict:
     return {"error": code, "message": message, **({"hint": hint} if hint else {})}
 
 
+def botocore_hint(exc: BaseException | str) -> str:
+    """Next step for a failure before any AWS call completed (credentials, region, endpoint, timeout).
+
+    Takes the exception or its class name (triage sections only keep the name)."""
+    name = exc if isinstance(exc, str) else type(exc).__name__
+    if name in {"NoCredentialsError", "PartialCredentialsError"}:
+        return (
+            "No AWS credentials found; set AWS_PROFILE or the AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY variables, "
+            "or run on a role with the read-only policy from the README."
+        )
+    if name == "NoRegionError":
+        return "No AWS region configured; set AWS_REGION (or AWS_DEFAULT_REGION) or ELASTICACHE_REGIONS."
+    if name in {"EndpointConnectionError", "ConnectTimeoutError", "ReadTimeoutError"}:
+        return (
+            "Cannot reach the AWS API endpoint; check network, proxy and VPC endpoint settings and that the region "
+            "name is valid, then retry."
+        )
+    return "The AWS SDK failed before the call completed; check credentials, region and network, then retry."
+
+
 def _fleet_deadline_error() -> dict:
     return {
         "error": "DeadlineExceeded",
@@ -269,6 +304,7 @@ class ControlPlane:
         self._clock = clock or (lambda: dt.datetime.now(dt.UTC))
         self._clients: dict[str, Any] = {}
         self._regional: dict[str, ControlPlane] = {}
+        self._truncations: list[str] = []
 
     # ------------------------------------------------------------ plumbing
     def in_region(self, region: str | None) -> ControlPlane:
@@ -514,34 +550,66 @@ class ControlPlane:
     def _guard(self, fn: Callable[[], dict]) -> dict:
         if not self.config.enabled:
             return {"unavailable": "control plane disabled (ELASTICACHE_CONTROL_PLANE=false)"}
+        outer, self._truncations = self._truncations, []
+        try:
+            result = self._guard_inner(fn)
+            if self._truncations and "unavailable" not in result and "error" not in result:
+                notes = [*result.get("notes", []), *self._truncations]
+                result = {**result, "partial": True, "notes": notes}
+            return result
+        finally:
+            self._truncations = [*outer, *self._truncations]
+
+    def _guard_inner(self, fn: Callable[[], dict]) -> dict:
         try:
             return fn()
-        except NoCredentialsError:
-            return {"unavailable": "no AWS credentials found; control-plane tools are optional"}
-        except NoRegionError:
-            return {"unavailable": "no AWS region configured (set AWS_REGION)"}
+        except NoCredentialsError as exc:
+            return {
+                "unavailable": "no AWS credentials found; control-plane tools are optional",
+                "error": type(exc).__name__,
+                "hint": botocore_hint(exc),
+            }
+        except NoRegionError as exc:
+            return {
+                "unavailable": "no AWS region configured (set AWS_REGION)",
+                "error": type(exc).__name__,
+                "hint": botocore_hint(exc),
+            }
         except ClientError as exc:
             err = exc.response.get("Error", {})
             code = err.get("Code", "ClientError")
             return _error_result(code, err.get("Message", str(exc)))
         except BotoCoreError as exc:
-            return _error_result(type(exc).__name__, str(exc))
+            res = _error_result(type(exc).__name__, str(exc))
+            return {**res, "hint": res.get("hint") or botocore_hint(exc)}
+
+    def _pages(self, label: str, fetch: Callable[[str | None], dict], token_key: str) -> Iterator[dict]:
+        """Yield pages of a Describe*/List* call, following ``token_key`` until it ends.
+
+        Stops after MAX_PAGES pages or when the service hands back a token it already returned, and
+        records a note so the enclosing tool reports ``partial``. Every list loop goes through here."""
+        token: str | None = None
+        seen: set[str] = set()
+        for _ in range(MAX_PAGES):
+            page = fetch(token)
+            yield page
+            token = page.get(token_key)
+            if not token:
+                return
+            if token in seen:
+                self._truncations.append(f"{label}: repeated {token_key} from the service; listing stopped early")
+                return
+            seen.add(token)
+        self._truncations.append(f"{label}: stopped after {MAX_PAGES} pages; results are truncated")
 
     def _paginate(self, op: str, key: str, **kwargs) -> list[dict]:
         if not op.startswith(ALLOWED_PREFIXES):  # belt and braces: never call a write API
             raise ValueError(f"refusing non-read-only API call {op!r}")
         ec = self.client("elasticache")
         items: list[dict] = []
-        marker = None
-        while True:
-            call = dict(kwargs)
-            if marker:
-                call["Marker"] = marker
-            page = getattr(ec, op)(**call)
+        for page in self._pages(op, lambda m: getattr(ec, op)(**({**kwargs, "Marker": m} if m else kwargs)), "Marker"):
             items.extend(page.get(key, []))
-            marker = page.get("Marker")
-            if not marker:
-                return items
+        return items
 
     # ---------------------------------------------------------------- tools
     def replication_groups(self, replication_group_id: str | None = None) -> dict:
@@ -613,19 +681,168 @@ class ControlPlane:
 
         return self._guard(run)
 
+    def memcached_discovery(
+        self, cache_cluster_id: str, host: str | None = None, port: int | None = None, timeout: float = 5.0
+    ) -> dict:
+        """Diff a Memcached cluster's auto-discovery config (``config get cluster``) with DescribeCacheClusters nodes.
+
+        ``host`` defaults to the cluster's configuration endpoint. Findings first; an unreachable endpoint is a
+        finding, never an exception."""
+
+        def run() -> dict:
+            clusters = self._paginate(
+                "describe_cache_clusters", "CacheClusters", CacheClusterId=cache_cluster_id, ShowCacheNodeInfo=True
+            )
+            cluster = next((c for c in clusters if c.get("CacheClusterId") == cache_cluster_id), None)
+            if cluster is None:
+                return _error_result("CacheClusterNotFound", f"no cache cluster {cache_cluster_id!r}")
+            if str(cluster.get("Engine", "")).lower() != "memcached":
+                return _error_result(
+                    "NotMemcached", f"{cache_cluster_id} runs {cluster.get('Engine')}: discovery applies to memcached"
+                )
+            report = memcached.discovery_report(cluster, host, port, timeout)
+            aws_nodes = [
+                f"{(n.get('Endpoint') or {}).get('Address')}:{(n.get('Endpoint') or {}).get('Port')}"
+                for n in cluster.get("CacheNodes", [])
+            ]
+            return {**report, "aws_nodes": aws_nodes}
+
+        return self._guard(run)
+
+    # ------------------------------------------------------------ cost overview
+    def cost_overview_fan_out(self, region: str | None = None) -> dict:
+        """``cost_overview`` over every region in ELASTICACHE_REGIONS (or just ``region``), one shared deadline."""
+        targets = self._target_regions(region)
+        if len(targets) == 1:
+            return self.in_region(targets[0]).cost_overview()
+        deadline = _monotonic() + FLEET_DEADLINE_SECONDS
+        findings: list[dict] = []
+        groups: list[dict] = []
+        serverless: list[dict] = []
+        notes: list[str] = []
+        failures: dict[str, dict] = {}
+        for target in targets:
+            if _monotonic() >= deadline:
+                failures[str(target)] = _fleet_deadline_error()
+                continue
+            result = self.in_region(target).cost_overview(deadline)
+            if _fleet_failed(result):
+                failures[str(target)] = result
+                continue
+            findings += [{**f, "region": target} for f in result["findings"]]
+            groups += [{**g, "region": target} for g in result["groups"]]
+            serverless += [{**s, "region": target} for s in result["serverless"]]
+            notes += [f"{target}: {n}" for n in result.get("notes", [])]
+        ordered = _sorted_findings(findings)
+        out: dict[str, Any] = {
+            "regions": [str(t) for t in targets],
+            "window_days": COST_WINDOW_DAYS,
+            "findings": ordered[:MAX_FLEET_FINDINGS],
+            "findings_total": len(ordered),
+            "truncated": len(ordered) > MAX_FLEET_FINDINGS,
+            "groups": groups,
+            "serverless": serverless,
+        }
+        if notes or failures:
+            out["partial"] = True
+            out["notes"] = notes
+        if failures:
+            out["region_errors"] = failures
+        return out
+
+    def cost_overview(self, deadline: float | None = None) -> dict:
+        """Fleet cost and right-sizing in one call: per replication group and serverless cache.
+
+        Joins node type and count, reserved coverage, 14-day peak memory/CPU and replica read activity, and flags
+        oversized nodes, idle replicas, on-demand nodes, non-Graviton families, old manual snapshots and uncapped
+        serverless caches. At most MAX_COST_GROUPS groups get a GetMetricData call (one each) and no call is made
+        once ``deadline`` (a ``time.monotonic`` value) passes; what was skipped is listed in ``notes``."""
+
+        def run() -> dict:
+            now = self._clock()
+            notes: list[str] = []
+            groups = self._paginate("describe_replication_groups", "ReplicationGroups")
+            reserved = self._best_effort(lambda: self._paginate("describe_reserved_cache_nodes", "ReservedCacheNodes"))
+            snaps = self._best_effort(
+                lambda: self._paginate("describe_snapshots", "Snapshots", SnapshotSource="manual")
+            )
+            caches = self._best_effort(lambda: self._paginate_token("describe_serverless_caches", "ServerlessCaches"))
+            for label, got in (("reservations", reserved), ("manual snapshots", snaps), ("serverless caches", caches)):
+                if got is None:
+                    notes.append(f"{label} not checked: the Describe call failed")
+            held = _reserved_nodes_held(reserved or [])
+            versions = self._member_engine_versions()
+            rows: list[dict] = []
+            findings: list[dict] = []
+            for i, g in enumerate(groups):
+                gid = str(g.get("ReplicationGroupId"))
+                members = [str(m) for m in g.get("MemberClusters", [])]
+                replicas = [
+                    str(m.get("CacheClusterId"))
+                    for ng in g.get("NodeGroups", [])
+                    for m in ng.get("NodeGroupMembers", [])
+                    if m.get("CurrentRole") == "replica"
+                ]
+                metrics: dict[str, dict[str, dict]] = {}
+                if members and (i >= MAX_COST_GROUPS or (deadline is not None and _monotonic() >= deadline)):
+                    notes.append(f"{gid}: no CloudWatch call (limit of {MAX_COST_GROUPS} groups or deadline reached)")
+                elif members:
+                    metrics = self._cost_metrics(members, False)
+                engine = versions.get(gid, (str(g.get("Engine") or ""), ""))[0].lower()
+                row, found = _cost_group(g, gid, members, replicas, metrics, held, engine)
+                rows.append(row)
+                findings += found
+            names = [str(c.get("ServerlessCacheName")) for c in (caches or [])][:MAX_COST_GROUPS]
+            sl_metrics: dict[str, dict[str, dict]] = {}
+            if names and deadline is not None and _monotonic() >= deadline:
+                notes.append("serverless metrics skipped: deadline reached")
+            elif names:
+                sl_metrics = self._cost_metrics(names, True)
+            serverless_rows: list[dict] = []
+            for c in caches or []:
+                row, found = _cost_serverless(c, sl_metrics.get(str(c.get("ServerlessCacheName")), {}))
+                serverless_rows.append(row)
+                findings += found
+            snap_row, snap_found = _cost_manual_snapshots(snaps or [], now)
+            findings += snap_found
+            ordered = _sorted_findings(findings)
+            out: dict[str, Any] = {
+                "window_days": COST_WINDOW_DAYS,
+                "findings": ordered[:MAX_FLEET_FINDINGS],
+                "findings_total": len(ordered),
+                "truncated": len(ordered) > MAX_FLEET_FINDINGS,
+                "groups": rows,
+                "serverless": serverless_rows,
+                "manual_snapshots": snap_row,
+            }
+            if notes:
+                out["partial"] = True
+                out["notes"] = notes
+            return out
+
+        return self._guard(run)
+
+    def _cost_metrics(self, targets: list[str], serverless: bool) -> dict[str, dict[str, dict]]:
+        """One GetMetricData call (hourly points over COST_WINDOW_DAYS); empty when CloudWatch denies it."""
+        names = COST_SERVERLESS_METRICS if serverless else COST_METRICS
+        try:
+            summary, _, _ = self._collect_metrics(
+                targets, names, COST_WINDOW_DAYS * 24 * 60, 3600, None, serverless, rightsizing=False
+            )
+        except (BotoCoreError, ClientError):
+            return {}
+        return summary
+
     def _paginate_token(self, op: str, key: str, **kwargs) -> list[dict]:
         """Like _paginate, for the serverless operations that page with NextToken."""
         if not op.startswith(ALLOWED_PREFIXES):
             raise ValueError(f"refusing non-read-only API call {op!r}")
         ec = self.client("elasticache")
         items: list[dict] = []
-        token = None
-        while True:
-            page = getattr(ec, op)(**({**kwargs, "NextToken": token} if token else kwargs))
+        pages = self._pages(op, lambda t: getattr(ec, op)(**({**kwargs, "NextToken": t} if t else kwargs)), "NextToken")
+        for page in pages:
             items.extend(page.get(key, []))
-            token = page.get("NextToken")
-            if not token:
-                return items
+        return items
 
     def serverless_caches(self) -> dict:
         def run() -> dict:
@@ -720,29 +937,24 @@ class ControlPlane:
                     + (["CPUCreditBalance"] if not memcached and is_burstable(c.get("CacheNodeType")) else []),
                 }
             )
-        ec = self.client("elasticache")
-        token = None
-        while True:
-            page = ec.describe_serverless_caches(**({"NextToken": token} if token else {}))
-            for c in page.get("ServerlessCaches", []):
-                sid = str(c.get("ServerlessCacheName"))
-                targets.append(
-                    {"id": sid, "kind": "serverless", "members": [sid], "metrics": list(SERVERLESS_RECOMMENDED_ALARMS)}
-                )
-            token = page.get("NextToken")
-            if not token:
-                return targets
+        for c in self._paginate_token("describe_serverless_caches", "ServerlessCaches"):
+            sid = str(c.get("ServerlessCacheName"))
+            targets.append(
+                {"id": sid, "kind": "serverless", "members": [sid], "metrics": list(SERVERLESS_RECOMMENDED_ALARMS)}
+            )
+        return targets
 
     def _describe_alarms(self) -> list[dict]:
         cw = self.client("cloudwatch")
         out: list[dict] = []
-        token = None
-        while True:
-            page = cw.describe_alarms(AlarmTypes=["MetricAlarm"], **({"NextToken": token} if token else {}))
+        pages = self._pages(
+            "describe_alarms",
+            lambda t: cw.describe_alarms(AlarmTypes=["MetricAlarm"], **({"NextToken": t} if t else {})),
+            "NextToken",
+        )
+        for page in pages:
             out.extend(a for a in page.get("MetricAlarms", []) if a.get("Namespace") == ALARM_NAMESPACE)
-            token = page.get("NextToken")
-            if not token:
-                return out
+        return out
 
     def alarms(self, replication_group_id: str | None = None) -> dict:
         """CloudWatch alarm coverage for ElastiCache: findings first, then the alarms and per-target gaps.
@@ -1679,18 +1891,17 @@ class ControlPlane:
         points: dict[str, dict[str, list[tuple[dt.datetime, float]]]] = defaultdict(lambda: defaultdict(list))
         for i in range(0, len(queries), MAX_QUERIES_PER_CALL):
             chunk = queries[i : i + MAX_QUERIES_PER_CALL]
-            token = None
-            while True:
-                kwargs: dict[str, Any] = {"MetricDataQueries": chunk, "StartTime": start, "EndTime": end}
-                if token:
-                    kwargs["NextToken"] = token
-                resp = cw.get_metric_data(**kwargs)
+            pages = self._pages(
+                "get_metric_data",
+                lambda t, chunk=chunk: cw.get_metric_data(
+                    MetricDataQueries=chunk, StartTime=start, EndTime=end, **({"NextToken": t} if t else {})
+                ),
+                "NextToken",
+            )
+            for resp in pages:
                 for res in resp.get("MetricDataResults", []):
                     target, _, name = res["Label"].rpartition("|")
                     points[target][name].extend(zip(res.get("Timestamps", []), res.get("Values", []), strict=False))
-                token = resp.get("NextToken")
-                if not token:
-                    break
         series: dict[str, dict[str, dict]] = {}
         summary: dict[str, dict[str, dict]] = {}
         findings: list[dict] = []
@@ -2144,6 +2355,171 @@ class ControlPlane:
             if caches:
                 out[target] = caches[0].get("CacheUsageLimits") or {}
         return out
+
+
+_GRAVITON_FAMILY = re.compile(r"^cache\.[a-z]+\d+g")
+
+
+def _is_graviton(node_type: str | None) -> bool:
+    return bool(_GRAVITON_FAMILY.match(str(node_type or "")))
+
+
+def _reserved_nodes_held(reserved: list[dict]) -> Counter[tuple[str, str]]:
+    """Active reserved nodes per (node type, engine)."""
+    held: Counter[tuple[str, str]] = Counter()
+    for r in reserved:
+        v = _reserved_view(r)
+        if v["state"] == "active":
+            held[(str(v["node_type"]), str(v["product"]).lower())] += int(v["count"] or 0)
+    return held
+
+
+def _cost_group(
+    g: dict,
+    gid: str,
+    members: list[str],
+    replicas: list[str],
+    metrics: dict[str, dict[str, dict]],
+    held: Counter[tuple[str, str]],
+    engine: str,
+) -> tuple[dict, list[dict]]:
+    """Row and findings for one replication group (see ControlPlane.cost_overview)."""
+    node_type = g.get("CacheNodeType")
+    nodes = len(members)
+    out: list[dict] = []
+
+    def add(sev: str, msg: str, **extra: Any) -> None:
+        out.append(finding(sev, msg, resource=gid, category="cost", **extra))
+
+    def peak(name: str) -> float | None:
+        values = [
+            s["max"]
+            for m in members
+            if (s := (metrics.get(m) or {}).get(name)) and s.get("points", 0) >= MIN_COST_POINTS
+        ]
+        return max(values) if values else None
+
+    mem_peak, cpu_peak = peak("DatabaseMemoryUsagePercentage"), peak("EngineCPUUtilization")
+    window = f"over {COST_WINDOW_DAYS} days"
+    if mem_peak is not None and mem_peak < OVERSIZED_MEMORY_PEAK:
+        add(
+            "warning" if nodes > 2 else "info",
+            f"{nodes} x {node_type}: peak memory {mem_peak:.0f}% {window} (under {OVERSIZED_MEMORY_PEAK:.0f}%); "
+            "a smaller node type would likely carry this dataset",
+            hint="oversized",
+        )
+    idle = [
+        m
+        for m in replicas
+        if (s := (metrics.get(m) or {}).get("GetTypeCmds")) and s.get("points", 0) >= MIN_COST_POINTS and not s["sum"]
+    ]
+    if idle:
+        add(
+            "warning",
+            f"{len(idle)} replica(s) served no read commands {window} ({', '.join(idle[:5])}): drop them if they "
+            "exist only as read capacity (keep one per shard for failover)",
+            hint="idle-replicas",
+        )
+    reserved_here = (
+        held.get((str(node_type), engine), 0)
+        if engine
+        else sum(n for (nt, _), n in held.items() if nt == str(node_type))
+    )
+    covered = min(nodes, reserved_here)
+    if nodes and not covered:
+        add(
+            "info",
+            f"{nodes} on-demand {node_type} node(s) with no active reservation; steady load is a reserved-node "
+            "candidate",
+            hint="reserved",
+        )
+    elif nodes and covered < nodes:
+        add(
+            "info",
+            f"{nodes - covered} of {nodes} {node_type} node(s) are not covered by a reservation",
+            hint="reserved",
+        )
+    if nodes and str(node_type).startswith("cache.") and not _is_graviton(node_type) and not is_burstable(node_type):
+        add(
+            "info",
+            f"{node_type} is not a Graviton family: the g-suffixed equivalent (for example m7g or r7g) is usually "
+            "cheaper at equal size",
+            hint="graviton",
+        )
+    row = {
+        "id": gid,
+        "engine": engine or None,
+        "node_type": node_type,
+        "shards": len(g.get("NodeGroups", [])),
+        "nodes": nodes,
+        "replicas": len(replicas),
+        "reserved_nodes_covering": covered,
+        "peak_memory_percent": round(mem_peak, 1) if mem_peak is not None else None,
+        "peak_engine_cpu_percent": round(cpu_peak, 1) if cpu_peak is not None else None,
+        "idle_replicas": idle,
+        "metrics_checked": bool(metrics),
+        "findings_total": len(out),
+    }
+    return row, out
+
+
+def _cost_serverless(c: dict, summary: dict[str, dict]) -> tuple[dict, list[dict]]:
+    name = str(c.get("ServerlessCacheName"))
+    limits = c.get("CacheUsageLimits") or {}
+    storage_cap = (limits.get("DataStorage") or {}).get("Maximum")
+    ecpu_cap = (limits.get("ECPUPerSecond") or {}).get("Maximum")
+    out: list[dict] = []
+    missing = [label for label, cap in (("DataStorage", storage_cap), ("ECPUPerSecond", ecpu_cap)) if cap is None]
+    if missing:
+        out.append(
+            finding(
+                "warning",
+                f"serverless cache is uncapped ({' and '.join(missing)} maximum unset): cost grows with load",
+                resource=name,
+                category="cost",
+                hint="uncapped",
+            )
+        )
+    ecpu = summary.get("ElastiCacheProcessingUnits") or {}
+    used = summary.get("BytesUsedForCache") or {}
+    row = {
+        "id": name,
+        "engine": c.get("Engine"),
+        "data_storage_max": storage_cap,
+        "ecpu_per_second_max": ecpu_cap,
+        "peak_bytes_used": used.get("max") if used.get("points") else None,
+        "peak_ecpu_per_second": round(ecpu["max"] / 3600, 2) if ecpu.get("points") else None,
+        "findings_total": len(out),
+    }
+    return row, out
+
+
+def _cost_manual_snapshots(snaps: list[dict], now: dt.datetime) -> tuple[dict, list[dict]]:
+    views = [v for v in (_snapshot_view(s, now) for s in snaps) if not v["automatic"]]
+    old = sorted(
+        (v for v in views if v["age_hours"] is not None and v["age_hours"] >= OLD_MANUAL_SNAPSHOT_DAYS * 24),
+        key=lambda v: -v["age_hours"],
+    )
+    size = sum(v["size_bytes"] or 0 for v in old)
+    out = []
+    if old:
+        out.append(
+            finding(
+                "info",
+                f"{len(old)} manual snapshot(s) older than {OLD_MANUAL_SNAPSHOT_DAYS} days"
+                + (f" holding {size / 1024**3:.1f} GiB" if size else "")
+                + f" (oldest {old[0]['name']}): manual snapshots are billed until deleted",
+                category="cost",
+                hint="old-snapshots",
+            )
+        )
+    row = {
+        "manual_count": len(views),
+        "old_count": len(old),
+        "old_size_bytes": size or None,
+        "oldest": [{"name": v["name"], "age_days": int(v["age_hours"] // 24)} for v in old[:5]],
+    }
+    return row, out
 
 
 def _tag_ownership(tags: dict[str, str]) -> dict[str, str]:

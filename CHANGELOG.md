@@ -3,6 +3,10 @@
 ## Unreleased
 
 ### Added
+- Round 12: every control-plane pagination loop stops at 50 pages or on a repeated token and reports `partial` with a
+  note; `memcached_discovery` (`config get cluster` joins the memcached allowlist); `aws_cost_overview`; Valkey quirks
+  in data-plane findings and EOL findings only for engine redis; botocore connection errors in every `aws_*` tool
+  return `error` and `hint`; integration job reachable via `workflow_dispatch` and a PR label, `integration.ps1` marks SKIPPED.
 - Round 11: `node_pubsub` (`PUBSUB CHANNELS`/`NUMSUB`/`NUMPAT`/`SHARDCHANNELS` added to the `SafeRedis` allowlist with
   bounds: one glob of at most 128 chars, at most 100 channels per `NUMSUB`) reports channel and pattern-subscription
   counts, top channels by subscribers and findings for many patterns, large pubsub output buffers and idle

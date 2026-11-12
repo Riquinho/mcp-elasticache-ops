@@ -24,10 +24,11 @@ function Invoke-Docker {
 
 $free = [math]::Round((Get-PSDrive -Name $Drive).Free / 1GB, 1)
 if ($free -lt $MinFreeGB) {
-    Write-Host "disk gate: ${free}G free on ${Drive}: (< ${MinFreeGB}G); skipping integration, run the unit suite only"
+    Write-Host "disk gate: ${free}G free on ${Drive}: (< ${MinFreeGB}G required)"
+    Write-Host "INTEGRATION SKIPPED: not enough disk, nothing was started. Trigger the CI integration job instead (workflow_dispatch or the 'integration' PR label)."
     exit 0
 }
-Write-Host "disk gate: ${free}G free on ${Drive}:, running integration"
+Write-Host "disk gate: ${free}G free on ${Drive}: (>= ${MinFreeGB}G), running integration"
 
 if ($Wsl) {
     $winPath = (Join-Path $root $ComposeFile)

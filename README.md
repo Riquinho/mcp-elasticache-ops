@@ -10,7 +10,7 @@ written from scratch for ElastiCache.
 
 ## Tools
 
-All 45 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
+All 47 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 
 **Data plane** (redis-py, talks to the node endpoint)
 
@@ -38,6 +38,7 @@ All 45 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `node_acl_log` | `ACL WHOAMI` + `ACL LOG` (optional count): auth failures and denied commands aggregated by reason and user, client info reduced and redacted, findings on bursts. `ACL LIST`, `GETUSER`, `SETUSER`, `DELUSER` and `LOG RESET` stay refused |
 | `memcached_stats` | Memcached `stats` summary (hit ratio, memory, evictions; evictions are put in context of hit ratio and fill level) or a raw stats group |
 | `memcached_cluster_stats` | Fan-out over `MEMCACHED_NODES` (bounded concurrency, per-node timeout), only `stats`, `stats slabs`, `stats items`. Findings first: evictions, hit-ratio outliers vs the median, item/memory imbalance, `listen_disabled_num`, connections near maxconns, slab classes evicting or out of memory, one class holding most pages, evictions with a low hit ratio, evictions far below the memory limit (slab imbalance), a near-full node of huge items, and an auto-discovery endpoint listed in `MEMCACHED_NODES`. A dead node gives `status: partial` |
+| `memcached_discovery` | Reads `config get cluster` from one node (ElastiCache auto discovery, read-only) and compares the advertised node list with `DescribeCacheClusters`: critical for an AWS node missing from the config, warning for a stale entry or version mismatch, info for a node still creating. |
 
 **Control plane** (boto3, optional)
 
@@ -63,6 +64,7 @@ All 45 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `aws_cluster_overview` | One findings-first call per replication group: shards, replicas per shard, AZ spread, failover, engine version joined with per-node CloudWatch (EngineCPU, memory %, ReplicationLag, Evictions, CurrConnections, NewConnections). Flags nodes above 1.5x the peer median, reader endpoint gaps and right-sizing (memory p95 < 30% and CPU p95 < 20%; data tiering for r6gd). Worst-first, bounded; `GetMetricData` denied gives `status: partial` |
 | `aws_alarms` | `DescribeAlarms` (AWS/ElastiCache, paginated, optional `replication_group_id`): alarms in ALARM, INSUFFICIENT_DATA or with actions disabled, and members with no alarm on EngineCPUUtilization, DatabaseMemoryUsagePercentage, Evictions, ReplicationLag, CurrConnections, SwapUsage (plus ThrottledCmds on Serverless). Denied `DescribeAlarms` gives `partial: true`. Without `replication_group_id` it fans out over every configured region with per-region error isolation (`region_errors`) and a shared deadline |
 | `aws_maintenance` | `DescribeUpdateActions`, `DescribeServiceUpdates` and `DescribeCacheClusters` (read-only, optional `replication_group_id`): pending service-update actions grouped per update, required updates past their apply-by date (critical), a `PreferredMaintenanceWindow` that overlaps the `SnapshotWindow` of the same node, and end-of-life engines (Redis OSS <= 6.x, Memcached < 1.6). A denied call gives `partial: true`. Without a group id it fans out over every configured region with per-region error isolation (`region_errors`) |
+| `aws_cost_overview` | Findings-first cost and right-sizing across groups and serverless caches: node type and count, reserved coverage, 14-day peak memory/CPU (one `GetMetricData` call per group, capped, one deadline). Flags oversized nodes, idle replicas, on-demand and non-Graviton nodes, old manual snapshots, uncapped serverless. |
 | `aws_engine_versions` | `DescribeCacheEngineVersions` for `redis`, `valkey` or `memcached` (optional `version_prefix`): versions with parameter group family and upgrade targets (latest minor of each major, latest Valkey for Redis OSS) |
 | `aws_parameter_groups` | `DescribeCacheParameterGroups` joined with running clusters: family, users of each group, unused custom groups (info), family differing from the running engine (warning) |
 | `aws_parameter_drift` | Diff of two parameter groups: only modified parameters whose values differ, family mismatch, important parameters flagged |
@@ -191,7 +193,7 @@ Generated from `safe_client.py`; the tests fail if this drifts from the code.
 - `CONFIG GET` exact names: `appendfsync`, `appendonly`, `client-query-buffer-limit`, `cluster-allow-reads-when-down`, `cluster-enabled`, `cluster-node-timeout`, `cluster-require-full-coverage`, `databases`, `dynamic-hz`, `hz`, `io-threads`, `lfu-decay-time`, `lfu-log-factor`, `maxclients`, `min-replicas-max-lag`, `min-replicas-to-write`, `notify-keyspace-events`, `proto-max-bulk-len`, `rdbcompression`, `repl-backlog-size`, `repl-backlog-ttl`, `repl-diskless-sync`, `replica-read-only`, `save`, `tcp-keepalive`, `timeout`
 - `CONFIG GET` prefixes: `maxmemory*`, `slowlog-*`, `latency-*`, `activedefrag*`, `active-defrag-*`, `lazyfree-*`, `hash-max-*`, `list-max-*`, `set-max-*`, `zset-max-*`, `client-output-buffer-limit*`
 - Always refused (self-tested never to be allowed): `ACL`, `ACL DELUSER`, `ACL GETUSER`, `ACL LIST`, `ACL LOG RESET`, `ACL SETUSER`, `AUTH`, `BGREWRITEAOF`, `BGSAVE`, `CLIENT KILL`, `CLIENT PAUSE`, `CLIENT REPLY`, `CLIENT TRACKING`, `CLIENT UNPAUSE`, `CLUSTER FAILOVER`, `CLUSTER RESET`, `CONFIG RESETSTAT`, `CONFIG REWRITE`, `CONFIG SET`, `DEBUG`, `DEL`, `DUMP`, `EVAL`, `EVALSHA`, `EXEC`, `EXPIRE`, `FAILOVER`, `FCALL`, `FLUSHALL`, `FLUSHDB`, `FUNCTION`, `GET`, `HELLO`, `HGET`, `HGETALL`, `KEYS`, `LATENCY RESET`, `LRANGE`, `MEMORY PURGE`, `MGET`, `MIGRATE`, `MODULE LOAD`, `MONITOR`, `MULTI`, `OBJECT HELP`, `PSUBSCRIBE`, `PSYNC`, `PUBLISH`, `PUBSUB`, `PUBSUB HELP`, `PUBSUB SHARDNUMSUB`, `REPLICAOF`, `RESTORE`, `SAVE`, `SCRIPT`, `SCRIPT FLUSH`, `SCRIPT LOAD`, `SET`, `SHUTDOWN`, `SLAVEOF`, `SLOWLOG RESET`, `SMEMBERS`, `SORT`, `SSUBSCRIBE`, `SUBSCRIBE`, `SYNC`, `UNLINK`, `WATCH`, `XRANGE`, `XREAD`, `XREADGROUP`, `ZRANGE`
-- Memcached: only `stats`, `stats settings|slabs|items|conns` and `version`.
+- Memcached: only `stats`, `stats settings|slabs|items|conns`, `config get cluster` and `version`.
 - AWS: operation names must start with `describe_`, `list_` or `get_metric_data`.
 <!-- allowlist:end -->
 
@@ -307,7 +309,7 @@ scripts/cluster-integration.sh   # 3-node valkey cluster via tests/docker-compos
 
 Disk gate: the integration scripts pull images and grow the WSL vhdx, so run them only with at least 5G free on the
 system drive (`df -h /c`). Below that, skip integration and rely on the unit suite. CI runs the integration job
-weekly (`on.schedule`) as well as on push, so drift in the live-server tests shows up without a code change. Tests that
+weekly (`on.schedule`) and on push, and on demand through `workflow_dispatch` or the `integration` pull-request label, so drift in the live-server tests shows up without a code change. Tests that
 start Docker must remove their own containers and volumes (`--rm`, `down -v`).
 
 The cluster test (`tests/test_dataplane_integration.py`, marker `integration`, needs `CLUSTER_TEST_HOST` and

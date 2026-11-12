@@ -13,6 +13,7 @@ from collections.abc import Callable
 from functools import lru_cache
 from typing import Annotated, Any, Literal
 
+import botocore.exceptions
 import redis
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -21,7 +22,7 @@ from pydantic import Field
 from . import dataplane, memcached
 from .config import ControlPlaneConfig, DataPlaneConfig, MemcachedConfig, max_output_chars
 from .connection import build_client
-from .controlplane import REGION_PATTERN, ControlPlane
+from .controlplane import REGION_PATTERN, ControlPlane, botocore_hint
 from .safe_client import SafeRedis
 
 log = logging.getLogger("mcp_elasticache_ops")
@@ -111,7 +112,9 @@ def connection_error_result(exc: BaseException) -> dict:
     """Structured result for a network failure towards a node: error type, message and a next step."""
     name, message = type(exc).__name__, str(exc)
     low = message.lower()
-    if isinstance(exc, redis.exceptions.AuthenticationError):
+    if isinstance(exc, botocore.exceptions.BotoCoreError):
+        hint = botocore_hint(exc)
+    elif isinstance(exc, redis.exceptions.AuthenticationError):
         hint = "The node rejected the credentials; check ELASTICACHE_USERNAME and ELASTICACHE_PASSWORD(_FILE)."
     elif "ssl" in low or "tls" in low or "certificate" in low or "handshake" in low:
         hint = (
@@ -132,13 +135,36 @@ def connection_error_result(exc: BaseException) -> dict:
     return {"error": name, "message": message, "hint": hint}
 
 
+def _lift_total_failure(result: Any) -> Any:
+    """When every region of a fleet call failed, surface the first failure's error and hint at the top level."""
+    if not isinstance(result, dict) or "error" in result:
+        return result
+    sections = result.get("sections")
+    if isinstance(sections, list) and sections and all(sec.get("status") == "unavailable" for sec in sections):
+        names = {str(sec.get("summary", "")).partition(":")[0] for sec in sections} - {"_TriageEmpty"}
+        known = {n for n in names if hasattr(botocore.exceptions, n) and n != "ClientError"}
+        if len(known) == 1 and len(names) == 1:
+            name = known.pop()
+            first = next(sec for sec in sections if str(sec.get("summary", "")).startswith(name))
+            return {"error": name, "message": first["summary"], "hint": botocore_hint(name), **result}
+    failures = result.get("region_errors")
+    regions = result.get("regions")
+    if not failures or not isinstance(regions, list) or len(failures) < len(regions):
+        return result
+    first = next(iter(failures.values()))
+    if not isinstance(first, dict) or not first.get("error"):
+        return result
+    lifted = {k: first[k] for k in ("error", "message", "hint") if first.get(k)}
+    return {**lifted, **result}
+
+
 def _guarded(fn: Callable[..., Any]) -> Callable[..., Any]:
     """Turn connection failures into a structured error result instead of a raw exception."""
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         try:
-            return fn(*args, **kwargs)
+            return _lift_total_failure(fn(*args, **kwargs))
         except (
             redis.exceptions.ConnectionError,
             redis.exceptions.TimeoutError,
@@ -146,6 +172,7 @@ def _guarded(fn: Callable[..., Any]) -> Callable[..., Any]:
             TimeoutError,
             socket.gaierror,
             ssl.SSLError,
+            botocore.exceptions.BotoCoreError,
         ) as exc:
             return connection_error_result(exc)
 
@@ -460,6 +487,18 @@ def memcached_cluster_stats() -> dict:
     return memcached.cluster_stats(cfg.nodes, cfg.timeout)
 
 
+@read_tool
+def memcached_discovery(
+    cache_cluster_id: Annotated[str, Field(min_length=1, max_length=50, description="Memcached cache cluster id")],
+    region: Region = None,
+) -> dict:
+    """Memcached auto-discovery check: reads `config get cluster` (read-only; MEMCACHED_HOST or the cluster's
+    configuration endpoint) and compares it with DescribeCacheClusters nodes. Flags AWS nodes missing from the
+    config, stale entries and engine version mismatch. An unreachable endpoint is a finding."""
+    cfg = MemcachedConfig.from_env()
+    return _cp(region).memcached_discovery(cache_cluster_id, cfg.host, cfg.port if cfg.host else None, cfg.timeout)
+
+
 # --------------------------------------------------------------- control plane
 
 
@@ -716,6 +755,15 @@ def aws_cluster_overview(
     if replication_group_id:
         return _cp(region).cluster_overview(replication_group_id, minutes)
     return control_plane().cluster_overview_fan_out(None, minutes, region)
+
+
+@read_tool
+def aws_cost_overview(region: Region = None) -> dict:
+    """Fleet cost and right-sizing, findings first: per replication group and serverless cache, node type and
+    count, reserved coverage, 14-day peak memory/CPU. Flags oversized nodes (peak memory under 30%), idle
+    replicas, on-demand and non-Graviton nodes, old manual snapshots, uncapped serverless. Bounded GetMetricData
+    calls under one deadline; all ELASTICACHE_REGIONS unless `region` is set."""
+    return control_plane().cost_overview_fan_out(region)
 
 
 # ------------------------------------------------------------------- on-call prompts

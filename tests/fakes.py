@@ -177,7 +177,22 @@ AUDIT_AWS_RESPONSES: dict[str, dict[str, Any]] = {
                 "EngineVersion": "7.1.0",
                 "CacheNodeType": "cache.r6g.large",
                 "CacheClusterStatus": "available",
-            }
+            },
+            {
+                "CacheClusterId": "audit-mc",
+                "Engine": "memcached",
+                "EngineVersion": "1.6.21",
+                "CacheNodeType": "cache.r6g.large",
+                "CacheClusterStatus": "available",
+                "ConfigurationEndpoint": {"Address": "audit-mc.cfg.use1.cache.amazonaws.com", "Port": 11211},
+                "CacheNodes": [
+                    {
+                        "CacheNodeId": "0001",
+                        "CacheNodeStatus": "available",
+                        "Endpoint": {"Address": "audit-mc.0001.use1.cache.amazonaws.com", "Port": 11211},
+                    }
+                ],
+            },
         ]
     },
     "DescribeServerlessCaches": {
@@ -314,6 +329,10 @@ class AuditSocket:
         self.sent.append(command)
         if command == "version":
             self._reply = b"VERSION 1.6.21\r\n"
+        elif command == "config get cluster":
+            self._reply = (
+                b"CONFIG cluster 0 60\r\n2\naudit-mc.0001.use1.cache.amazonaws.com|10.0.0.9|11211 \n\r\nEND\r\n"
+            )
         else:
             self._reply = b"STAT pid 1\r\nSTAT curr_connections 3\r\nSTAT limit_maxbytes 1048576\r\nEND\r\n"
 

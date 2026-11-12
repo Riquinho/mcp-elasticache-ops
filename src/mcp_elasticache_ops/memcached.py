@@ -1,6 +1,7 @@
 """Minimal read-only Memcached stats client (text protocol, no dependency).
 
-Only ``stats``, ``stats <group>`` and ``version`` are ever sent.
+Only ``stats``, ``stats <group>``, ``version`` and the exact auto-discovery read ``config get cluster``
+are ever sent.
 """
 
 from __future__ import annotations
@@ -13,7 +14,8 @@ from concurrent.futures import TimeoutError as FuturesTimeout
 ALLOWED_STAT_GROUPS = {"", "settings", "slabs", "items", "conns"}
 
 
-ALLOWED_COMMANDS = {f"stats {g}".strip() for g in ALLOWED_STAT_GROUPS} | {"version"}
+CONFIG_CLUSTER_COMMAND = "config get cluster"  # read-only auto-discovery listing; `config set` stays blocked
+ALLOWED_COMMANDS = {f"stats {g}".strip() for g in ALLOWED_STAT_GROUPS} | {"version", CONFIG_CLUSTER_COMMAND}
 
 
 def _query(host: str, port: int, command: str, timeout: float) -> list[str]:
@@ -377,4 +379,119 @@ def cluster_stats(
             "median_hit_ratio": round(statistics.median(hits_known), 4) if hits_known else None,
         },
         "nodes": views,
+    }
+
+
+# ------------------------------------------------------------------ auto-discovery check
+
+
+def parse_config_cluster(lines: list[str]) -> dict:
+    """Parse the reply of ``config get cluster``: ``CONFIG cluster 0 <n>``, a version, then ``host|ip|port ...``."""
+    tokens = " ".join(lines).split()
+    if tokens[:2] == ["CONFIG", "cluster"]:
+        tokens = tokens[4:]  # CONFIG cluster <flags> <bytes>
+    if not tokens or not tokens[0].isdigit():
+        raise ValueError("unexpected reply to config get cluster")
+    nodes = []
+    for entry in tokens[1:]:
+        host, _, rest = entry.partition("|")
+        ip, _, port = rest.partition("|")
+        if not host or not port.isdigit():
+            raise ValueError(f"malformed discovery entry {entry!r}")
+        nodes.append({"host": host.lower(), "ip": ip or None, "port": int(port)})
+    return {"config_version": int(tokens[0]), "nodes": nodes}
+
+
+def discovery_config(host: str, port: int = 11211, timeout: float = 5.0) -> dict:
+    """Node list a client would learn from the configuration endpoint, plus the engine ``version`` it reports."""
+    out = parse_config_cluster(_query(host, port, CONFIG_CLUSTER_COMMAND, timeout))
+    try:
+        reply = _query(host, port, "version", timeout)
+        out["version"] = reply[0].split(" ", 1)[1].strip() if reply and reply[0].startswith("VERSION ") else None
+    except (OSError, RuntimeError, ValueError):
+        out["version"] = None
+    return out
+
+
+def _version_mismatch(reported: str | None, aws: str | None) -> bool:
+    if not reported or not aws:
+        return False
+    return not (reported == aws or reported.startswith(aws + ".") or aws.startswith(reported + "."))
+
+
+def discovery_findings(cluster: dict, config: dict) -> list[dict]:
+    """Compare the discovery config with the nodes AWS lists for the cluster (DescribeCacheClusters)."""
+    findings: list[dict] = []
+    cid = cluster.get("CacheClusterId", "?")
+    aws_nodes = {}
+    for n in cluster.get("CacheNodes", []):
+        ep = n.get("Endpoint") or {}
+        if ep.get("Address"):
+            aws_nodes[(str(ep["Address"]).lower(), int(ep.get("Port", 11211)))] = n
+    listed = {(n["host"], n["port"]): n for n in config["nodes"]}
+    for key, node in sorted(aws_nodes.items()):
+        if key in listed:
+            continue
+        status = node.get("CacheNodeStatus")
+        if status and status != "available":
+            findings.append(_finding("info", f"node {key[0]}:{key[1]} is {status} and not yet in the discovery config"))
+        else:
+            findings.append(
+                _finding(
+                    "critical",
+                    f"node {key[0]}:{key[1]} exists in AWS but is missing from the discovery config: "
+                    "auto-discovery clients will never send it traffic",
+                    node=f"{key[0]}:{key[1]}",
+                )
+            )
+    for key in sorted(set(listed) - set(aws_nodes)):
+        findings.append(
+            _finding(
+                "warning",
+                f"discovery config lists {key[0]}:{key[1]} but AWS has no such node of {cid}: stale entry, "
+                "clients will time out on it until the config refreshes",
+                node=f"{key[0]}:{key[1]}",
+            )
+        )
+    if _version_mismatch(config.get("version"), cluster.get("EngineVersion")):
+        findings.append(
+            _finding(
+                "warning",
+                f"discovery endpoint reports memcached {config['version']} but AWS lists engine version "
+                f"{cluster.get('EngineVersion')}: a version change may be in progress or nodes disagree",
+            )
+        )
+    return sorted(findings, key=lambda f: _SEVERITY_RANK.get(f["severity"], 9))
+
+
+def discovery_report(cluster: dict, host: str | None = None, port: int | None = None, timeout: float = 5.0) -> dict:
+    """Read the discovery config from ``host`` (default: the cluster's configuration endpoint) and diff it with AWS."""
+    cfg_ep = cluster.get("ConfigurationEndpoint") or {}
+    host = host or cfg_ep.get("Address")
+    port = port or cfg_ep.get("Port") or 11211
+    if not host:
+        return {
+            "status": "error",
+            "findings": [_finding("warning", "cluster has no configuration endpoint and MEMCACHED_HOST is not set")],
+        }
+    try:
+        config = discovery_config(host, int(port), timeout)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "status": "error",
+            "endpoint": f"{host}:{port}",
+            "findings": [
+                _finding("warning", f"could not read discovery config from {host}:{port}: {type(exc).__name__}: {exc}")
+            ],
+        }
+    findings = discovery_findings(cluster, config)
+    return {
+        "status": "ok",
+        "cache_cluster_id": cluster.get("CacheClusterId"),
+        "endpoint": f"{host}:{port}",
+        "engine_version_aws": cluster.get("EngineVersion"),
+        "engine_version_reported": config.get("version"),
+        "config_version": config["config_version"],
+        "discovery_nodes": [f"{n['host']}:{n['port']}" for n in config["nodes"]],
+        "findings": findings or [_finding("info", "discovery config matches the nodes AWS lists")],
     }

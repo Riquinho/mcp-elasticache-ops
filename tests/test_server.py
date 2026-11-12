@@ -32,7 +32,7 @@ async def test_all_tools_read_only():
     async with Client(server.mcp) as c:
         tools = await c.list_tools()
     names = {t.name for t in tools}
-    assert len(tools) == 45
+    assert len(tools) == 47
     assert {
         "node_health",
         "node_info",
@@ -74,6 +74,7 @@ async def test_all_tools_read_only():
     assert {"node_triage", "aws_alarms", "memcached_cluster_stats"} <= names  # round 04
     assert {"aws_engine_versions", "aws_parameter_groups"} <= names  # round 06
     assert {"node_pubsub", "node_cluster_triage", "aws_maintenance"} <= names  # round 11
+    assert {"memcached_discovery", "aws_cost_overview"} <= names  # round 12
     for t in tools:
         assert t.annotations.read_only_hint is True, t.name
         assert t.annotations.destructive_hint is False, t.name
@@ -118,7 +119,7 @@ async def test_node_config_end_to_end(env):
 
 async def test_every_registered_tool_is_wrapped_with_the_output_cap():
     tools = await server.mcp.list_tools()
-    assert len(tools) == 45
+    assert len(tools) == 47
     unwrapped = [t.name for t in tools if not getattr(t.fn, "__capped__", False)]
     assert unwrapped == []
 
@@ -339,7 +340,7 @@ async def test_oncall_prompts_are_registered_and_do_not_change_the_tool_count():
     assert {p.name for p in prompts} == RUNBOOKS
     async with Client(server.mcp) as c:
         assert {p.name for p in await c.list_prompts()} == RUNBOOKS
-        assert len(await c.list_tools()) == 45  # prompts are not tools
+        assert len(await c.list_tools()) == 47  # prompts are not tools
 
 
 @pytest.mark.parametrize("name", sorted(RUNBOOKS))
@@ -394,6 +395,7 @@ AUDIT_CALLS: list[tuple[str, dict]] = [
     ("memcached_stats", {}),
     ("memcached_stats", {"group": "slabs"}),
     ("memcached_cluster_stats", {}),
+    ("memcached_discovery", {"cache_cluster_id": "audit-mc"}),
     ("aws_replication_groups", {}),
     ("aws_replication_groups", {"replication_group_id": "audit-rg", "region": "eu-west-1"}),
     ("aws_cache_clusters", {}),
@@ -420,6 +422,7 @@ AUDIT_CALLS: list[tuple[str, dict]] = [
     ("aws_alarms", {"replication_group_id": "audit-rg"}),
     ("aws_cluster_overview", {}),  # fleet mode
     ("aws_cluster_overview", {"replication_group_id": "audit-rg"}),
+    ("aws_cost_overview", {}),
 ]
 
 
@@ -488,3 +491,28 @@ async def test_every_tool_only_issues_read_operations(audit):
     }
     assert audit.memcached, "no memcached command was recorded at all"
     assert set(audit.memcached) <= memcached.ALLOWED_COMMANDS
+
+
+def _boto_errors():
+    from botocore.exceptions import EndpointConnectionError, NoCredentialsError
+
+    return [NoCredentialsError(), EndpointConnectionError(endpoint_url="https://elasticache.invalid")]
+
+
+@pytest.mark.parametrize("exc", _boto_errors(), ids=lambda e: type(e).__name__)
+async def test_every_aws_tool_turns_botocore_connection_errors_into_error_and_hint(monkeypatch, exc):
+    from mcp_elasticache_ops.controlplane import ControlPlane, ControlPlaneConfig
+
+    def boom():
+        raise exc
+
+    plane = ControlPlane(ControlPlaneConfig(region="us-east-1"), session_factory=boom)
+    monkeypatch.setattr(server, "control_plane", lambda: plane)
+    calls = [(n, a) for n, a in AUDIT_CALLS if n.startswith("aws_")]
+    assert len(calls) >= 20
+    async with Client(server.mcp) as c:
+        for name, args in calls:
+            res = await c.call_tool(name, args, raise_on_error=False)
+            data = res.data if isinstance(res.data, dict) else json.loads(res.content[0].text)
+            assert isinstance(data, dict) and data.get("error"), (name, data)
+            assert data.get("hint"), (name, data)

@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      integration:
+        description: "Run the live-server integration jobs"
+        type: boolean
+        default: true
   schedule:
     - cron: "17 5 * * 1"  # weekly, Monday 05:17 UTC
 
@@ -71,6 +78,9 @@ jobs:
       - run: uv run pytest -q --cov=mcp_elasticache_ops --cov-fail-under=90
 
   cluster:
+    # always on push, schedule and dispatch; on a pull request only with the `integration` label
+    if: >-
+      github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'integration')
     runs-on: ubuntu-latest
     env:
       COMPOSE: docker compose -f tests/docker-compose.cluster.yml

@@ -1655,3 +1655,25 @@ def test_cluster_triage_on_a_standalone_node_falls_back_to_plain_triage():
     seed.infos["cluster"] = {"cluster_enabled": 0}
     out = dataplane.cluster_triage(seed, lambda h, p: seed)
     assert out["cluster_enabled"] is False and "sections" in out
+
+
+def test_valkey_compat_redis_version_is_not_redis_eol_and_is_labelled():
+    server = {"server_name": "valkey", "valkey_version": "8.0.1", "redis_version": "7.2.4"}
+    r = FakeRedis(infos={"server": server})
+    out = dataplane.health_summary(r)
+    assert out["engine"] == "valkey" and out["version"] == "8.0.1"
+    assert out["version_label"] == "Valkey 8.0.1" and out["redis_compat_version"] == "7.2.4"
+    assert not any("end-of-life" in str(f) or "Redis OSS" in str(f) for f in out["findings"])
+    tri = dataplane.triage(r)
+    assert tri["sections"]["health"]["version_label"] == "Valkey 8.0.1"
+    assert not any("end-of-life" in f["message"] for f in tri["findings"])
+
+
+def test_valkey_config_findings_flag_single_io_thread_and_lazyfree_off():
+    server = {"server_name": "valkey", "valkey_version": "8.0.1"}
+    cfg = {"io-threads": "1", "lazyfree-lazy-eviction": "no", "lazyfree-lazy-expire": "yes"}
+    params = {f["parameter"] for f in dataplane.config_findings(cfg, None, server)}
+    assert params == {"io-threads", "lazyfree-lazy-eviction"}
+    redis_server = {"redis_version": "7.2.4"}
+    assert dataplane.config_findings(cfg, None, redis_server) == []
+    assert dataplane.config_findings({"io-threads": "1"}, None, {"valkey_version": "7.2.6"}) == []

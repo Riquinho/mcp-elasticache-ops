@@ -64,10 +64,18 @@ def _num(value: Any, default: float = 0.0) -> float:
 
 
 def engine_of(info_server: dict) -> dict:
-    """Valkey reports ``server_name: valkey`` and ``valkey_version``."""
+    """Valkey reports ``server_name: valkey`` and ``valkey_version``.
+
+    Valkey also keeps ``redis_version`` (7.2.4) as a compatibility value; it is surfaced as
+    ``redis_compat_version`` and never used as the engine version."""
     if info_server.get("server_name") == "valkey" or "valkey_version" in info_server:
-        return {"engine": "valkey", "version": str(info_server.get("valkey_version", ""))}
-    return {"engine": "redis", "version": str(info_server.get("redis_version", ""))}
+        version = str(info_server.get("valkey_version", ""))
+        out = {"engine": "valkey", "version": version, "version_label": f"Valkey {version}".strip()}
+        if info_server.get("redis_version"):
+            out["redis_compat_version"] = str(info_server["redis_version"])
+        return out
+    version = str(info_server.get("redis_version", ""))
+    return {"engine": "redis", "version": version, "version_label": f"Redis OSS {version}".strip()}
 
 
 # Oldest engine version that has each command (Valkey 7.2+ has all of them). A refusal on an older
@@ -684,8 +692,36 @@ def _cfg_finding(severity: str, message: str, parameter: str) -> dict:
     return {"severity": severity, "message": message, "parameter": parameter}
 
 
-def config_findings(cfg: dict[str, str], idle_clients: int | None = None) -> list[dict]:
+def _valkey_config_findings(cfg: dict[str, str], server: dict) -> list[dict]:
+    """Valkey 8+ quirks: single-threaded I/O by default, lazyfree tuning."""
     out: list[dict] = []
+    engine = engine_of(server)
+    if engine["engine"] != "valkey":
+        return out
+    if version_tuple(engine["version"]) >= (8,) and str(cfg.get("io-threads", "")).strip() == "1":
+        out.append(
+            _cfg_finding(
+                "info",
+                "io-threads is 1 on Valkey 8+: all socket I/O shares the main thread. If EngineCPUUtilization is "
+                "high with many clients, raise io-threads in the parameter group (needs a node type with spare vCPUs).",
+                "io-threads",
+            )
+        )
+    off = sorted(k for k, v in cfg.items() if k.startswith("lazyfree-lazy-") and str(v).lower() == "no")
+    if off:
+        out.append(
+            _cfg_finding(
+                "info",
+                f"{', '.join(off)} is off: large key deletes, expiry and eviction free memory on the main thread "
+                "and can stall it. Valkey 8 defaults these to yes.",
+                off[0],
+            )
+        )
+    return out
+
+
+def config_findings(cfg: dict[str, str], idle_clients: int | None = None, server: dict | None = None) -> list[dict]:
+    out: list[dict] = _valkey_config_findings(cfg, server or {})
     if cfg.get("maxmemory-policy") == "noeviction" and _num(cfg.get("maxmemory")) != 0:
         out.append(
             _cfg_finding(
@@ -788,7 +824,8 @@ def config_view(r: redis.Redis) -> dict:
         }
     clients, _ = _try(r.client_list)
     idle = sum(1 for c in clients if _num(c.get("idle")) > 3600) if clients is not None else None
-    findings = sorted(config_findings(cfg, idle), key=lambda f: _SEVERITY_RANK.get(f["severity"], 3))
+    server, _ = _try(r.info, "server")
+    findings = sorted(config_findings(cfg, idle, server or {}), key=lambda f: _SEVERITY_RANK.get(f["severity"], 3))
     out: dict[str, Any] = {"available": True, "config": redact(dict(sorted(cfg.items()))), "findings": findings}
     if refused:
         out["notes"] = [CONFIG_FALLBACK_NOTE]
@@ -2438,7 +2475,17 @@ def _health_severity(message: str) -> str:
 def _triage_health(d: dict) -> tuple[dict, list[dict]]:
     if "role" not in d:
         return {"status": "unavailable", "notes": d.get("notes", [])}, []
-    keys = ("engine", "version", "role", "connected_clients", "hit_ratio", "ops_per_sec", "evicted_keys")
+    keys = (
+        "engine",
+        "version",
+        "version_label",
+        "redis_compat_version",
+        "role",
+        "connected_clients",
+        "hit_ratio",
+        "ops_per_sec",
+        "evicted_keys",
+    )
     findings = [_finding(_health_severity(f), f) for f in d["findings"] if not f.startswith("no issues detected")]
     return {k: d[k] for k in keys if k in d}, findings
 

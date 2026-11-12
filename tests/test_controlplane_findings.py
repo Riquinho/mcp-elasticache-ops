@@ -1459,3 +1459,184 @@ def test_maintenance_never_calls_a_write_api():
     ec = Fake({"describe_cache_clusters": {"CacheClusters": []}})
     plane(ec).maintenance()
     assert all(op.startswith("describe_") for op, _ in ec.calls)
+
+
+# ------------------------------------------------------------------ pagination safety
+def test_stuck_marker_stops_and_reports_partial():
+    ec = Fake({"describe_replication_groups": {"ReplicationGroups": [rg()], "Marker": "same"}})
+    out = plane(ec).replication_groups()
+    assert out["partial"] is True
+    assert any("repeated Marker" in n for n in out["notes"])
+    assert len([c for c in ec.calls if c[0] == "describe_replication_groups"]) == 2
+
+
+def test_endless_distinct_pages_are_capped():
+    state = {"n": 0}
+
+    def pages(kwargs):
+        state["n"] += 1
+        return {"CacheClusters": [{"CacheClusterId": f"c{state['n']}"}], "Marker": f"m{state['n']}"}
+
+    ec = Fake({"describe_cache_clusters": pages})
+    out = plane(ec).cache_clusters()
+    assert state["n"] == controlplane.MAX_PAGES == 50
+    assert out["partial"] is True
+    assert out["count"] == 50
+    assert any("truncated" in n for n in out["notes"])
+
+
+def test_stuck_next_token_in_serverless_and_alarms():
+    ec = Fake({"describe_serverless_caches": {"ServerlessCaches": [{"ServerlessCacheName": "s"}], "NextToken": "t"}})
+    out = plane(ec).serverless_caches()
+    assert out["partial"] is True and any("repeated NextToken" in n for n in out["notes"])
+    cw = Fake({"describe_alarms": {"MetricAlarms": [], "NextToken": "t"}})
+    out = plane(ec, cw).alarms()
+    assert out["partial"] is True
+    assert len([c for c in cw.calls if c[0] == "describe_alarms"]) == 2
+
+
+def test_pagination_helper_keeps_read_only_prefix_guard():
+    with pytest.raises(ValueError, match="non-read-only"):
+        plane(Fake())._paginate("modify_replication_group", "ReplicationGroups")
+    with pytest.raises(ValueError, match="non-read-only"):
+        plane(Fake())._paginate_token("delete_serverless_cache", "ServerlessCaches")
+
+
+# ------------------------------------------------------------------ aws_cost_overview
+
+
+def _cost_group(gid, node_type, azs=("us-east-1a", "us-east-1b")):
+    g = rg(azs=azs)
+    members = [f"{gid}-00{i + 1}" for i in range(len(azs))]
+    for m, new in zip(g["NodeGroups"][0]["NodeGroupMembers"], members, strict=True):
+        m["CacheClusterId"] = new
+    g.update({"ReplicationGroupId": gid, "MemberClusters": members, "CacheNodeType": node_type})
+    return g
+
+
+def _cost_ec(extra=None):
+    groups = [
+        _cost_group("big", "cache.m5.large"),  # oversized, idle replica, not graviton, on demand
+        _cost_group("fine", "cache.m7g.large"),  # busy, reserved, graviton: quiet
+    ]
+    return Fake(
+        {
+            "describe_replication_groups": {"ReplicationGroups": groups},
+            "describe_cache_clusters": {
+                "CacheClusters": [
+                    {
+                        "CacheClusterId": m,
+                        "ReplicationGroupId": g["ReplicationGroupId"],
+                        "Engine": "redis",
+                        "EngineVersion": "7.1",
+                    }
+                    for g in groups
+                    for m in g["MemberClusters"]
+                ]
+            },
+            "describe_reserved_cache_nodes": {
+                "ReservedCacheNodes": [
+                    {
+                        "ReservedCacheNodeId": "r1",
+                        "CacheNodeType": "cache.m7g.large",
+                        "ProductDescription": "redis",
+                        "CacheNodeCount": 2,
+                        "State": "active",
+                        "StartTime": NOW - dt.timedelta(days=30),
+                        "Duration": 365 * 86400,
+                    }
+                ]
+            },
+            "describe_snapshots": {
+                "Snapshots": [
+                    {
+                        "SnapshotName": "old-manual",
+                        "SnapshotSource": "manual",
+                        "SnapshotStatus": "available",
+                        "NodeSnapshots": [{"SnapshotCreateTime": NOW - dt.timedelta(days=200), "CacheSize": "2 GB"}],
+                    }
+                ]
+            },
+            "describe_serverless_caches": {
+                "ServerlessCaches": [{"ServerlessCacheName": "sc1", "Engine": "valkey", "Status": "available"}]
+            },
+            **(extra or {}),
+        }
+    )
+
+
+def _cost_metrics_for(big_mem=20.0, fine_mem=60.0):
+    flat = [1.0] * 48
+    return metric_result(
+        {
+            "big-001|DatabaseMemoryUsagePercentage": [big_mem] * 48,
+            "big-002|DatabaseMemoryUsagePercentage": [big_mem] * 48,
+            "big-001|EngineCPUUtilization": flat,
+            "big-002|EngineCPUUtilization": flat,
+            "big-002|GetTypeCmds": [0.0] * 48,
+            "fine-001|DatabaseMemoryUsagePercentage": [fine_mem] * 48,
+            "fine-002|DatabaseMemoryUsagePercentage": [fine_mem] * 48,
+            "fine-001|EngineCPUUtilization": [30.0] * 48,
+            "fine-002|EngineCPUUtilization": [30.0] * 48,
+            "fine-002|GetTypeCmds": [500.0] * 48,
+            "sc1|ElastiCacheProcessingUnits": [3600.0] * 48,
+            "sc1|BytesUsedForCache": [1e6] * 48,
+        }
+    )
+
+
+def test_cost_overview_flags_oversized_idle_graviton_reserved_and_uncapped():
+    cw = Fake({"get_metric_data": _cost_metrics_for()})
+    out = plane(_cost_ec(), cw).cost_overview()
+    by_hint = {(f.get("resource"), f.get("hint")) for f in out["findings"]}
+    assert ("big", "oversized") in by_hint
+    assert ("big", "idle-replicas") in by_hint
+    assert ("big", "graviton") in by_hint
+    assert ("big", "reserved") in by_hint
+    assert ("sc1", "uncapped") in by_hint
+    assert (None, "old-snapshots") in by_hint
+    quiet = next(g for g in out["groups"] if g["id"] == "fine")
+    assert quiet["findings_total"] == 0 and quiet["reserved_nodes_covering"] == 2
+    assert quiet["peak_memory_percent"] == 60.0 and quiet["idle_replicas"] == []
+    assert not [f for f in out["findings"] if f.get("resource") == "fine"]
+    assert out["manual_snapshots"]["old_count"] == 1
+    assert out["window_days"] == 14
+    assert "partial" not in out
+    # one GetMetricData call per group plus one for serverless, never per metric
+    assert len([c for c in cw.calls if c[0] == "get_metric_data"]) == 3
+
+
+def test_cost_overview_caps_metric_calls_and_respects_deadline():
+    groups = [_cost_group(f"g{i}", "cache.m7g.large") for i in range(controlplane.MAX_COST_GROUPS + 3)]
+    ec = Fake({"describe_replication_groups": {"ReplicationGroups": groups}})
+    cw = Fake({"get_metric_data": metric_result({})})
+    out = plane(ec, cw).cost_overview()
+    assert len([c for c in cw.calls if c[0] == "get_metric_data"]) == controlplane.MAX_COST_GROUPS
+    assert out["partial"] is True and len(out["notes"]) == 3
+    assert len(out["groups"]) == controlplane.MAX_COST_GROUPS + 3
+
+    cw2 = Fake({"get_metric_data": metric_result({})})
+    expired = controlplane._monotonic() - 1
+    out2 = plane(ec, cw2).cost_overview(deadline=expired)
+    assert not cw2.calls and out2["partial"] is True
+
+
+def test_cost_overview_degrades_when_optional_calls_fail():
+    ec = _cost_ec({"describe_reserved_cache_nodes": denied("DescribeReservedCacheNodes")})
+    out = plane(ec, Fake({"get_metric_data": denied("GetMetricData")})).cost_overview()
+    assert out["partial"] is True and any("reservations not checked" in n for n in out["notes"])
+    assert all(g["metrics_checked"] is False for g in out["groups"])
+
+
+def test_cost_overview_fan_out_tags_regions_and_only_reads():
+    ec = _cost_ec()
+    cw = Fake({"get_metric_data": _cost_metrics_for()})
+    out = plane(ec, cw).cost_overview_fan_out()
+    assert out["groups"] and out["findings"]
+    assert all(op.startswith(("describe_", "get_metric_data")) for op, _ in ec.calls + cw.calls)
+
+
+def test_eol_finding_fires_only_for_redis_engine():
+    assert any("end-of-life" in f["message"] for f in controlplane._version_findings("redis", "6.2.6", None, eol=True))
+    assert not controlplane._version_findings("valkey", "6.2.6", None, eol=True)
+    assert not controlplane._version_findings("redis", "7.1.0", None, eol=True)
