@@ -257,6 +257,15 @@ def aws_failover_readiness(
 
 
 @server.read_tool
+def aws_reader_endpoint_audit(
+    replication_group_id: Annotated[str, Field(description="ReplicationGroupId to check")], region: Region = None
+) -> dict:
+    """Are replicas usable for reads? Findings first: clients likely on the primary endpoint, no reader endpoint,
+    single-replica shards, replicas in the primary's AZ, high ReplicationLag."""
+    return server._cp(region).reader_endpoint_audit(replication_group_id)
+
+
+@server.read_tool
 def aws_scale_readiness(
     replication_group_id: Annotated[str, Field(description="ReplicationGroupId to check")], region: Region = None
 ) -> dict:

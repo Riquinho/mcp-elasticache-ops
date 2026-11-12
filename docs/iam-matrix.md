@@ -26,6 +26,7 @@ with several actions degrade to a partial answer when only some are denied.
 | `aws_parameter_drift` | `elasticache:DescribeCacheParameterGroups`, `elasticache:DescribeCacheParameters` |
 | `aws_parameter_groups` | `elasticache:DescribeCacheClusters`, `elasticache:DescribeCacheParameterGroups` |
 | `aws_parameters` | `elasticache:DescribeCacheParameters` |
+| `aws_reader_endpoint_audit` | `elasticache:DescribeCacheClusters`, `elasticache:DescribeReplicationGroups` |
 | `aws_replication_groups` | `elasticache:DescribeCacheClusters`, `elasticache:DescribeCacheEngineVersions`, `elasticache:DescribeReplicationGroups` |
 | `aws_reserved_nodes` | `elasticache:DescribeCacheClusters`, `elasticache:DescribeReservedCacheNodes` |
 | `aws_reserved_offerings` | `elasticache:DescribeCacheClusters`, `elasticache:DescribeReservedCacheNodes`, `elasticache:DescribeReservedCacheNodesOfferings` |
@@ -51,14 +52,14 @@ with several actions degrade to a partial answer when only some are denied.
 | --- | --- |
 | `cloudwatch:DescribeAlarms` | `aws_alarms` |
 | `cloudwatch:GetMetricData` | `aws_capacity_forecast`, `aws_cluster_overview`, `aws_cost_overview`, `aws_metrics`, `aws_scale_readiness`, `aws_serverless_triage`, `aws_shard_balance`, `aws_triage` |
-| `elasticache:DescribeCacheClusters` | `aws_alarms`, `aws_cache_clusters`, `aws_capacity_forecast`, `aws_cluster_overview`, `aws_cost_overview`, `aws_failover_readiness`, `aws_maintenance`, `aws_metrics`, `aws_parameter_groups`, `aws_replication_groups`, `aws_reserved_nodes`, `aws_reserved_offerings`, `aws_scale_readiness`, `aws_security_audit`, `aws_snapshot_restore_readiness`, `aws_triage`, `aws_upgrade_plan`, `memcached_discovery` |
+| `elasticache:DescribeCacheClusters` | `aws_alarms`, `aws_cache_clusters`, `aws_capacity_forecast`, `aws_cluster_overview`, `aws_cost_overview`, `aws_failover_readiness`, `aws_maintenance`, `aws_metrics`, `aws_parameter_groups`, `aws_reader_endpoint_audit`, `aws_replication_groups`, `aws_reserved_nodes`, `aws_reserved_offerings`, `aws_scale_readiness`, `aws_security_audit`, `aws_snapshot_restore_readiness`, `aws_triage`, `aws_upgrade_plan`, `memcached_discovery` |
 | `elasticache:DescribeCacheEngineVersions` | `aws_cache_clusters`, `aws_engine_versions`, `aws_replication_groups`, `aws_security_audit`, `aws_triage`, `aws_upgrade_plan` |
 | `elasticache:DescribeCacheParameterGroups` | `aws_cache_clusters`, `aws_parameter_drift`, `aws_parameter_groups`, `aws_upgrade_plan` |
 | `elasticache:DescribeCacheParameters` | `aws_parameter_drift`, `aws_parameters` |
 | `elasticache:DescribeCacheSubnetGroups` | `aws_subnet_groups` |
 | `elasticache:DescribeEvents` | `aws_events`, `aws_serverless_triage`, `aws_triage` |
 | `elasticache:DescribeGlobalReplicationGroups` | `aws_global_replication_groups` |
-| `elasticache:DescribeReplicationGroups` | `aws_alarms`, `aws_capacity_forecast`, `aws_cluster_overview`, `aws_cost_overview`, `aws_failover_readiness`, `aws_metrics`, `aws_replication_groups`, `aws_scale_readiness`, `aws_security_audit`, `aws_shard_balance`, `aws_snapshot_restore_readiness`, `aws_triage`, `aws_upgrade_plan` |
+| `elasticache:DescribeReplicationGroups` | `aws_alarms`, `aws_capacity_forecast`, `aws_cluster_overview`, `aws_cost_overview`, `aws_failover_readiness`, `aws_metrics`, `aws_reader_endpoint_audit`, `aws_replication_groups`, `aws_scale_readiness`, `aws_security_audit`, `aws_shard_balance`, `aws_snapshot_restore_readiness`, `aws_triage`, `aws_upgrade_plan` |
 | `elasticache:DescribeReservedCacheNodes` | `aws_cost_overview`, `aws_reserved_nodes`, `aws_reserved_offerings` |
 | `elasticache:DescribeReservedCacheNodesOfferings` | `aws_reserved_offerings` |
 | `elasticache:DescribeServerlessCacheSnapshots` | `aws_serverless_snapshots`, `aws_serverless_triage`, `aws_snapshot_restore_readiness` |

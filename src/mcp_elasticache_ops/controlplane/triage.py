@@ -36,7 +36,8 @@ from ._shared import (
     finding,
     is_burstable,
 )
-from .failover import failover_readiness_findings
+from .failover import failover_readiness_findings, reader_endpoint_findings
+from .scale import LAG_RISK_SECONDS, _pick
 from .security import _SecurityMixin
 from .triage_events import (  # noqa: F401
     _FAILOVER_EVENT,
@@ -684,6 +685,88 @@ class _TriageMixin(_SecurityMixin):
                 },
                 "shards": ranked[:MAX_OVERVIEW_SHARDS],
                 "shards_total": len(ranked),
+                **({"notes": notes} if notes else {}),
+            }
+
+        return self._guard(run)
+
+    def reader_endpoint_audit(self, replication_group_id: str) -> dict:
+        """Reader-endpoint use against replica count, findings first.
+
+        DescribeReplicationGroups and DescribeCacheClusters, plus a 1-hour ReplicationLag read from CloudWatch
+        (skipped with a note when unavailable); no data-plane connection."""
+
+        def run() -> dict:
+            groups = self._paginate(
+                "describe_replication_groups", "ReplicationGroups", ReplicationGroupId=replication_group_id
+            )
+            if not groups:
+                return {"error": "NotFound", "message": f"replication group {replication_group_id} not found"}
+            g = groups[0]
+            notes: list[str] = []
+            statuses: dict[str, str] = {}
+            try:
+                for c in self._paginate("describe_cache_clusters", "CacheClusters"):
+                    if c.get("ReplicationGroupId") == replication_group_id and c.get("CacheClusterId"):
+                        statuses[str(c["CacheClusterId"])] = str(c.get("CacheClusterStatus"))
+            except (BotoCoreError, ClientError) as exc:
+                notes.append(f"node states skipped: DescribeCacheClusters failed ({_error_code(exc)})")
+            findings, rows = reader_endpoint_findings(g)
+            members = [m for ng in g.get("NodeGroups", []) for m in ng.get("NodeGroupMembers", [])]
+            down = [
+                f"{m['CacheClusterId']} ({statuses[m['CacheClusterId']]})"
+                for m in members
+                if statuses.get(str(m.get("CacheClusterId")), "available") != "available"
+            ]
+            if down:
+                findings.append(
+                    finding(
+                        "warning",
+                        f"node(s) not available: {', '.join(down[:5])}; reader traffic is already shifted to the "
+                        "remaining nodes",
+                        resource=replication_group_id,
+                        category="replica-state",
+                    )
+                )
+            replicas = [
+                str(m["CacheClusterId"])
+                for m in members
+                if m.get("CurrentRole") != "primary" and m.get("CacheClusterId")
+            ][:MAX_SHARD_MEMBERS]
+            lag: dict[str, float] = {}
+            if replicas:
+                try:
+                    summary, _, _ = self._collect_metrics(replicas, ["ReplicationLag"], 60, 300, None, False, False)
+                    for rep in replicas:
+                        v = _pick(summary, rep, "ReplicationLag", "p95")
+                        if v is not None:
+                            lag[rep] = round(v, 3)
+                except (BotoCoreError, ClientError) as exc:
+                    notes.append(f"replication lag skipped: GetMetricData failed ({_error_code(exc)})")
+            slow = sorted(((k, v) for k, v in lag.items() if v > LAG_RISK_SECONDS), key=lambda kv: -kv[1])
+            if slow:
+                shown = ", ".join(f"{k} {v:g}s" for k, v in slow[:5])
+                findings.append(
+                    finding(
+                        "warning",
+                        f"ReplicationLag p95 above {LAG_RISK_SECONDS:g}s on {len(slow)} replica(s) ({shown}): "
+                        "reads from the reader endpoint can be stale",
+                        resource=replication_group_id,
+                        category="replica-lag",
+                    )
+                )
+            ordered = _sorted_findings(findings)
+            clustered = bool(g.get("ClusterEnabled")) or g.get("ClusterMode") == "enabled"
+            return {
+                "replication_group_id": replication_group_id,
+                "status": "partial" if notes else "ok",
+                "overall": _worst_status(ordered) if ordered else "ok",
+                "cluster_mode": "enabled" if clustered else "disabled",
+                "findings": ordered[:MAX_OVERVIEW_FINDINGS],
+                "findings_total": len(ordered),
+                "replication_lag_p95": lag,
+                "shards": rows[:MAX_OVERVIEW_SHARDS],
+                "shards_total": len(rows),
                 **({"notes": notes} if notes else {}),
             }
 

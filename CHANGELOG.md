@@ -1,5 +1,17 @@
 # Changelog
 
+## Round 24 additions to 0.3.0
+
+Round 24. 61 tools.
+
+### Added
+- `aws_reader_endpoint_audit`: replicas against reader-endpoint use, from `DescribeReplicationGroups`,
+  `DescribeCacheClusters` and a 1-hour `ReplicationLag` read (no new IAM actions). Findings: clients likely on the
+  primary endpoint (info, a pointer: describe data cannot show client config), no reader endpoint, single-replica
+  shards, replicas in the primary's AZ, replicas not available, high replica lag. Rules in
+  `controlplane/failover.py`; tests in `tests/test_reader_endpoint.py`.
+- `tools/list` byte budget raised from 50_500 to 51_200 for the 61st tool (docstring already trimmed).
+
 ## Round 23 additions to 0.3.0
 
 Round 23. 60 tools.
