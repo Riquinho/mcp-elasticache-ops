@@ -191,3 +191,29 @@ def test_forbidden_commands_never_pass_with_any_arguments(rest):
     for key in sorted(FORBIDDEN_COMMANDS):
         assert not _passes((*key.split(" "), *rest)), key
         assert not _passes((key, *rest)), key
+
+
+@given(count=st.integers(min_value=-(10**12), max_value=10**12))
+@SETTINGS
+def test_slowlog_get_count_property(count):
+    from mcp_elasticache_ops.safe_client import MAX_SLOWLOG_COUNT
+
+    if 1 <= count <= MAX_SLOWLOG_COUNT:
+        check(("SLOWLOG", "GET", count))
+    else:
+        with contextlib.suppress(ReadOnlyViolation):
+            check(("SLOWLOG", "GET", count))
+            raise AssertionError(f"SLOWLOG GET {count} passed the cap")
+
+
+@given(n=st.integers(min_value=0, max_value=30_000), width=st.integers(min_value=0, max_value=3))
+@SETTINGS
+def test_limit_reply_never_exceeds_caps(n, width):
+    from mcp_elasticache_ops.safe_client import MAX_REPLY_ITEMS, MAX_REPLY_TEXT_CHARS, limit_reply, reply_truncation
+
+    items = limit_reply([0] * n)
+    assert len(items) <= MAX_REPLY_ITEMS
+    assert (reply_truncation(items) is not None) == (n > MAX_REPLY_ITEMS)
+    text = limit_reply("y" * (MAX_REPLY_TEXT_CHARS + width - 1))
+    assert len(text) <= MAX_REPLY_TEXT_CHARS
+    assert (reply_truncation(text) is not None) == (width > 1)

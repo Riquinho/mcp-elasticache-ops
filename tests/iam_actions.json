@@ -158,6 +158,13 @@
   "elasticache:DescribeSnapshots",
   "elasticache:DescribeUpdateActions"
  ],
+ "aws_user_access_map": [
+  "elasticache:DescribeCacheClusters",
+  "elasticache:DescribeReplicationGroups",
+  "elasticache:DescribeServerlessCaches",
+  "elasticache:DescribeUserGroups",
+  "elasticache:DescribeUsers"
+ ],
  "aws_user_groups": [
   "elasticache:DescribeUserGroups",
   "elasticache:DescribeUsers"

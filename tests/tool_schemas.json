@@ -1129,6 +1129,26 @@
   ],
   "type": "object"
  },
+ "aws_user_access_map": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   }
+  },
+  "type": "object"
+ },
  "aws_user_groups": {
   "additionalProperties": false,
   "properties": {

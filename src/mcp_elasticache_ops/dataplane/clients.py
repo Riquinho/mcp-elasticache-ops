@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import redis
 
+from ..safe_client import reply_truncation
 from ._core import (
     CLIENT_BUFFER_WARN_BYTES,
     CONNECTIONS_CRIT_RATIO,
@@ -108,7 +109,8 @@ def client_summary(
                 }
             )
     big.sort(key=lambda b: -(b["omem"] + b["qbuf"]))
-    total = len(clients)
+    cut = reply_truncation(clients)
+    total = cut["total"] if cut else len(clients)
     idle_total = sum(idle_by_ip.values())
     maxclients = _maxclients(r)
     used_pct = round(100 * total / maxclients, 1) if maxclients else None
@@ -154,6 +156,17 @@ def client_summary(
         "by_flag": by_flag,
         "idle_over_1h": {"total": idle_total, "top_ips": _top(idle_by_ip, top, "ip")},
         "big_buffers": {"threshold_bytes": CLIENT_BIG_BUFFER_BYTES, "total": len(big), "clients": big[:top]},
+        **(
+            {
+                "truncated": True,
+                "notes": [
+                    f"CLIENT LIST reply cut at {len(clients)} of {total} clients: the breakdown covers only those, "
+                    "the total is exact"
+                ],
+            }
+            if cut
+            else {}
+        ),
     }
 
 

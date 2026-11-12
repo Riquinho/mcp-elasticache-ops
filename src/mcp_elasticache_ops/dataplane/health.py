@@ -10,6 +10,7 @@ from typing import Any
 import redis
 
 from .. import quirks
+from ..safe_client import MAX_SLOWLOG_COUNT, reply_truncation
 from ._core import (
     CHURN_MIN_UPTIME_SECONDS,
     CHURN_PER_SECOND,
@@ -322,7 +323,7 @@ def slowlog(r: redis.Redis, count: int = 25, include_args: bool = False, serverl
     By default only the command name and the first argument (usually the key)
     are returned, so values passed to SET/HSET etc. never leave the server.
     """
-    count = max(1, min(int(count), 1024))
+    count = max(1, min(int(count), MAX_SLOWLOG_COUNT))
     entries, err = _try(r.slowlog_get, count)
     if entries is None:
         return {
@@ -362,6 +363,7 @@ def slowlog(r: redis.Redis, count: int = 25, include_args: bool = False, serverl
 
 def client_list(r: redis.Redis, top: int = 20) -> dict:
     clients = r.client_list()
+    cut = reply_truncation(clients)
     by_ip: Counter[str] = Counter()
     by_name: Counter[str] = Counter()
     by_user: Counter[str] = Counter()
@@ -389,9 +391,17 @@ def client_list(r: redis.Redis, top: int = 20) -> dict:
                 "(connection leak, or timeout 0 with no idle reaping)",
             )
         )
+    if cut:
+        findings.append(
+            _finding(
+                "info",
+                f"CLIENT LIST reply cut at {len(clients)} of {cut['total']} clients: the breakdown covers only those",
+            )
+        )
     return {
         "findings": findings,
-        "total": len(clients),
+        **({"truncated": True} if cut else {}),
+        "total": cut["total"] if cut else len(clients),
         "by_source_ip": by_ip.most_common(top),
         "by_name": by_name.most_common(top),
         "by_user": by_user.most_common(top),

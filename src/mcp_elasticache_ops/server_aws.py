@@ -110,6 +110,13 @@ def aws_user_groups(region: Region = None) -> dict:
 
 
 @server.read_tool
+def aws_user_access_map(region: Region = None) -> dict:
+    """RBAC map from Describe* calls: users x groups x caches. Findings first: ~* +@all users, unattached
+    groups, enabled default user, no-password users in live groups, Memcached groups, caches without a group."""
+    return server._cp(region).user_access_map()
+
+
+@server.read_tool
 def aws_global_replication_groups(region: Region = None) -> dict:
     """DescribeGlobalReplicationGroups: global datastore members, regions, roles and status."""
     return server._cp(region).global_replication_groups()
@@ -117,9 +124,10 @@ def aws_global_replication_groups(region: Region = None) -> dict:
 
 @server.read_tool
 def aws_reserved_nodes(region: Region = None) -> dict:
-    """DescribeReservedCacheNodes plus running nodes: reservation coverage per node type and
-    engine, on-demand nodes not covered, unused or soon-expiring reservations."""
-    return server._cp(region).reserved_nodes()
+    """DescribeReservedCacheNodes plus running nodes, findings first: reservations expiring in 30/90 days,
+    reservations matching no node, nodes no reservation covers (node-hours billed on demand). All ELASTICACHE_REGIONS
+    unless `region`."""
+    return server.control_plane().reserved_nodes_fan_out(region)
 
 
 @server.read_tool

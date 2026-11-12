@@ -514,6 +514,121 @@ def _risky_parameter_findings(values: dict[str, str], defaults: dict[str, str], 
     return out
 
 
+def _map_finding(severity: str, message: str, resource: str, category: str, next_tool: str, **extra: Any) -> dict:
+    return finding(severity, message, resource=resource, category=category, next=next_tool, **extra)
+
+
+def _access_map_findings(
+    users: list[dict],
+    groups: list[dict],
+    rgs: list[dict] | None,
+    serverless: list[dict] | None,
+    memcached: list[dict] | None,
+) -> list[dict]:
+    """Join users x groups x caches. Every finding carries resource, category and a ``next`` tool."""
+    by_user = {str(u.get("UserId")): u for u in users}
+    live_users: set[str] = set()  # users reachable through a group that is attached to at least one cache
+    out: list[dict] = []
+    mc_ids = {str(c.get("CacheClusterId")) for c in memcached or []}
+    for g in groups:
+        gid = str(g.get("UserGroupId"))
+        caches = [*g.get("ReplicationGroups", []), *g.get("ServerlessCaches", [])]
+        member_ids = [str(i) for i in g.get("UserIds", [])]
+        if not caches:
+            out.append(
+                _map_finding(
+                    "info",
+                    "user group is attached to no replication group or serverless cache: it grants nothing; "
+                    "attach it or delete it",
+                    gid,
+                    "unattached group",
+                    "aws_user_groups",
+                )
+            )
+        else:
+            live_users.update(member_ids)
+        for uid in member_ids:
+            u = by_user.get(uid) or {}
+            tokens = _access_tokens(u)
+            if str(u.get("UserName", "")).lower() == "default" and "on" in tokens:
+                out.append(
+                    _map_finding(
+                        "warning",
+                        f"group {gid} keeps its default user enabled: disable it (`off -@all`) so clients must "
+                        "authenticate as a named user",
+                        gid,
+                        "default user",
+                        "aws_users",
+                        user=uid,
+                    )
+                )
+        bad = sorted(set(caches) & mc_ids)
+        if bad:
+            out.append(
+                _map_finding(
+                    "warning",
+                    f"user group references Memcached cluster(s) {', '.join(bad)}: Memcached has no RBAC, so the "
+                    "group protects nothing there; restrict access with security groups",
+                    gid,
+                    "engine support",
+                    "aws_cache_clusters",
+                )
+            )
+    for uid, u in by_user.items():
+        tokens = _access_tokens(u)
+        active = "on" in tokens
+        auth = u.get("Authentication") or {}
+        no_password = auth.get("Type") == "no-password" or "nopass" in tokens
+        reach = ", ".join(str(g.get("UserGroupId")) for g in groups if uid in g.get("UserIds", [])) or "no group"
+        if active and bool({"~*", "allkeys", "%rw~*"} & set(tokens)) and _grants_all(tokens):
+            out.append(
+                _map_finding(
+                    "critical" if no_password and uid in live_users else "warning",
+                    f"user has all keys and all commands (~* +@all), reaches {reach}; give it a "
+                    "least-privilege access string",
+                    uid,
+                    "access string",
+                    "aws_users",
+                )
+            )
+        if active and no_password and uid in live_users:
+            out.append(
+                _map_finding(
+                    "critical",
+                    f"user has no authentication (no-password-required) and sits in live group {reach}: any "
+                    "client can connect as it; set a password or IAM authentication",
+                    uid,
+                    "no authentication",
+                    "aws_users",
+                )
+            )
+    for g in rgs or []:
+        if str(g.get("Engine", "")).lower() != "memcached" and not g.get("UserGroupIds"):
+            token = bool(g.get("AuthTokenEnabled"))
+            out.append(
+                _map_finding(
+                    "info" if token else "warning",
+                    "replication group has no user group"
+                    + (" (AUTH token only: one shared secret)" if token else " and no AUTH token: no RBAC"),
+                    str(g.get("ReplicationGroupId")),
+                    "no user group",
+                    "aws_replication_group_audit",
+                )
+            )
+    for c in serverless or []:
+        if not c.get("UserGroupId"):
+            out.append(
+                _map_finding(
+                    "warning",
+                    "serverless cache has no user group: only the default user can connect",
+                    str(c.get("ServerlessCacheName")),
+                    "no user group",
+                    "aws_serverless_caches",
+                )
+            )
+    return out
+
+
 class _SecurityMixin(_CostMixin):
     # ------------------------------------------------------------ security audit
     def security_audit_fan_out(self, region: str | None = None, top: int = MAX_AUDIT_MATRIX_ROWS) -> dict:
@@ -756,6 +871,57 @@ class _SecurityMixin(_CostMixin):
                     findings.append(finding("warning", f"user group status is {view['status']}", resource=view["id"]))
             findings += _acl_group_findings(groups, users)
             return {"count": len(views), "findings": _sorted_findings(findings), "user_groups": views}
+
+        return self._guard(run)
+
+    def user_access_map(self) -> dict:
+        """Read-only RBAC join: users x user groups x the caches that use each group."""
+
+        def run() -> dict:
+            users = self._paginate("describe_users", "Users")
+            groups = self._paginate("describe_user_groups", "UserGroups")
+            rgs = self._best_effort(lambda: self._paginate("describe_replication_groups", "ReplicationGroups"))
+            serverless = self._best_effort(
+                lambda: self._paginate_token("describe_serverless_caches", "ServerlessCaches")
+            )
+            clusters = self._best_effort(lambda: self._paginate("describe_cache_clusters", "CacheClusters"))
+            memcached = [c for c in clusters or [] if str(c.get("Engine", "")).lower() == "memcached"]
+            findings = _sorted_findings(_access_map_findings(users, groups, rgs, serverless, memcached))
+            notes = [
+                f"{name} unavailable: its findings are skipped"
+                for name, data in (("replication groups", rgs), ("serverless caches", serverless))
+                if data is None
+            ]
+            access = {str(u.get("UserId")): _user_view(u) for u in users}
+            rows = [
+                {
+                    "group": g.get("UserGroupId"),
+                    "status": g.get("Status"),
+                    "users": [
+                        {
+                            "id": uid,
+                            "name": (access.get(str(uid)) or {}).get("name"),
+                            "authentication_type": (access.get(str(uid)) or {}).get("authentication_type"),
+                        }
+                        for uid in g.get("UserIds", [])
+                    ],
+                    "replication_groups": g.get("ReplicationGroups", []),
+                    "serverless_caches": g.get("ServerlessCaches", []),
+                }
+                for g in groups
+            ]
+            out: dict[str, Any] = {
+                "users": len(users),
+                "user_groups": len(groups),
+                "findings": findings[:MAX_AUDIT_FINDINGS],
+                "map": rows[:MAX_AUDIT_MATRIX_ROWS],
+            }
+            if len(findings) > MAX_AUDIT_FINDINGS or len(rows) > MAX_AUDIT_MATRIX_ROWS:
+                out["partial"] = True
+                notes.append("output capped; use aws_user_groups and aws_users for the full lists")
+            if notes:
+                out["notes"] = notes
+            return out
 
         return self._guard(run)
 

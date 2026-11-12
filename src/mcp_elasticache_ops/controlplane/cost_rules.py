@@ -150,7 +150,7 @@ def _cost_group(
     members: list[str],
     replicas: list[str],
     metrics: dict[str, dict[str, dict]],
-    held: Counter[tuple[str, str]],
+    covered_ids: set[str],
     engine: str,
 ) -> tuple[dict, list[dict]]:
     """Row and findings for one replication group (see ControlPlane.cost_overview)."""
@@ -205,12 +205,7 @@ def _cost_group(
             "exist only as read capacity (keep one per shard for failover)",
             hint="idle-replicas",
         )
-    reserved_here = (
-        held.get((str(node_type), engine), 0)
-        if engine
-        else sum(n for (nt, _), n in held.items() if nt == str(node_type))
-    )
-    covered = min(nodes, reserved_here)
+    covered = sum(1 for m in members if m in covered_ids)
     if nodes and not covered:
         add(
             "info",
@@ -503,3 +498,151 @@ def _reserved_view(r: dict) -> dict:
         "start_time": _jsonable(start),
         "end_time": end.isoformat() if end else None,
     }
+
+
+# Normalised size units within a node family (as EC2 does): a reservation of N units of a family covers any mix of
+# sizes of that family that fits. ElastiCache applies this to Redis OSS and Valkey reservations, not to Memcached.
+_SIZE_UNITS = {
+    "micro": 0.5,
+    "small": 1.0,
+    "medium": 2.0,
+    "large": 4.0,
+    "xlarge": 8.0,
+    "2xlarge": 16.0,
+    "4xlarge": 32.0,
+    "8xlarge": 64.0,
+    "12xlarge": 96.0,
+    "16xlarge": 128.0,
+    "24xlarge": 192.0,
+}
+SIZE_FLEXIBLE_ENGINES = frozenset({"redis", "valkey"})
+EXPIRY_WARNING_DAYS = 30
+EXPIRY_INFO_DAYS = 90
+
+
+def _family_units(node_type: Any) -> tuple[str, float] | None:
+    m = _NODE_TYPE.match(str(node_type or ""))
+    if not m or m.group(2) not in _SIZE_UNITS:
+        return None
+    return m.group(1), _SIZE_UNITS[m.group(2)]
+
+
+def plan_coverage(reserved: list[dict], nodes: list[tuple[str, str, str]]) -> dict[str, Any]:
+    """Assign active reservations to running nodes. Shared by aws_reserved_nodes and aws_cost_overview, so the two
+    tools always report the same covered node count.
+
+    ``nodes`` is ``(node id, node type, engine)``; an empty engine matches any reservation of that node type.
+    Exact node type and engine first, then size flexibility inside a family for Redis OSS / Valkey.
+    Returns ``covered`` (node ids), ``size_flexible`` (the subset covered by a different size) and ``reservations``
+    (one row per active reservation with the nodes it covers and the nodes it leaves unused)."""
+    views = sorted((v for v in map(_reserved_view, reserved) if v["state"] == "active"), key=lambda v: str(v["id"]))
+    open_nodes = {nid: (str(nt), str(eng).lower()) for nid, nt, eng in sorted(nodes)}
+    covered: set[str] = set()
+    flexible: set[str] = set()
+    remaining = {str(v["id"]): int(v["count"] or 0) for v in views}
+    exact: Counter[str] = Counter()
+    for v in views:
+        rid, product = str(v["id"]), str(v["product"]).lower()
+        for nid, (nt, eng) in list(open_nodes.items()):
+            if not remaining[rid]:
+                break
+            if nt == v["node_type"] and eng in (product, ""):
+                covered.add(nid)
+                del open_nodes[nid]
+                remaining[rid] -= 1
+                exact[rid] += 1
+    flex: Counter[str] = Counter()
+    left: dict[str, int] = dict(remaining)
+    for v in views:
+        rid, product = str(v["id"]), str(v["product"]).lower()
+        res = _family_units(v["node_type"])
+        if not res or product not in SIZE_FLEXIBLE_ENGINES or not remaining[rid]:
+            continue
+        family, unit = res
+        budget = remaining[rid] * unit
+        pool = sorted(
+            (
+                (-(u[1]), nid)
+                for nid, (nt, eng) in open_nodes.items()
+                if eng == product and (u := _family_units(nt)) and u[0] == family
+            )
+        )
+        for neg_units, nid in pool:
+            if -neg_units <= budget:
+                budget += neg_units
+                covered.add(nid)
+                flexible.add(nid)
+                del open_nodes[nid]
+                flex[rid] += 1
+        left[rid] = int(budget // unit)
+    rows = [
+        {
+            **v,
+            "exact_nodes": exact[str(v["id"])],
+            "size_flexible_nodes": flex[str(v["id"])],
+            "unused": left[str(v["id"])],
+        }
+        for v in views
+    ]
+    return {"covered": covered, "size_flexible": flexible, "reservations": rows}
+
+
+RESERVED_NOTE = (
+    "Matching is by node type and engine, plus size flexibility inside a family for Redis OSS and Valkey "
+    "reservations. Serverless caches cannot be reserved. The API exposes no Multi-AZ class and no on-demand price, "
+    "so uncovered spend is reported as node-hours per month."
+)
+
+
+def cluster_nodes(clusters: list[dict]) -> list[tuple[str, str, str]]:
+    """(node id, node type, engine) for every node of every cluster that is not being deleted."""
+    out: list[tuple[str, str, str]] = []
+    for c in clusters:
+        if str(c.get("CacheClusterStatus", "")).lower() in {"deleting", "deleted"}:
+            continue
+        cid = str(c.get("CacheClusterId"))
+        for i in range(int(c.get("NumCacheNodes") or 1)):
+            out.append((f"{cid}#{i}", str(c.get("CacheNodeType")), str(c.get("Engine", "")).lower()))
+    return out
+
+
+def _reserved_finding(severity: str, message: str, resource: str, category: str, next_tool: str, **extra: Any) -> dict:
+    return finding(severity, message, resource=resource, category=category, next=next_tool, **extra)
+
+
+def _mismatch_reason(node_type: str, product: str, running: dict[str, tuple[str, str]]) -> str:
+    """Why a reservation covers nothing: same type on another engine, same engine on another size or family."""
+    nodes = list(running.values())
+    if any(nt == node_type and eng != product for nt, eng in nodes):
+        return "engine mismatch: nodes of this type run another engine"
+    family = _family_units(node_type)
+    if any(eng == product and (u := _family_units(nt)) and family and u[0] == family[0] for nt, eng in nodes):
+        return "size mismatch: nodes of this family run and are already covered or not size-flexible"
+    if any(eng == product for _, eng in nodes):
+        return "node type mismatch: this engine runs on other node types"
+    return "no running node of this engine"
+
+
+def _expiry_findings(r: dict, now: dt.datetime, running: dict[str, tuple[str, str]], unknown: bool) -> list[dict]:
+    if not r["end_time"]:
+        return []
+    days = (dt.datetime.fromisoformat(r["end_time"]) - now).days
+    if days >= EXPIRY_INFO_DAYS:
+        return []
+    still = sum(1 for nt, eng in running.values() if nt == r["node_type"] and eng in (str(r["product"]).lower(), ""))
+    tail = (
+        f"; {still} {r['node_type']} {r['product']} node(s) still running"
+        if still
+        else ("" if unknown else "; no matching running nodes")
+    )
+    when = f"in {days} days" if days >= 0 else f"{-days} days ago"
+    return [
+        _reserved_finding(
+            "warning" if days < EXPIRY_WARNING_DAYS else "info",
+            f"reservation {r['id']} ends {r['end_time']} ({when}){tail}",
+            str(r["id"]),
+            "expiring reservation",
+            "aws_reserved_offerings",
+            days_left=days,
+        )
+    ]

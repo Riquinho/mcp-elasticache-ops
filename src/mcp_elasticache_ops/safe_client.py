@@ -208,6 +208,9 @@ MAX_MEMORY_USAGE_SAMPLES = 100
 MAX_CLIENT_LIST_IDS = 100
 MAX_ACL_LOG_COUNT = 128
 MAX_COMMANDLOG_COUNT = 128
+MAX_SLOWLOG_COUNT = 128
+MAX_REPLY_TEXT_CHARS = 1_000_000  # a text reply longer than this is cut and flagged
+MAX_REPLY_ITEMS = 10_000  # a list reply longer than this is cut and flagged
 MAX_HISTOGRAM_COMMANDS = 16
 MAX_HISTOGRAM_NAME_LEN = 48
 MAX_PUBSUB_PATTERN_LEN = 128
@@ -242,6 +245,14 @@ def _check_acl_log(rest: tuple) -> None:
         raise ReadOnlyViolation("ACL LOG accepts at most a count")
     if rest and _int_arg(rest[0], "ACL LOG count") > MAX_ACL_LOG_COUNT:
         raise ReadOnlyViolation(f"ACL LOG count is capped at {MAX_ACL_LOG_COUNT}")
+
+
+def _check_slowlog(rest: tuple) -> None:
+    # SLOWLOG GET [count]; -1 means "everything" in Redis, so it is refused along with 0 and anything above the cap.
+    if len(rest) > 1:
+        raise ReadOnlyViolation("SLOWLOG GET accepts at most a count")
+    if rest and not 1 <= _int_arg(rest[0], "SLOWLOG GET count") <= MAX_SLOWLOG_COUNT:
+        raise ReadOnlyViolation(f"SLOWLOG GET count must be between 1 and {MAX_SLOWLOG_COUNT}")
 
 
 def _commandlog_type(value: object, what: str) -> None:
@@ -360,6 +371,8 @@ def check(args: tuple) -> None:
         _check_config_get(rest)
     elif key == "ACL LOG":
         _check_acl_log(rest)
+    elif key == "SLOWLOG GET":
+        _check_slowlog(rest)
     elif key == "ACL WHOAMI" and rest:
         raise ReadOnlyViolation("ACL WHOAMI takes no arguments")
     elif key == "MEMORY USAGE":
@@ -454,6 +467,40 @@ def _guarded_class(cls: type) -> type:
     return type(f"Guarded{cls.__name__}", (_GuardedConnectionMixin, cls), {})
 
 
+class TruncatedText(str):
+    """A text reply cut at MAX_REPLY_TEXT_CHARS. ``total`` is the original length."""
+
+    truncated = True
+    total = 0
+
+
+class TruncatedList(list):
+    """A list reply cut at MAX_REPLY_ITEMS. ``total`` is the original length."""
+
+    truncated = True
+    total = 0
+
+
+def limit_reply(reply):
+    """Cap an oversized reply and mark it (``.truncated`` / ``.total``); other replies pass through unchanged."""
+    if isinstance(reply, str) and len(reply) > MAX_REPLY_TEXT_CHARS:
+        out = TruncatedText(reply[:MAX_REPLY_TEXT_CHARS])
+        out.total = len(reply)
+        return out
+    if isinstance(reply, list) and len(reply) > MAX_REPLY_ITEMS:
+        lst = TruncatedList(reply[:MAX_REPLY_ITEMS])
+        lst.total = len(reply)
+        return lst
+    return reply
+
+
+def reply_truncation(reply) -> dict | None:
+    """``{"truncated": True, "total": n}`` when ``limit_reply`` cut this reply, else None."""
+    if isinstance(reply, (TruncatedText, TruncatedList)):
+        return {"truncated": True, "total": reply.total}
+    return None
+
+
 class _BlockedHelpers:
     """redis-py helpers that reach the wire without going through ``execute_command``."""
 
@@ -517,7 +564,7 @@ class SafeRedis(_BlockedHelpers, redis.Redis):
 
     def execute_command(self, *args, **options):
         check(args)
-        return super().execute_command(*args, **options)
+        return limit_reply(super().execute_command(*args, **options))
 
     def pipeline(self, transaction: bool = False, shard_hint=None) -> SafePipeline:
         if transaction:

@@ -32,7 +32,7 @@ async def test_all_tools_read_only():
     async with Client(server.mcp) as c:
         tools = await c.list_tools()
     names = {t.name for t in tools}
-    assert len(tools) == 63
+    assert len(tools) == 64
     assert {
         "node_health",
         "node_info",
@@ -58,6 +58,7 @@ async def test_all_tools_read_only():
         "aws_snapshots",
         "aws_users",
         "aws_user_groups",
+        "aws_user_access_map",
         "aws_global_replication_groups",
         "aws_reserved_nodes",
         "aws_service_updates",
@@ -120,7 +121,7 @@ async def test_node_config_end_to_end(env):
 
 async def test_every_registered_tool_is_wrapped_with_the_output_cap():
     tools = await server.mcp.list_tools()
-    assert len(tools) == 63
+    assert len(tools) == 64
     unwrapped = [t.name for t in tools if not getattr(t.fn, "__capped__", False)]
     assert unwrapped == []
 
@@ -341,7 +342,7 @@ async def test_oncall_prompts_are_registered_and_do_not_change_the_tool_count():
     assert {p.name for p in prompts} == RUNBOOKS
     async with Client(server.mcp) as c:
         assert {p.name for p in await c.list_prompts()} == RUNBOOKS
-        assert len(await c.list_tools()) == 63  # prompts are not tools
+        assert len(await c.list_tools()) == 64  # prompts are not tools
 
 
 @pytest.mark.parametrize("name", sorted(RUNBOOKS))
@@ -414,6 +415,7 @@ AUDIT_CALLS: list[tuple[str, dict]] = [
     ("aws_serverless_snapshots", {}),
     ("aws_users", {}),
     ("aws_user_groups", {}),
+    ("aws_user_access_map", {}),
     ("aws_global_replication_groups", {}),
     ("aws_reserved_nodes", {}),
     ("aws_reserved_offerings", {"node_type": "cache.r6g.large", "engine": "redis"}),

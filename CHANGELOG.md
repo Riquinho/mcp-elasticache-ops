@@ -1,5 +1,17 @@
 # Changelog
 
+## Round 28 additions to 0.3.0
+
+Round 28. 64 tools (one new tool, `aws_user_access_map`).
+
+### Added
+- `aws_user_access_map` (`controlplane/security.py`): read-only RBAC join of `DescribeUsers`, `DescribeUserGroups`
+  and the replication groups, serverless caches and Memcached clusters that use each group (no new IAM actions beyond
+  `Describe*`). Findings first, each with `resource`, `category`, `next`.
+
+### Changed
+- `MAX_TOOLS_LIST_BYTES` raised from 53_400 to 54_000: the 64th tool (measured 53_804).
+
 ## Round 27 additions to 0.3.0
 
 Round 27. 63 tools (one new tool, `aws_replication_group_audit`).

@@ -62,6 +62,7 @@ TOOL_ARGS: dict[str, dict[str, Any]] = {
             "aws_serverless_snapshots",
             "aws_users",
             "aws_user_groups",
+            "aws_user_access_map",
             "aws_global_replication_groups",
             "aws_reserved_nodes",
             "aws_parameter_groups",
@@ -245,3 +246,44 @@ async def test_exemptions_are_still_needed(audit):  # noqa: F811
         args = dict(next(a for n, a in AUDIT_CALLS if n == name))
         if "findings" in await _run(name, args):
             pytest.fail(f"{name} returns findings now; remove it from NO_FINDINGS_EXEMPT")
+
+
+def test_50k_clients_stay_inside_the_output_budget():
+    """A 50k-connection CLIENT LIST is cut at MAX_REPLY_ITEMS, flagged, and both client tools stay under the cap."""
+    import json
+
+    from mcp_elasticache_ops import config
+    from mcp_elasticache_ops.dataplane.clients import client_summary
+    from mcp_elasticache_ops.dataplane.health import client_list
+    from mcp_elasticache_ops.safe_client import MAX_REPLY_ITEMS, limit_reply
+
+    raw = [
+        {
+            "id": str(i),
+            "addr": f"10.{i % 250}.{i // 250 % 250}.1:{i % 60000}",
+            "name": f"app-{i % 40}",
+            "user": "u",
+            "idle": "5",
+            "flags": "N",
+            "omem": "0",
+            "qbuf": "0",
+            "tot-mem": "0",
+            "cmd": "get",
+        }
+        for i in range(50_000)
+    ]
+
+    class Fake:
+        def client_list(self, **_):
+            return limit_reply(raw)
+
+        def info(self, *_):
+            return {"maxclients": 65000}
+
+    summary = client_summary(Fake())
+    listing = client_list(Fake())
+    assert summary["total"] == listing["total"] == 50_000
+    assert summary["truncated"] is True and listing["truncated"] is True
+    assert len(limit_reply(raw)) == MAX_REPLY_ITEMS
+    for out in (summary, listing):
+        assert len(json.dumps(out, default=str)) < config.max_output_chars()

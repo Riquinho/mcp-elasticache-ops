@@ -10,7 +10,7 @@ written from scratch for ElastiCache.
 
 ## Tools
 
-All 63 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
+All 64 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 
 **Data plane** (redis-py, talks to the node endpoint)
 
@@ -67,6 +67,7 @@ All 63 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `aws_snapshots` | `DescribeSnapshots`: retention gaps, failed and missing automatic backups, old manual snapshots |
 | `aws_serverless_snapshots` | `DescribeServerlessCacheSnapshots` + `DescribeServerlessCaches`: caches with no available snapshot in `stale_hours` (default 24), failed snapshots, newest snapshot about to expire, snapshots without a customer KMS key, unset per-cache retention; a failing cache listing degrades to `partial` |
 | `aws_users` | `DescribeUsers` (RBAC): `~* +@all` access strings and users without a password; critical when the active `default` user has no password or `+@all` and is attached to a cache, warning for dangerous commands on prod-like caches. No secret material is returned |
+| `aws_user_access_map` | `DescribeUsers`, `DescribeUserGroups` and the caches using each group: `~* +@all` users, unattached groups, enabled `default` user in a group, no-password users in live groups, Memcached groups, caches with no user group. Each finding has `resource`, `category`, `next` |
 | `aws_user_groups` | `DescribeUserGroups`: unattached groups, non-active status, groups holding only the `default` user |
 | `aws_global_replication_groups` | `DescribeGlobalReplicationGroups`: members per region, status, missing secondary. Per secondary region (max 6): `GlobalDatastoreReplicationLag` (> 1 s warning, > 10 s critical), node type or engine version that differs from the primary, members not `associated`/`available` |
 | `aws_reserved_nodes` | `DescribeReservedCacheNodes` vs running nodes: coverage by exact node type and engine, unused reservations, reservations expiring with nodes still running; a failing cluster listing degrades to `partial` with the reservation list intact |

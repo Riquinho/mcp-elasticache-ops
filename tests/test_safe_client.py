@@ -1,6 +1,15 @@
 import pytest
+import redis
 
-from mcp_elasticache_ops.safe_client import READ_ONLY_COMMANDS, ReadOnlyViolation, SafeRedis, check, command_key
+from mcp_elasticache_ops.safe_client import (
+    MAX_ACL_LOG_COUNT,
+    MAX_COMMANDLOG_COUNT,
+    READ_ONLY_COMMANDS,
+    ReadOnlyViolation,
+    SafeRedis,
+    check,
+    command_key,
+)
 
 
 @pytest.mark.parametrize(
@@ -559,3 +568,66 @@ def test_pubsub_unbounded_or_writing_forms_are_blocked(args):
 
 def test_pubsub_numsub_accepts_exactly_the_bound():
     check(("PUBSUB NUMSUB", *[f"c{i}" for i in range(100)]))
+
+
+# --- response-size and count guard (round 28) ---------------------------------------------------------------------
+
+
+def _raises(*args):
+    with pytest.raises(ReadOnlyViolation):
+        check(args)
+
+
+@pytest.mark.parametrize("count", [-1, 0, 129, 10**9, "-1", b"0", "129"])
+def test_slowlog_get_count_is_capped(count):
+    _raises("SLOWLOG", "GET", count)
+
+
+@pytest.mark.parametrize("args", [("SLOWLOG GET",), ("SLOWLOG", "GET", 1), ("SLOWLOG", "GET", "128")])
+def test_slowlog_get_within_cap_is_allowed(args):
+    check(args)
+
+
+def test_slowlog_get_rejects_extra_arguments():
+    _raises("SLOWLOG", "GET", 5, "x")
+
+
+def test_acl_log_and_commandlog_caps_hold_next_to_slowlog():
+    _raises("ACL", "LOG", MAX_ACL_LOG_COUNT + 1)
+    _raises("COMMANDLOG", "GET", MAX_COMMANDLOG_COUNT + 1, "slow")
+    check(("ACL", "LOG", MAX_ACL_LOG_COUNT))
+    check(("COMMANDLOG", "GET", MAX_COMMANDLOG_COUNT, "slow"))
+
+
+def test_limit_reply_cuts_text_and_marks_it():
+    from mcp_elasticache_ops.safe_client import MAX_REPLY_TEXT_CHARS, limit_reply, reply_truncation
+
+    big = "x" * (MAX_REPLY_TEXT_CHARS + 5)
+    out = limit_reply(big)
+    assert len(out) == MAX_REPLY_TEXT_CHARS
+    assert reply_truncation(out) == {"truncated": True, "total": len(big)}
+    assert limit_reply("small") == "small"
+    assert reply_truncation("small") is None
+
+
+def test_limit_reply_cuts_lists_and_marks_them():
+    from mcp_elasticache_ops.safe_client import MAX_REPLY_ITEMS, limit_reply, reply_truncation
+
+    out = limit_reply(list(range(MAX_REPLY_ITEMS + 7)))
+    assert len(out) == MAX_REPLY_ITEMS
+    assert reply_truncation(out) == {"truncated": True, "total": MAX_REPLY_ITEMS + 7}
+    exact = list(range(MAX_REPLY_ITEMS))
+    assert limit_reply(exact) is exact
+
+
+def test_safe_redis_marks_an_oversized_reply():
+    from unittest import mock
+
+    from mcp_elasticache_ops.safe_client import MAX_REPLY_ITEMS, SafeRedis, reply_truncation
+
+    r = SafeRedis()
+    with mock.patch.object(
+        redis.Redis, "execute_command", return_value=[{"id": i} for i in range(MAX_REPLY_ITEMS + 1)]
+    ):
+        reply = r.execute_command("CLIENT", "LIST")
+    assert reply_truncation(reply) == {"truncated": True, "total": MAX_REPLY_ITEMS + 1}

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import datetime as dt
 from collections import Counter
 from typing import Any
 
@@ -34,6 +33,7 @@ from .cost_rules import (  # noqa: F401
     FORECAST_FULL_PCT,
     FORECAST_UNDERUSED_PCT,
     FORECAST_WARNING_DAYS,
+    HOURS_PER_MONTH,
     MAX_COST_GROUPS,
     MAX_FORECAST_ROWS,
     MAX_FORECAST_TARGETS,
@@ -47,20 +47,26 @@ from .cost_rules import (  # noqa: F401
     OLD_MANUAL_SNAPSHOT_DAYS,
     OVERSIZED_MEMORY_PEAK,
     OWNER_TAG_KEYS,
+    RESERVED_NOTE,
     VALKEY_MIN_REDIS_VERSION,
     VALKEY_SAVINGS_NODE_PERCENT,
     VALKEY_SAVINGS_SERVERLESS_PERCENT,
     _cost_group,
     _cost_manual_snapshots,
     _cost_serverless,
+    _expiry_findings,
     _forecast_rank,
     _forecast_row,
     _is_graviton,
+    _mismatch_reason,
     _offering_view,
+    _reserved_finding,
     _reserved_nodes_held,
     _reserved_view,
     _tag_ownership,
     _valkey_savings_findings,
+    cluster_nodes,
+    plan_coverage,
 )
 from .monitoring import _MonitoringMixin
 
@@ -127,9 +133,15 @@ class _CostMixin(_MonitoringMixin):
             for label, got in (("reservations", reserved), ("manual snapshots", snaps), ("serverless caches", caches)):
                 if got is None:
                     notes.append(f"{label} not checked: the Describe call failed")
-            held = _reserved_nodes_held(reserved or [])
             clusters = self._member_clusters()
             versions = self._member_engine_versions(clusters)
+            in_groups = {str(m) for g in groups for m in g.get("MemberClusters", [])}
+            plan_nodes = [
+                (str(m), str(g.get("CacheNodeType")), versions.get(str(g.get("ReplicationGroupId")), ("",))[0].lower())
+                for g in groups
+                for m in g.get("MemberClusters", [])
+            ] + cluster_nodes([c for c in clusters if str(c.get("CacheClusterId")) not in in_groups])
+            plan = plan_coverage(reserved or [], plan_nodes)
             rows: list[dict] = []
             findings: list[dict] = []
             for i, g in enumerate(groups):
@@ -147,7 +159,7 @@ class _CostMixin(_MonitoringMixin):
                 elif members:
                     metrics = self._cost_metrics(members, False)
                 engine = versions.get(gid, (str(g.get("Engine") or ""), ""))[0].lower()
-                row, found = _cost_group(g, gid, members, replicas, metrics, held, engine)
+                row, found = _cost_group(g, gid, members, replicas, metrics, plan["covered"], engine)
                 rows.append(row)
                 findings += found
             names = [str(c.get("ServerlessCacheName")) for c in (caches or [])][:MAX_COST_GROUPS]
@@ -173,6 +185,10 @@ class _CostMixin(_MonitoringMixin):
                 "groups": rows,
                 "serverless": serverless_rows,
                 "manual_snapshots": snap_row,
+                "reserved_coverage": {
+                    "running_nodes": len(plan_nodes),
+                    "covered_nodes": len(plan["covered"]),
+                },
             }
             if notes:
                 out["partial"] = True
@@ -366,13 +382,58 @@ class _CostMixin(_MonitoringMixin):
         return summary
 
     # ---------------------------------------------------------- reserved nodes
-    def reserved_nodes(self, expiring_days: int = 60) -> dict:
+    def reserved_nodes_fan_out(self, region: str | None = None) -> dict:
+        """``reserved_nodes`` over every region in ELASTICACHE_REGIONS (at most MAX_REGIONS) or just ``region``."""
+        targets = self._target_regions(region)
+        if len(targets) == 1:
+            return self.in_region(targets[0]).reserved_nodes()
+        deadline = _monotonic() + FLEET_DEADLINE_SECONDS
+        findings: list[dict] = []
+        coverage: list[dict] = []
+        reservations: list[dict] = []
+        notes: list[str] = []
+        failures: dict[str, dict] = {}
+        total = Counter[str]()
+        for target in targets:
+            if _monotonic() >= deadline:
+                failures[str(target)] = _fleet_deadline_error()
+                continue
+            result = self.in_region(target).reserved_nodes()
+            if _fleet_failed(result):
+                failures[str(target)] = result
+                continue
+            findings += [{**f, "region": target} for f in result["findings"]]
+            coverage += [{**c, "region": target} for c in result["coverage"]]
+            reservations += [{**r, "region": target} for r in result["reserved_cache_nodes"]]
+            notes += [f"{target}: {n}" for n in result.get("notes", [])]
+            total.update({k: v for k, v in result["summary"].items() if isinstance(v, int)})
+        ordered = _sorted_findings(findings)
+        out: dict[str, Any] = {
+            "regions": [str(t) for t in targets],
+            "reached": f"{len(targets) - len(failures)}/{len(targets)}",
+            "findings": ordered[:MAX_FLEET_FINDINGS],
+            "findings_total": len(ordered),
+            "truncated": len(ordered) > MAX_FLEET_FINDINGS,
+            "summary": dict(total),
+            "coverage": coverage,
+            "reserved_cache_nodes": reservations,
+            "note": RESERVED_NOTE,
+        }
+        if notes or failures:
+            out["partial"] = True
+            out["notes"] = notes
+        if failures:
+            out["region_errors"] = failures
+        return out
+
+    def reserved_nodes(self) -> dict:
+        """Findings first: expiring reservations (30 / 90 days), reservations matching no running node, running
+        nodes no reservation covers and the node-hours per month billed on demand. Uses the same coverage plan as
+        aws_cost_overview."""
+
         def run() -> dict:
             reserved = self._paginate("describe_reserved_cache_nodes", "ReservedCacheNodes")
-            notes = [
-                "Matching is by exact node type and engine; size-flexible matching within a family is not "
-                "modelled. Serverless caches cannot be reserved."
-            ]
+            notes: list[str] = []
             clusters: list[dict] | None
             try:
                 clusters = self._paginate("describe_cache_clusters", "CacheClusters")
@@ -384,71 +445,79 @@ class _CostMixin(_MonitoringMixin):
                 )
             now = self._clock()
             views = [_reserved_view(r) for r in reserved]
-            active = [v for v in views if v["state"] == "active"]
-            running: Counter[tuple[str, str]] = Counter()
-            for c in clusters or []:
-                if str(c.get("CacheClusterStatus", "")).lower() in {"deleting", "deleted"}:
-                    continue
-                running[(str(c.get("CacheNodeType")), str(c.get("Engine", "")).lower())] += int(
-                    c.get("NumCacheNodes") or 1
-                )
+            nodes = cluster_nodes(clusters or [])
+            plan = plan_coverage(reserved, nodes)
+            by_id = {nid: (nt, eng) for nid, nt, eng in nodes}
+            running: Counter[tuple[str, str]] = Counter((nt, eng) for nt, eng in by_id.values())
+            uncovered: Counter[tuple[str, str]] = Counter(by_id[nid] for nid in by_id if nid not in plan["covered"])
             held: Counter[tuple[str, str]] = Counter()
-            for v in active:
-                held[(str(v["node_type"]), str(v["product"]).lower())] += int(v["count"] or 0)
+            unused: Counter[tuple[str, str]] = Counter()
+            for r in plan["reservations"]:
+                key = (str(r["node_type"]), str(r["product"]).lower())
+                held[key] += int(r["count"] or 0)
+                unused[key] += r["unused"]
             coverage = []
-            findings = []
+            findings: list[dict] = []
             for key in sorted(set(running) | set(held)) if clusters is not None else []:
                 node_type, product = key
-                run_n, res_n = running[key], held[key]
-                row = {
+                row: dict[str, Any] = {
                     "node_type": node_type,
                     "engine": product,
-                    "running_nodes": run_n,
-                    "reserved_nodes": res_n,
-                    "on_demand_nodes": max(0, run_n - res_n),
-                    "unused_reservations": max(0, res_n - run_n),
+                    "running_nodes": running[key],
+                    "reserved_nodes": held[key],
+                    "on_demand_nodes": uncovered[key],
+                    "unused_reservations": unused[key],
                 }
                 coverage.append(row)
                 if row["on_demand_nodes"]:
                     findings.append(
-                        finding(
+                        _reserved_finding(
                             "info",
-                            f"{row['on_demand_nodes']} on-demand {node_type} {product} node(s) not covered by a reservation",
+                            f"{row['on_demand_nodes']} on-demand {node_type} {product} node(s) not covered by a "
+                            "reservation",
+                            f"{node_type}/{product}",
+                            "uncovered node",
+                            "aws_cost_overview",
+                            node_hours_per_month=row["on_demand_nodes"] * HOURS_PER_MONTH,
                         )
                     )
                 if row["unused_reservations"]:
                     findings.append(
-                        finding(
+                        _reserved_finding(
                             "warning",
-                            f"{row['unused_reservations']} reserved {node_type} {product} node(s) have no running match",
+                            f"{row['unused_reservations']} reserved {node_type} {product} node(s) have no running "
+                            "match",
+                            f"{node_type}/{product}",
+                            "unmatched reservation",
+                            "aws_cache_clusters",
+                            reason=_mismatch_reason(node_type, product, by_id),
                         )
                     )
-            for v in active:
-                if v["end_time"] and dt.datetime.fromisoformat(v["end_time"]) - now < dt.timedelta(days=expiring_days):
-                    days = (dt.datetime.fromisoformat(v["end_time"]) - now).days
-                    still = running[(str(v["node_type"]), str(v["product"]).lower())]
-                    tail = (
-                        f"; {still} {v['node_type']} {v['product']} node(s) still running"
-                        if still
-                        else ""
-                        if clusters is None
-                        else "; no matching running nodes"
-                    )
-                    findings.append(
-                        finding(
-                            "warning",
-                            f"reservation {v['id']} ends {v['end_time']} (in {days} days){tail}",
-                            resource=v["id"],
-                        )
-                    )
-            return {
+            for r in plan["reservations"]:
+                findings += _expiry_findings(r, now, by_id, clusters is None)
+            uncovered_total = sum(uncovered.values())
+            summary = {
+                "running_nodes": sum(running.values()),
+                "covered_nodes": len(plan["covered"]),
+                "size_flexible_nodes": len(plan["size_flexible"]),
+                "uncovered_nodes": uncovered_total,
+                "uncovered_node_hours_per_month": uncovered_total * HOURS_PER_MONTH,
+            }
+            ordered = _sorted_findings(findings)
+            out: dict[str, Any] = {
                 "count": len(views),
-                "findings": _sorted_findings(findings),
+                "findings": ordered[:MAX_FLEET_FINDINGS],
+                "findings_total": len(ordered),
+                "truncated": len(ordered) > MAX_FLEET_FINDINGS,
+                "summary": summary if clusters is not None else {},
                 "coverage": coverage,
                 "reserved_cache_nodes": views,
-                "note": notes[0],
-                **({"partial": True, "notes": notes[1:]} if clusters is None else {}),
+                "note": RESERVED_NOTE,
             }
+            if clusters is None:
+                out["partial"] = True
+                out["notes"] = notes
+            return out
 
         return self._guard(run)
 
