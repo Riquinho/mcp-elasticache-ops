@@ -148,7 +148,7 @@ def _split(args: tuple) -> tuple[str, str, tuple]:
     if not rest:
         return name, "", rest
     sub = _text(rest[0], "subcommand")
-    if not re.fullmatch(r"[A-Za-z]+", sub):
+    if not re.fullmatch(r"[A-Za-z_]+", sub):
         raise ReadOnlyViolation(f"malformed subcommand {sub!r}")
     return name, sub.upper(), rest[1:]
 
@@ -184,13 +184,135 @@ def check(args: tuple) -> None:
         _check_config_get(rest)
 
 
-class SafePipeline(Pipeline):
+# Commands redis-py itself sends while (re)connecting; they only touch connection state.
+_HANDSHAKE_COMMANDS: frozenset[str] = frozenset(
+    {"AUTH", "HELLO", "SELECT", "CLIENT SETNAME", "CLIENT SETINFO", "CLIENT MAINT_NOTIFICATIONS"}
+)
+
+# Never allowed in the allowlist, whatever the future holds. Used by the self-test below.
+FORBIDDEN_COMMANDS: frozenset[str] = frozenset(
+    {
+        "SET", "GET", "MGET", "HGET", "HGETALL", "LRANGE", "SMEMBERS", "ZRANGE", "DEL", "UNLINK", "EXPIRE",
+        "FLUSHALL", "FLUSHDB", "KEYS", "CONFIG SET", "CONFIG REWRITE", "CONFIG RESETSTAT", "CLIENT KILL",
+        "CLIENT PAUSE", "CLIENT UNPAUSE", "CLIENT REPLY", "CLIENT TRACKING", "DEBUG", "EVAL", "EVALSHA",
+        "FCALL", "SCRIPT", "SCRIPT LOAD", "SCRIPT FLUSH", "FUNCTION", "ACL", "ACL LIST", "ACL GETUSER",
+        "ACL SETUSER", "MONITOR", "SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE", "PUBLISH", "XREAD", "XREADGROUP",
+        "XRANGE", "MULTI", "EXEC", "WATCH", "SHUTDOWN", "SLAVEOF", "REPLICAOF", "FAILOVER", "SAVE", "BGSAVE",
+        "BGREWRITEAOF", "SLOWLOG RESET", "CLUSTER FAILOVER", "CLUSTER RESET", "MIGRATE", "RESTORE", "DUMP",
+        "MODULE LOAD", "SYNC", "PSYNC", "SORT", "OBJECT HELP", "MEMORY PURGE", "LATENCY RESET", "AUTH", "HELLO",
+    }
+)  # fmt: skip
+
+
+def assert_allowlist_is_readonly() -> None:
+    """Self-test: fail loudly if a forbidden command ever lands in ``READ_ONLY_COMMANDS``."""
+    leaked = FORBIDDEN_COMMANDS & READ_ONLY_COMMANDS
+    if leaked:
+        raise ReadOnlyViolation(f"allowlist contains forbidden commands: {sorted(leaked)}")
+    for key in READ_ONLY_COMMANDS:
+        if key != key.upper() or key != key.strip() or key.count(" ") > 1:
+            raise ReadOnlyViolation(f"allowlist entry {key!r} is not in canonical form")
+        if " " in key and key.split(" ")[0] not in _CONTAINERS:
+            raise ReadOnlyViolation(f"allowlist entry {key!r} has a subcommand on a non-container command")
+
+
+assert_allowlist_is_readonly()
+
+
+def _check_handshake_or_allowed(args: tuple) -> None:
+    if command_key(args) in _HANDSHAKE_COMMANDS:
+        return
+    check(args)
+
+
+class _GuardedConnectionMixin:
+    """Mixed into the pool's connection class so raw ``send_command`` calls are checked too."""
+
+    _safe_packed_ok = False
+
+    def send_command(self, *args, **kwargs):
+        _check_handshake_or_allowed(args)
+        previous, self._safe_packed_ok = self._safe_packed_ok, True  # checked above
+        try:
+            return super().send_command(*args, **kwargs)  # type: ignore[misc]
+        finally:
+            self._safe_packed_ok = previous
+
+    def send_packed_command(self, command, check_health=True):
+        # Pre-packed bytes cannot be inspected; only SafePipeline (which re-checks every
+        # queued command first) may use them.
+        if not self._safe_packed_ok:
+            raise ReadOnlyViolation("raw packed commands are not allowed")
+        return super().send_packed_command(command, check_health=check_health)  # type: ignore[misc]
+
+
+def _guarded_class(cls: type) -> type:
+    if issubclass(cls, _GuardedConnectionMixin):
+        return cls
+    return type(f"Guarded{cls.__name__}", (_GuardedConnectionMixin, cls), {})
+
+
+class _BlockedHelpers:
+    """redis-py helpers that reach the wire without going through ``execute_command``."""
+
+    def _blocked(self, what: str):
+        raise ReadOnlyViolation(f"{what} is not allowed on a read-only client")
+
+    def pubsub(self, **kwargs):
+        self._blocked("pubsub (SUBSCRIBE/PSUBSCRIBE would expose live traffic)")
+
+    def monitor(self):
+        self._blocked("MONITOR (would expose live traffic, values included)")
+
+    def register_script(self, script):
+        self._blocked("register_script/EVALSHA")
+
+    def lock(self, *args, **kwargs):
+        self._blocked("lock (writes keys)")
+
+    def transaction(self, *args, **kwargs):
+        self._blocked("transaction (WATCH/MULTI/EXEC)")
+
+
+class SafePipeline(_BlockedHelpers, Pipeline):
     def execute_command(self, *args, **kwargs):
         check(args)
         return super().execute_command(*args, **kwargs)
 
+    def pipeline_execute_command(self, *args, **options):
+        check(args)
+        return super().pipeline_execute_command(*args, **options)
 
-class SafeRedis(redis.Redis):
+    def immediate_execute_command(self, *args, **options):
+        check(args)
+        return super().immediate_execute_command(*args, **options)
+
+    def multi(self):
+        raise ReadOnlyViolation("MULTI/EXEC transactions are not allowed")
+
+    def execute(self, raise_on_error: bool = True):
+        for args, _ in self.command_stack:
+            check(args)  # refuse before any connection is opened
+        return super().execute(raise_on_error)
+
+    def _execute_pipeline(self, connection, commands, raise_on_error):
+        for args, _ in commands:
+            check(args)
+        connection._safe_packed_ok = True
+        try:
+            return super()._execute_pipeline(connection, commands, raise_on_error)
+        finally:
+            connection._safe_packed_ok = False
+
+
+class SafeRedis(_BlockedHelpers, redis.Redis):
+    def __init__(self, *args, **kwargs):
+        if kwargs.get("single_connection_client"):
+            raise ReadOnlyViolation("single_connection_client is not supported")
+        super().__init__(*args, **kwargs)
+        pool = self.connection_pool
+        pool.connection_class = _guarded_class(pool.connection_class)
+
     def execute_command(self, *args, **options):
         check(args)
         return super().execute_command(*args, **options)

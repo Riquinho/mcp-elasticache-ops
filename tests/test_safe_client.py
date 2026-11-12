@@ -170,3 +170,187 @@ def test_pipeline_paths_use_the_same_guard():
     with pytest.raises(ReadOnlyViolation):
         r.execute_command("INFO\nSET k v")
     assert not pipe.command_stack
+
+
+# ---- bypass paths ---------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def offline():
+    return SafeRedis(host="127.0.0.1", port=1, socket_connect_timeout=0.2)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda r: r.pubsub(),
+        lambda r: r.monitor(),
+        lambda r: r.register_script("return 1"),
+        lambda r: r.lock("name"),
+        lambda r: r.transaction(lambda p: None, "k"),
+        lambda r: r.pipeline().pubsub(),
+        lambda r: r.pipeline().register_script("return 1"),
+        lambda r: r.pipeline().watch("k"),
+        lambda r: r.pipeline().multi(),
+        lambda r: r.client().eval("return 1", 0),
+        lambda r: r.subscribe if False else r.execute_command("SUBSCRIBE", "c"),
+    ],
+)
+def test_bypass_helpers_raise(offline, call):
+    with pytest.raises(ReadOnlyViolation):
+        call(offline)
+
+
+def test_raw_connection_send_command_is_guarded(offline):
+    conn = offline.connection_pool.make_connection()
+    for bad in (("SET", "k", "v"), ("MONITOR",), ("PSUBSCRIBE", "*"), ("FLUSHALL",), ("CONFIG GET", "*")):
+        with pytest.raises(ReadOnlyViolation):
+            conn.send_command(*bad)
+    with pytest.raises(ReadOnlyViolation):
+        conn.send_packed_command(b"*1\r\n$8\r\nFLUSHALL\r\n")
+    with pytest.raises(ReadOnlyViolation):
+        conn.send_packed_command(conn.pack_command("SET", "k", "v"))
+
+
+def test_single_connection_client_refused():
+    with pytest.raises(ReadOnlyViolation):
+        SafeRedis(host="127.0.0.1", port=1, single_connection_client=True)
+
+
+def test_pipeline_staging_paths_are_guarded(offline):
+    pipe = offline.pipeline()
+    with pytest.raises(ReadOnlyViolation):
+        pipe.pipeline_execute_command("SET", "k", "v")
+    with pytest.raises(ReadOnlyViolation):
+        pipe.immediate_execute_command("DEL", "k")
+    # a command smuggled into the stack after staging is still refused at execute time
+    pipe.command_stack.append((("FLUSHALL",), {}))
+    with pytest.raises(ReadOnlyViolation):
+        pipe.execute()
+
+
+def test_allowed_commands_still_work_on_the_wire():
+    """A tiny RESP server proves the guarded connection and pipeline do send allowed commands."""
+    import socket
+    import threading
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def serve():
+        conn, _ = srv.accept()
+        with conn:
+            while data := conn.recv(4096):
+                # one reply per command in this buffer (handshake commands reply +OK)
+                n = data.count(b"*")
+                reply = b"+PONG\r\n" if b"PING" in data else b"+OK\r\n"
+                conn.sendall(reply * max(n, 1))
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    try:
+        r = SafeRedis(host="127.0.0.1", port=port, socket_timeout=2, protocol=2, client_name="x")
+        assert r.ping() is True
+        assert r.pipeline().ping().ping().execute() == [True, True]
+    finally:
+        r.close()
+        srv.close()
+        t.join(1)
+
+
+# ---- allowlist self-test and fuzz --------------------------------------------------------------------------------
+
+
+def test_allowlist_self_test_passes_and_detects_leaks(monkeypatch):
+    from mcp_elasticache_ops import safe_client
+
+    safe_client.assert_allowlist_is_readonly()
+    monkeypatch.setattr(safe_client, "READ_ONLY_COMMANDS", READ_ONLY_COMMANDS | {"CONFIG SET"})
+    with pytest.raises(ReadOnlyViolation):
+        safe_client.assert_allowlist_is_readonly()
+    monkeypatch.setattr(safe_client, "READ_ONLY_COMMANDS", READ_ONLY_COMMANDS | {"get stuff"})
+    with pytest.raises(ReadOnlyViolation):
+        safe_client.assert_allowlist_is_readonly()
+    monkeypatch.setattr(safe_client, "READ_ONLY_COMMANDS", READ_ONLY_COMMANDS | {"PING PONG"})
+    with pytest.raises(ReadOnlyViolation):
+        safe_client.assert_allowlist_is_readonly()
+
+
+_BAD_BASES = [
+    ("CONFIG", "SET", "maxmemory", "1"),
+    ("CLIENT", "KILL", "ID", "1"),
+    ("SCRIPT", "FLUSH"),
+    ("SCRIPT", "LOAD", "return 1"),
+    ("DEBUG", "SLEEP", "1"),
+    ("EVAL", "return 1", "0"),
+    ("EVALSHA", "abc", "0"),
+    ("FUNCTION", "LIST"),
+    ("FUNCTION", "FLUSH"),
+    ("ACL", "LIST"),
+    ("ACL", "SETUSER", "x"),
+    ("XREAD", "STREAMS", "s", "0"),
+    ("SUBSCRIBE", "c"),
+    ("PSUBSCRIBE", "*"),
+    ("MONITOR",),
+    ("SET", "k", "v"),
+]
+
+
+def _variants(base):
+    name, *rest = base
+    yield (name, *rest)
+    yield (name.lower(), *rest)
+    yield (name.title(), *rest)
+    yield (name.encode(), *rest)
+    yield (f" {name}", *rest)
+    yield (f"{name} ", *rest)
+    yield (f"{name}\t", *rest)
+    yield (f"{name}\n", *rest)
+    yield (f"{name}\x00", *rest)
+    yield (f"{name}  ".replace(" ", " "), *rest)
+    yield (name.replace("E", "Е").replace("S", "Ѕ"), *rest)  # cyrillic lookalikes
+    yield (f"{name} {rest[0]}" if rest else name, *rest[1:])
+    yield (f"{name}  {rest[0]}" if rest else name, *rest[1:])
+    yield (name, *(x.lower() if isinstance(x, str) else x for x in rest))
+    if rest and isinstance(rest[0], str):
+        yield (name.encode(), rest[0].encode(), *rest[1:])
+
+
+@pytest.mark.parametrize("base", _BAD_BASES, ids=lambda b: " ".join(b[:2]))
+def test_fuzz_dangerous_commands_never_pass(base):
+    for args in _variants(base):
+        with pytest.raises(ReadOnlyViolation):
+            check(args)
+
+
+@pytest.mark.parametrize("key", sorted(READ_ONLY_COMMANDS))
+def test_fuzz_allowlisted_commands_are_case_and_bytes_insensitive(key):
+    name, _, sub = key.partition(" ")
+    extra = ("maxmemory",) if key == "CONFIG GET" else ()
+    for args in (
+        (key, *extra),
+        (key.lower(), *extra),
+        (key.encode(), *extra),
+        *([(name, sub, *extra), (name.lower().encode(), sub.lower().encode(), *extra)] if sub else []),
+    ):
+        check(args)
+
+
+@pytest.mark.parametrize("key", sorted(READ_ONLY_COMMANDS))
+def test_fuzz_allowlisted_commands_reject_whitespace_and_unicode_tricks(key):
+    for bad in (
+        f" {key}",
+        f"{key} ",
+        f"{key}\n",
+        f"\t{key}",
+        key.replace(" ", "  "),
+        key.replace(" ", "\n"),
+        key + "​",
+        key.replace("I", "І"),
+    ):
+        if bad == key:
+            continue
+        with pytest.raises(ReadOnlyViolation):
+            check((bad,))
