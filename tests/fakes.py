@@ -144,6 +144,10 @@ class FakeRedis:
 # Memcached commands at the socket level.
 
 AUDIT_AWS_RESPONSES: dict[str, dict[str, Any]] = {
+    "DescribeCacheParameterGroups": {
+        "CacheParameterGroups": [{"CacheParameterGroupName": "audit-tuned", "CacheParameterGroupFamily": "redis7"}]
+    },
+    "DescribeCacheParameters": {"Parameters": [{"ParameterName": "timeout", "ParameterValue": "5"}]},
     "DescribeReplicationGroups": {
         "ReplicationGroups": [
             {
@@ -176,6 +180,7 @@ AUDIT_AWS_RESPONSES: dict[str, dict[str, Any]] = {
             {
                 "CacheClusterId": "audit-rg-001",
                 "ReplicationGroupId": "audit-rg",
+                "CacheParameterGroup": {"CacheParameterGroupName": "audit-tuned"},
                 "Engine": "redis",
                 "EngineVersion": "7.1.0",
                 "CacheNodeType": "cache.r6g.large",

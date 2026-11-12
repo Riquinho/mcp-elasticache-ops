@@ -33,7 +33,7 @@ Conclude: sustained or spike, one node or all, top slow command, next step.
 4. `node_memory` for fragmentation, maxmemory and policy; `node_cluster_memory` to compare shards.
 5. `node_keyspace_sample` (or `node_cluster_keyspace_sample`) for big keys and missing TTLs. Add `include_sizes` to
    list key prefixes whose lists, sets, hashes or streams exceed a threshold (unbounded-growth candidates; prefixes only).
-6. `aws_parameters` to confirm maxmemory-policy and reserved-memory-percent.
+6. `aws_parameters` to confirm maxmemory-policy and reserved-memory-percent; `aws_parameter_groups` flags risky settings across all in-use custom groups.
 
 Conclude: leak or burst, which keys or shard, policy in force, hours until full, and the choice (TTLs, policy,
 shards, node type).

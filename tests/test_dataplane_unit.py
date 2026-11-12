@@ -1892,7 +1892,12 @@ def test_triage_includes_the_doctor_section():
     r.commands["MEMORY DOCTOR"] = _PROBLEM_MEMORY
     r.commands["LATENCY DOCTOR"] = _HEALTHY_LATENCY
     out = dataplane.triage(r)
-    assert out["sections"]["doctor"] == {"status": "ok", "memory": "findings", "latency": "healthy"}
+    assert out["sections"]["doctor"] == {
+        "status": "ok",
+        "memory": "findings",
+        "latency": "healthy",
+        "commandlog": "not available",
+    }
     assert any(f.get("section") == "doctor" for f in out["findings"])
 
 

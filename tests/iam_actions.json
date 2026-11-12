@@ -60,7 +60,9 @@
  ],
  "aws_parameter_groups": [
   "elasticache:DescribeCacheClusters",
-  "elasticache:DescribeCacheParameterGroups"
+  "elasticache:DescribeCacheEngineVersions",
+  "elasticache:DescribeCacheParameterGroups",
+  "elasticache:DescribeCacheParameters"
  ],
  "aws_parameters": [
   "elasticache:DescribeCacheParameters"

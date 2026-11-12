@@ -12,7 +12,7 @@ from botocore.exceptions import (
 )
 
 from .. import memcached
-from ..quirks import quirks_for
+from ..quirks import parameter_risks, quirks_for
 from ..quirks import summary as quirk_summary
 from ._core import _CoreMixin
 from ._shared import (
@@ -49,6 +49,8 @@ from .inventory_views import (  # noqa: F401
     _version_key,
 )
 from .restore import MAX_RESTORE_SNAPSHOTS, RESTORE_STALE_HOURS, group_restore_findings, serverless_restore_findings
+
+MAX_AUDITED_GROUPS = 25  # DescribeCacheParameters calls made by aws_parameter_groups
 
 
 class _InventoryMixin(_CoreMixin):
@@ -530,7 +532,10 @@ class _InventoryMixin(_CoreMixin):
 
         return self._guard(run)
 
-    def parameter_groups(self) -> dict:
+    def parameter_groups(self, audit_settings: bool = True) -> dict:
+        """Groups joined with running clusters; with ``audit_settings``, risky ``Source=user`` values of the custom
+        groups in use (rules in ``quirks.PARAM_RULES``), at most ``MAX_AUDITED_GROUPS`` groups."""
+
         def run() -> dict:
             groups = self._paginate("describe_cache_parameter_groups", "CacheParameterGroups")
             notes: list[str] = []
@@ -579,10 +584,50 @@ class _InventoryMixin(_CoreMixin):
                                 resource=name,
                             )
                         )
+            audited: list[str] = []
+            if audit_settings:
+                todo = [
+                    str(g.get("CacheParameterGroupName"))
+                    for g in groups
+                    if not str(g.get("CacheParameterGroupName")).startswith("default.")
+                    and (clusters is None or users.get(str(g.get("CacheParameterGroupName"))))
+                ]
+                if len(todo) > MAX_AUDITED_GROUPS:
+                    notes.append(f"settings audit covers {MAX_AUDITED_GROUPS} of {len(todo)} custom groups")
+                    todo = todo[:MAX_AUDITED_GROUPS]
+                family_of_group = {
+                    str(g.get("CacheParameterGroupName")): g.get("CacheParameterGroupFamily") for g in groups
+                }
+                for name in todo:
+                    try:
+                        params = self._paginate(
+                            "describe_cache_parameters", "Parameters", CacheParameterGroupName=name, Source="user"
+                        )
+                    except (BotoCoreError, ClientError) as exc:
+                        notes.append(
+                            f"settings audit stopped at {name}: DescribeCacheParameters failed ({_error_code(exc)})"
+                        )
+                        break
+                    audited.append(name)
+                    values = {str(p.get("ParameterName")): str(p.get("ParameterValue", "")) for p in params}
+                    for risk in parameter_risks(family_of_group[name], values):
+                        findings.append(
+                            finding(
+                                risk.rule.severity,
+                                risk.message(name),
+                                resource=name,
+                                category="parameter-risk",
+                                parameter=risk.parameter,
+                                value=risk.value,
+                                recommended=risk.rule.recommended,
+                                rule=risk.rule.key,
+                            )
+                        )
             return {
                 "count": len(views),
                 "findings": _sorted_findings(findings),
                 "parameter_groups": views,
+                **({"settings_audited": audited} if audit_settings else {}),
                 **({"partial": True, "notes": notes} if notes else {}),
             }
 

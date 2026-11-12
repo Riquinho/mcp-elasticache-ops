@@ -147,10 +147,13 @@ def aws_engine_versions(
 
 
 @server.read_tool
-def aws_parameter_groups(region: Region = None) -> dict:
-    """DescribeCacheParameterGroups joined with running clusters: family, which clusters use each
-    group, unused custom groups (info) and groups whose family differs from the running engine (warning)."""
-    return server._cp(region).parameter_groups()
+def aws_parameter_groups(
+    audit_settings: Annotated[bool, Field(description="Also flag risky user-set values in custom groups")] = True,
+    region: Region = None,
+) -> dict:
+    """DescribeCacheParameterGroups joined with running clusters: unused custom groups, family mismatch,
+    and risky Source=user settings (noeviction, timeout, keepalive, reserved-memory, lazyfree, slowlog)."""
+    return server._cp(region).parameter_groups(audit_settings)
 
 
 @server.read_tool

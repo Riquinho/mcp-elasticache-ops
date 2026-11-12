@@ -445,6 +445,11 @@
  "aws_parameter_groups": {
   "additionalProperties": false,
   "properties": {
+   "audit_settings": {
+    "default": true,
+    "description": "Also flag risky user-set values in custom groups",
+    "type": "boolean"
+   },
    "region": {
     "anyOf": [
      {

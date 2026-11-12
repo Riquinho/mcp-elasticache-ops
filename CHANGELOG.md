@@ -10,6 +10,15 @@ Round 24. 61 tools.
   primary endpoint (info, a pointer: describe data cannot show client config), no reader endpoint, single-replica
   shards, replicas in the primary's AZ, replicas not available, high replica lag. Rules in
   `controlplane/failover.py`; tests in `tests/test_reader_endpoint.py`.
+- `aws_parameter_groups` settings audit (`audit_settings`, default on): `DescribeCacheParameters` with `Source=user`
+  for in-use custom redis/valkey groups (all custom groups when the cluster listing is unavailable), at most 25
+  groups, stops with a partial note on the first denial. Rules in `quirks.PARAM_RULES` (noeviction, short timeout,
+  tcp-keepalive 0, cluster-require-full-coverage, reserved-memory-percent low or unset, lazyfree off, replica-lazy-flush
+  off, slowlog threshold too high); each finding names group, parameter, value and recommended value. Tests in
+  `tests/test_parameter_groups.py`. `aws_parameter_groups` now also needs `DescribeCacheParameters` and
+  `DescribeCacheEngineVersions` (already in the policy).
+- `node_cluster_triage`: explicit "reached N/M nodes" for the COMMANDLOG and CLUSTER LINKS fan-out, with failure-mode
+  tests (aggregation, hanging node, shard down, pre-Valkey-8 node).
 - `tools/list` byte budget raised from 50_500 to 51_200 for the 61st tool (docstring already trimmed).
 
 ## Round 23 additions to 0.3.0

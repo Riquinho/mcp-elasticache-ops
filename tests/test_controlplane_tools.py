@@ -1100,7 +1100,14 @@ def test_parameter_groups_flags_unused_custom_and_family_mismatch(aws):
     ec.add_response(
         "describe_cache_engine_versions", {"CacheEngineVersions": [_ev("7.0.7", "redis7")]}, {"Engine": "redis"}
     )
+    for group in ("stale", "ok"):
+        ec.add_response(
+            "describe_cache_parameters",
+            {"Parameters": []},
+            {"CacheParameterGroupName": group, "Source": "user"},
+        )
     out = cp.parameter_groups()
+    assert "partial" not in out and out["settings_audited"] == ["stale", "ok"]
     by_name = {g["name"]: g for g in out["parameter_groups"]}
     assert by_name["ok"]["in_use"] is True and by_name["ok"]["used_by"] == ["b-001"]
     assert by_name["orphan"]["in_use"] is False and by_name["default.redis7"]["custom"] is False
@@ -1123,8 +1130,11 @@ def test_parameter_groups_without_cluster_listing_skips_unused_findings(aws):
         {},
     )
     ec.add_client_error("describe_cache_clusters", service_error_code="AccessDenied", http_status_code=403)
+    ec.add_response(
+        "describe_cache_parameters", {"Parameters": []}, {"CacheParameterGroupName": "orphan", "Source": "user"}
+    )
     out = cp.parameter_groups()
-    assert out["partial"] is True and out["findings"] == []
+    assert out["partial"] is True and out["findings"] == [] and out["settings_audited"] == ["orphan"]
     assert out["parameter_groups"][0]["in_use"] is None
 
 
