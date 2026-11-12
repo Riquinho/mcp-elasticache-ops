@@ -34,7 +34,7 @@ jobs:
       - name: Lockfile is current
         run: uv lock --check
       - name: Dependency audit
-        run: uv export --locked --no-hashes --no-emit-project -o /tmp/req.txt && uvx pip-audit --disable-pip -r /tmp/req.txt
+        run: uv export --locked --no-hashes --no-emit-project -o /tmp/req.txt && uvx pip-audit --disable-pip --no-deps -r /tmp/req.txt
         shell: bash
       - name: Release check (CHANGELOG entry for the version, README tool table matches the registry)
         run: bash scripts/release-check.sh

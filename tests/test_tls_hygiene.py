@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 
 import botocore.session
 import pytest
@@ -66,7 +67,11 @@ def test_maintenance_reports_both_rules_from_describe_cache_clusters():
 
 
 def test_field_names_used_exist_in_the_botocore_describe_shapes():
-    model = botocore.session.get_session().get_service_model("elasticache")
+    # Load from the botocore package's own data dir: an earlier test (or AWS_DATA_PATH) must not hide the model.
+    data = os.path.join(os.path.dirname(botocore.__file__), "data")
+    session = botocore.session.get_session()
+    session.get_component("data_loader").search_paths[:] = [data]
+    model = session.get_service_model("elasticache")
     for shape in ("CacheCluster", "ReplicationGroup"):
         members = model.shape_for(shape).members
         for field in ("TransitEncryptionEnabled", "AuthTokenEnabled", "AuthTokenLastModifiedDate"):
