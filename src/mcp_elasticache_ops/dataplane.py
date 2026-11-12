@@ -22,6 +22,8 @@ from typing import Any
 
 import redis
 
+from .safe_client import CONFIG_GET_EXACT, CONFIG_GET_PREFIXES
+
 LENGTH_COMMAND = {
     "string": "STRLEN",
     "list": "LLEN",
@@ -37,6 +39,20 @@ def _try(fn, *args, **kwargs) -> tuple[Any, str | None]:
         return fn(*args, **kwargs), None
     except redis.ResponseError as exc:  # command disabled/renamed/unknown
         return None, str(exc)
+
+
+_SERVERLESS_HOST = re.compile(r"\.serverless\.[a-z0-9-]+\.cache\.amazonaws\.com\.?$", re.IGNORECASE)
+
+
+def is_serverless_host(host: str | None) -> bool:
+    """True for ElastiCache Serverless endpoints (``<name>.serverless.<region>.cache.amazonaws.com``)."""
+    return bool(host and _SERVERLESS_HOST.search(host.strip()))
+
+
+def _unsupported(what: str, err: str | None, serverless: bool) -> str:
+    if serverless:
+        return f"{what}: serverless: command not supported ({err})"
+    return f"{what}: unavailable ({err})"
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -75,8 +91,29 @@ def server_info(r: redis.Redis, section: str | None = None) -> dict:
     return {"section": section or "default", "info": redact(data)}
 
 
-def health_summary(r: redis.Redis) -> dict:
-    info = r.info()
+INFO_SECTIONS = ("server", "clients", "memory", "stats", "replication", "keyspace")
+
+
+def _info_all(r: redis.Redis, serverless: bool) -> tuple[dict, list[str]]:
+    """``INFO`` with a per-section fallback for endpoints that refuse the bare command."""
+    info, err = _try(r.info)
+    if info is not None:
+        return info, []
+    merged: dict = {}
+    notes = [_unsupported("INFO", err, serverless)]
+    for section in INFO_SECTIONS:
+        part, part_err = _try(r.info, section)
+        if part is None:
+            notes.append(_unsupported(f"INFO {section}", part_err, serverless))
+        else:
+            merged.update(part)
+    return merged, notes
+
+
+def health_summary(r: redis.Redis, serverless: bool = False) -> dict:
+    info, notes = _info_all(r, serverless)
+    if not info and notes:
+        return {"serverless": serverless, "findings": ["INFO is not available on this endpoint"], "notes": notes}
     hits, misses = _num(info.get("keyspace_hits")), _num(info.get("keyspace_misses"))
     maxmemory = _num(info.get("maxmemory"))
     used = _num(info.get("used_memory"))
@@ -112,15 +149,23 @@ def health_summary(r: redis.Redis) -> dict:
         "expired_keys": info.get("expired_keys"),
         "keyspace": {k: v for k, v in info.items() if k.startswith("db")},
         "findings": findings or ["no issues detected by basic thresholds"],
+        **({"serverless": serverless} if serverless else {}),
+        **({"notes": notes} if notes else {}),
     }
 
 
 # ------------------------------------------------------------------------- memory
 
 
-def memory_report(r: redis.Redis) -> dict:
-    mem = r.info("memory")
-    stats = r.info("stats")
+def memory_report(r: redis.Redis, serverless: bool = False) -> dict:
+    mem, mem_err = _try(r.info, "memory")
+    stats, stats_info_err = _try(r.info, "stats")
+    if mem is None:
+        return {
+            "serverless": serverless,
+            "notes": [_unsupported("INFO memory", mem_err, serverless), *_serverless_hint(serverless)],
+        }
+    stats = stats or {}
     used = _num(mem.get("used_memory"))
     maxmemory = _num(mem.get("maxmemory"))
     rss = _num(mem.get("used_memory_rss"))
@@ -151,6 +196,16 @@ def memory_report(r: redis.Redis) -> dict:
         "evicted_keys": stats.get("evicted_keys"),
         "memory_stats": memory_stats if memory_stats is not None else {"unavailable": stats_err},
         "memory_doctor": doctor if doctor is not None else {"unavailable": doctor_err},
+        **(
+            {
+                "notes": [
+                    *([_unsupported("INFO stats", stats_info_err, serverless)] if stats_info_err else []),
+                    *_serverless_hint(serverless),
+                ]
+            }
+            if stats_info_err or serverless
+            else {}
+        ),
         "note": (
             "On ElastiCache, maxmemory already excludes reserved-memory-percent; "
             "compare with the BytesUsedForCache and DatabaseMemoryUsagePercentage metrics."
@@ -158,17 +213,34 @@ def memory_report(r: redis.Redis) -> dict:
     }
 
 
+def _serverless_hint(serverless: bool) -> list[str]:
+    if not serverless:
+        return []
+    return [
+        "ElastiCache Serverless manages memory and eviction itself; use aws_metrics with serverless=true "
+        "(BytesUsedForCache, ElastiCacheProcessingUnits) for capacity."
+    ]
+
+
 # ------------------------------------------------------------------------ slowlog
 
 
-def slowlog(r: redis.Redis, count: int = 25, include_args: bool = False) -> dict:
+def slowlog(r: redis.Redis, count: int = 25, include_args: bool = False, serverless: bool = False) -> dict:
     """SLOWLOG GET with per-command aggregation.
 
     By default only the command name and the first argument (usually the key)
     are returned, so values passed to SET/HSET etc. never leave the server.
     """
     count = max(1, min(int(count), 1024))
-    entries = r.slowlog_get(count)
+    entries, err = _try(r.slowlog_get, count)
+    if entries is None:
+        return {
+            "slowlog_len": None,
+            "returned": 0,
+            "by_command": [],
+            "entries": [],
+            "notes": [_unsupported("SLOWLOG GET", err, serverless)],
+        }
     total_len, _ = _try(r.slowlog_len)
     out = []
     by_cmd: dict[str, list[int]] = defaultdict(list)
@@ -289,6 +361,138 @@ def commandstats(r: redis.Redis, top: int = 20) -> dict:
         )
     rows.sort(key=lambda x: x["usec"], reverse=True)
     return {"commands": len(rows), "top_by_total_time": rows[: max(1, int(top))]}
+
+
+# ----------------------------------------------------------------------- config
+
+CONFIG_FALLBACK_NOTE = (
+    "CONFIG GET is refused by this endpoint (managed services restrict it); read the effective values "
+    "from the parameter group with aws_parameters."
+)
+IDLE_CLIENTS_WARN = 20  # clients idle for over an hour that make timeout=0 worth flagging
+_KEYSPACE_CLASSES = set("gl$szxetd")  # event classes besides K/E; A is the alias for all of them
+_SEVERITY_RANK = {"critical": 0, "warning": 1, "info": 2}
+
+
+def config_patterns() -> list[str]:
+    """CONFIG GET patterns requested by ``config_view``: only allowlisted names and prefixes."""
+    return [*sorted(CONFIG_GET_EXACT), *(f"{p}*" for p in CONFIG_GET_PREFIXES)]
+
+
+def _cfg_finding(severity: str, message: str, parameter: str) -> dict:
+    return {"severity": severity, "message": message, "parameter": parameter}
+
+
+def config_findings(cfg: dict[str, str], idle_clients: int | None = None) -> list[dict]:
+    out: list[dict] = []
+    if cfg.get("maxmemory-policy") == "noeviction" and _num(cfg.get("maxmemory")) != 0:
+        out.append(
+            _cfg_finding(
+                "warning",
+                "maxmemory-policy is noeviction: writes fail with OOM once memory is full. "
+                "Fine for a datastore, wrong for a cache (use allkeys-lru, allkeys-lfu or volatile-ttl).",
+                "maxmemory-policy",
+            )
+        )
+    if cfg.get("timeout") is not None and _num(cfg["timeout"]) == 0 and (idle_clients or 0) >= IDLE_CLIENTS_WARN:
+        out.append(
+            _cfg_finding(
+                "warning",
+                f"timeout is 0 (idle connections are never closed) and {idle_clients} clients have been idle for "
+                "over an hour: leaked connections count against maxclients. Set timeout or fix client pooling.",
+                "timeout",
+            )
+        )
+    if str(cfg.get("appendonly", "")).lower() == "yes":
+        out.append(
+            _cfg_finding(
+                "warning",
+                "appendonly is yes: AOF adds fsync latency and ElastiCache does not support AOF persistence "
+                "(use snapshots and Multi-AZ replicas).",
+                "appendonly",
+            )
+        )
+    if cfg.get("latency-monitor-threshold") is not None and _num(cfg["latency-monitor-threshold"]) == 0:
+        out.append(
+            _cfg_finding(
+                "info",
+                "latency-monitor-threshold is 0: LATENCY LATEST stays empty. "
+                "Set it (for example 100 ms) in the parameter group.",
+                "latency-monitor-threshold",
+            )
+        )
+    slower = cfg.get("slowlog-log-slower-than")
+    if slower is not None and _num(slower) < 0:
+        out.append(
+            _cfg_finding(
+                "warning", "slowlog-log-slower-than is negative: the slow log is disabled", "slowlog-log-slower-than"
+            )
+        )
+    elif slower is not None and _num(slower) == 0:
+        out.append(
+            _cfg_finding(
+                "warning",
+                "slowlog-log-slower-than is 0: every command is logged, which pushes out real slow entries "
+                "and costs CPU",
+                "slowlog-log-slower-than",
+            )
+        )
+    events = cfg.get("notify-keyspace-events") or ""
+    if events:
+        classes = set(events.replace("A", "gl$szxetd")) & _KEYSPACE_CLASSES
+        if len(classes) >= 4:
+            out.append(
+                _cfg_finding(
+                    "warning",
+                    f"notify-keyspace-events is {events!r}: broad keyspace notifications publish an event per "
+                    "write and add CPU and output-buffer load. Enable only the classes you consume.",
+                    "notify-keyspace-events",
+                )
+            )
+        else:
+            out.append(
+                _cfg_finding(
+                    "info",
+                    f"notify-keyspace-events is {events!r}: each matching event is published to Pub/Sub; "
+                    "cost grows with the write rate.",
+                    "notify-keyspace-events",
+                )
+            )
+    return out
+
+
+def config_view(r: redis.Redis) -> dict:
+    """Allowlisted ``CONFIG GET`` parameters with ElastiCache-aware findings.
+
+    Only names in ``CONFIG_GET_EXACT`` and prefixes in ``CONFIG_GET_PREFIXES`` are requested, so secrets
+    (``requirepass``, ``masterauth``, TLS paths) are never asked for. When the endpoint refuses CONFIG
+    (ElastiCache and Serverless do), the result is a note pointing at ``aws_parameters``.
+    """
+    cfg: dict[str, str] = {}
+    refused: list[str] = []
+    first_error: str | None = None
+    for pattern in config_patterns():
+        got, err = _try(r.config_get, pattern)
+        if got is None:
+            refused.append(pattern)
+            first_error = first_error or err
+            continue
+        cfg.update({str(_s(k)): str(_s(v)) for k, v in got.items()})
+    if not cfg:
+        return {
+            "available": False,
+            "config": {},
+            "findings": [],
+            "notes": [CONFIG_FALLBACK_NOTE, f"first error: {first_error}"],
+        }
+    clients, _ = _try(r.client_list)
+    idle = sum(1 for c in clients if _num(c.get("idle")) > 3600) if clients is not None else None
+    findings = sorted(config_findings(cfg, idle), key=lambda f: _SEVERITY_RANK.get(f["severity"], 3))
+    out: dict[str, Any] = {"available": True, "config": redact(dict(sorted(cfg.items()))), "findings": findings}
+    if refused:
+        out["notes"] = [CONFIG_FALLBACK_NOTE]
+        out["refused_patterns"] = refused
+    return out
 
 
 # --------------------------------------------------------------------- keyspace
@@ -443,26 +647,42 @@ def replication(r: redis.Redis) -> dict:
     }
 
 
-def cluster(r: redis.Redis) -> dict:
-    enabled = int(_num(r.info("cluster").get("cluster_enabled")))
+def cluster(r: redis.Redis, serverless: bool = False) -> dict:
+    cluster_info, info_err = _try(r.info, "cluster")
+    notes: list[str] = []
+    if cluster_info is None:
+        notes.append(_unsupported("INFO cluster", info_err, serverless))
+        enabled = serverless  # Serverless endpoints use cluster-mode client semantics
+    else:
+        enabled = bool(int(_num(cluster_info.get("cluster_enabled"))))
     if not enabled:
-        return {"cluster_enabled": False, "note": "cluster mode disabled (single shard)"}
-    info = r.execute_command("CLUSTER INFO")
-    if isinstance(info, (bytes, str)):
+        return {
+            "cluster_enabled": False,
+            "note": "cluster mode disabled (single shard)",
+            **({"notes": notes} if notes else {}),
+        }
+    info, cinfo_err = _try(r.execute_command, "CLUSTER INFO")
+    if info is None:
+        notes.append(_unsupported("CLUSTER INFO", cinfo_err, serverless))
+    elif isinstance(info, (bytes, str)):
         info = dict(line.split(":", 1) for line in _s(info).splitlines() if ":" in line)
     shards, shards_err = _try(r.execute_command, "CLUSTER", "SHARDS")
-    slots, _ = _try(r.execute_command, "CLUSTER", "SLOTS")
+    slots, slots_err = _try(r.execute_command, "CLUSTER", "SLOTS")
+    if slots is None:
+        notes.append(_unsupported("CLUSTER SLOTS", slots_err, serverless))
     coverage: dict[str, int] = Counter()
     for row in slots or []:
         start, end, master = row[0], row[1], row[2]
         host = _s(master[0]) if master else "?"
         coverage[f"{host}:{master[1]}"] += int(end) - int(start) + 1
+    notes += _serverless_hint(serverless)
     return {
         "cluster_enabled": True,
-        "cluster_info": _jsonable(info),
+        "cluster_info": _jsonable(info) if info is not None else {"unavailable": cinfo_err},
         "slots_per_primary": dict(coverage),
         "slots_covered": sum(coverage.values()),
         "shards": _jsonable(shards) if shards is not None else {"unavailable": shards_err},
+        **({"notes": notes} if notes else {}),
     }
 
 
@@ -509,14 +729,26 @@ def _endpoint(n: dict) -> str:
     return f"{n.get('hostname') or n['ip']}:{n['port']}"
 
 
-def cluster_nodes(r: redis.Redis) -> dict:
+def cluster_nodes(r: redis.Redis, serverless: bool = False) -> dict:
     """Per-shard endpoints from CLUSTER NODES, with a recommendation for fan-out."""
-    cluster_info, _ = _try(r.info, "cluster")
-    if not int(_num((cluster_info or {}).get("cluster_enabled"))):
+    cluster_info, info_err = _try(r.info, "cluster")
+    if cluster_info is not None and not int(_num(cluster_info.get("cluster_enabled"))):
         return {"cluster_enabled": False, "note": "cluster mode disabled (single shard); use the primary endpoint"}
     raw, err = _try(r.execute_command, "CLUSTER", "NODES")
     if raw is None:
-        return {"cluster_enabled": True, "unavailable": err}
+        notes = [_unsupported("CLUSTER NODES", err, serverless)]
+        if cluster_info is None:
+            notes.append(_unsupported("INFO cluster", info_err, serverless))
+        if serverless:
+            notes.append(
+                "ElastiCache Serverless exposes one TLS endpoint and hides node topology; "
+                "connect with a cluster-aware client to that endpoint."
+            )
+        return {
+            "cluster_enabled": True if cluster_info is not None or serverless else None,
+            "unavailable": err,
+            "notes": notes,
+        }
     nodes = parse_cluster_nodes(_s(raw))
     primaries = [n for n in nodes if n["role"] == "primary"]
     shards = []

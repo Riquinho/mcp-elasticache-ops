@@ -69,6 +69,38 @@ MAXCLIENTS_DEFAULT = 65_000  # ElastiCache default maxclients
 MAX_QUERIES_PER_CALL = 500  # GetMetricData limit
 ALLOWED_PREFIXES = ("describe_", "list_", "get_metric_data")
 
+TRIAGE_WINDOW_HOURS = 6
+MAX_TRIAGE_FINDINGS = 30
+TRIAGE_METRICS = [
+    "EngineCPUUtilization",
+    "DatabaseMemoryUsagePercentage",
+    "Evictions",
+    "ReplicationLag",
+    "CurrConnections",
+]
+_TRIAGE_FATAL = {"ReplicationGroupNotFoundFault"}  # nothing useful to report: surface it as the tool error
+_PENDING_ACTION_STATUSES = (
+    "not-applied",
+    "waiting-to-start",
+    "in-progress",
+    "stopping",
+    "stopped",
+    "scheduling",
+    "scheduled",
+)
+IMPORTANT_PARAMETERS = {
+    "maxmemory-policy",
+    "reserved-memory-percent",
+    "timeout",
+    "appendonly",
+    "cluster-enabled",
+    "notify-keyspace-events",
+    "maxclients",
+    "activedefrag",
+    "lazyfree-lazy-eviction",
+    "tcp-keepalive",
+}
+
 _SEVERITY_ORDER = {"critical": 0, "important": 1, "warning": 2, "medium": 3, "low": 4, "info": 5}
 
 
@@ -139,7 +171,8 @@ class ControlPlane:
             kwargs = {"ReplicationGroupId": replication_group_id} if replication_group_id else {}
             groups = self._paginate("describe_replication_groups", "ReplicationGroups", **kwargs)
             versions = self._member_engine_versions() if groups else {}
-            views = [_rg_view(g, versions.get(g.get("ReplicationGroupId"))) for g in groups]
+            ctx = self._engine_context({engine.lower() for engine, _ in versions.values()}, False)
+            views = [_rg_view(g, versions.get(g.get("ReplicationGroupId")), ctx) for g in groups]
             findings = [{**f, "resource": v["id"]} for v in views for f in v["findings"]]
             return {
                 "count": len(groups),
@@ -168,7 +201,10 @@ class ControlPlane:
             if cache_cluster_id:
                 kwargs["CacheClusterId"] = cache_cluster_id
             clusters = self._paginate("describe_cache_clusters", "CacheClusters", **kwargs)
-            return {"count": len(clusters), "cache_clusters": [_cluster_view(c) for c in clusters]}
+            ctx = self._engine_context({str(c.get("Engine", "")).lower() for c in clusters}, bool(clusters))
+            views = [_cluster_view(c, ctx) for c in clusters]
+            findings = [{**f, "resource": v["id"]} for v in views for f in v["findings"]]
+            return {"count": len(clusters), "findings": _sorted_findings(findings), "cache_clusters": views}
 
         return self._guard(run)
 
@@ -182,7 +218,8 @@ class ControlPlane:
                 token = page.get("NextToken")
                 if not token:
                     break
-            return {"count": len(items), "serverless_caches": _jsonable(items)}
+            findings = [f for c in items for f in _serverless_cache_findings(c)]
+            return {"count": len(items), "findings": _sorted_findings(findings), "serverless_caches": _jsonable(items)}
 
         return self._guard(run)
 
@@ -490,65 +527,14 @@ class ControlPlane:
                     return {"error": "NoMembers", "message": f"replication group {replication_group_id} has no members"}
             else:
                 targets = [str(cache_cluster_id)]
-            end = self._clock()
-            start = end - dt.timedelta(minutes=int(minutes))
-            queries, idx = [], 0
-            for target in targets:
-                if serverless:
-                    dims = [{"Name": "clusterId", "Value": target}]
-                else:
-                    dims = [{"Name": "CacheClusterId", "Value": target}]
-                    if node_id:
-                        dims.append({"Name": "CacheNodeId", "Value": node_id})
-                for name in names:
-                    queries.append(
-                        {
-                            "Id": f"m{idx}",
-                            "Label": f"{target}|{name}",
-                            "MetricStat": {
-                                "Metric": {"Namespace": "AWS/ElastiCache", "MetricName": name, "Dimensions": dims},
-                                "Period": int(period_seconds),
-                                "Stat": "Sum" if name in SUM_STAT_METRICS else "Average",
-                            },
-                            "ReturnData": True,
-                        }
-                    )
-                    idx += 1
-            cw = self.client("cloudwatch")
-            points: dict[str, dict[str, list[tuple[dt.datetime, float]]]] = defaultdict(lambda: defaultdict(list))
-            for i in range(0, len(queries), MAX_QUERIES_PER_CALL):
-                chunk = queries[i : i + MAX_QUERIES_PER_CALL]
-                token = None
-                while True:
-                    kwargs: dict[str, Any] = {"MetricDataQueries": chunk, "StartTime": start, "EndTime": end}
-                    if token:
-                        kwargs["NextToken"] = token
-                    resp = cw.get_metric_data(**kwargs)
-                    for res in resp.get("MetricDataResults", []):
-                        target, _, name = res["Label"].rpartition("|")
-                        points[target][name].extend(zip(res.get("Timestamps", []), res.get("Values", []), strict=False))
-                    token = resp.get("NextToken")
-                    if not token:
-                        break
-            series: dict[str, dict[str, dict]] = {}
-            summary: dict[str, dict[str, dict]] = {}
-            findings: list[dict] = []
-            for target in targets:
-                series[target], summary[target] = {}, {}
-                for name in names:
-                    pts = sorted(points[target][name], key=lambda p: p[0])  # CloudWatch default is newest first
-                    series[target][name] = {
-                        "timestamps": [t.isoformat() for t, _ in pts],
-                        "values": [v for _, v in pts],
-                    }
-                    summary[target][name] = _summarize([v for _, v in pts])
-                findings += _metric_findings(target, summary[target])
-                if all(s["points"] == 0 for s in summary[target].values()):
-                    findings.append(
-                        finding(
-                            "info", "no datapoints returned (check the id, region and time window)", resource=target
-                        )
-                    )
+            summary, series, findings = self._collect_metrics(
+                targets, names, minutes, period_seconds, node_id, serverless
+            )
+            limits: dict[str, dict] = {}
+            if serverless:
+                limits = self._serverless_limits(targets)
+                for target in targets:
+                    findings += _serverless_limit_findings(target, summary[target], limits.get(target), period_seconds)
             single = len(targets) == 1
             out: dict[str, Any] = {
                 "cache_cluster_id": cache_cluster_id,
@@ -560,11 +546,291 @@ class ControlPlane:
                 "findings": _sorted_findings(findings),
                 "summary": summary[targets[0]] if single else summary,
             }
+            if serverless:
+                out["serverless_limits"] = {t: _limits_view(limits.get(t), summary[t], period_seconds) for t in targets}
             if include_series:
                 out["series"] = series[targets[0]] if single else series
             return out
 
         return self._guard(run)
+
+    def _collect_metrics(
+        self,
+        targets: list[str],
+        names: list[str],
+        minutes: int,
+        period_seconds: int,
+        node_id: str | None,
+        serverless: bool,
+        rightsizing: bool = True,
+    ) -> tuple[dict[str, dict[str, dict]], dict[str, dict[str, dict]], list[dict]]:
+        """GetMetricData for every target/metric; returns (summary, series, findings) keyed by target."""
+        end = self._clock()
+        start = end - dt.timedelta(minutes=int(minutes))
+        queries, idx = [], 0
+        for target in targets:
+            if serverless:
+                dims = [{"Name": "clusterId", "Value": target}]
+            else:
+                dims = [{"Name": "CacheClusterId", "Value": target}]
+                if node_id:
+                    dims.append({"Name": "CacheNodeId", "Value": node_id})
+            for name in names:
+                queries.append(
+                    {
+                        "Id": f"m{idx}",
+                        "Label": f"{target}|{name}",
+                        "MetricStat": {
+                            "Metric": {"Namespace": "AWS/ElastiCache", "MetricName": name, "Dimensions": dims},
+                            "Period": int(period_seconds),
+                            "Stat": "Sum" if name in SUM_STAT_METRICS else "Average",
+                        },
+                        "ReturnData": True,
+                    }
+                )
+                idx += 1
+        cw = self.client("cloudwatch")
+        points: dict[str, dict[str, list[tuple[dt.datetime, float]]]] = defaultdict(lambda: defaultdict(list))
+        for i in range(0, len(queries), MAX_QUERIES_PER_CALL):
+            chunk = queries[i : i + MAX_QUERIES_PER_CALL]
+            token = None
+            while True:
+                kwargs: dict[str, Any] = {"MetricDataQueries": chunk, "StartTime": start, "EndTime": end}
+                if token:
+                    kwargs["NextToken"] = token
+                resp = cw.get_metric_data(**kwargs)
+                for res in resp.get("MetricDataResults", []):
+                    target, _, name = res["Label"].rpartition("|")
+                    points[target][name].extend(zip(res.get("Timestamps", []), res.get("Values", []), strict=False))
+                token = resp.get("NextToken")
+                if not token:
+                    break
+        series: dict[str, dict[str, dict]] = {}
+        summary: dict[str, dict[str, dict]] = {}
+        findings: list[dict] = []
+        for target in targets:
+            series[target], summary[target] = {}, {}
+            for name in names:
+                pts = sorted(points[target][name], key=lambda p: p[0])  # CloudWatch default is newest first
+                series[target][name] = {
+                    "timestamps": [t.isoformat() for t, _ in pts],
+                    "values": [v for _, v in pts],
+                }
+                summary[target][name] = _summarize([v for _, v in pts])
+            findings += _metric_findings(target, summary[target])
+            if rightsizing and not serverless:
+                findings += _rightsizing_findings(target, summary[target], minutes)
+            if all(s["points"] == 0 for s in summary[target].values()):
+                findings.append(
+                    finding("info", "no datapoints returned (check the id, region and time window)", resource=target)
+                )
+        return summary, series, findings
+
+    def _engine_context(self, engines: set[str], with_parameter_groups: bool) -> dict[str, Any]:
+        """Engine versions, their parameter group families and parameter group families, best effort.
+
+        Used only to add findings; any API failure just means fewer findings, never a failed tool.
+        """
+        versions: dict[str, set[str]] = defaultdict(set)
+        family_of: dict[tuple[str, str], str] = {}
+        for engine in sorted(e for e in engines if e):
+            try:
+                items = self._paginate("describe_cache_engine_versions", "CacheEngineVersions", Engine=engine)
+            except (BotoCoreError, ClientError):
+                continue
+            for item in items:
+                version = str(item.get("EngineVersion", ""))
+                versions[engine].add(version)
+                if item.get("CacheParameterGroupFamily"):
+                    family_of[(engine, version)] = str(item["CacheParameterGroupFamily"])
+        parameter_group_family: dict[str, str] = {}
+        if with_parameter_groups:
+            try:
+                groups = self._paginate("describe_cache_parameter_groups", "CacheParameterGroups")
+            except (BotoCoreError, ClientError):
+                groups = []
+            parameter_group_family = {
+                str(g.get("CacheParameterGroupName")): str(g["CacheParameterGroupFamily"])
+                for g in groups
+                if g.get("CacheParameterGroupFamily")
+            }
+        return {"versions": versions, "family_of": family_of, "parameter_group_family": parameter_group_family}
+
+    def parameter_drift(self, group_a: str, group_b: str) -> dict:
+        """Diff two parameter groups: only parameters whose values differ and that one side modified."""
+
+        def run() -> dict:
+            def load(name: str) -> dict[str, dict]:
+                params = self._paginate("describe_cache_parameters", "Parameters", CacheParameterGroupName=name)
+                return {str(p.get("ParameterName")): p for p in params}
+
+            a, b = load(group_a), load(group_b)
+            diffs: list[dict] = []
+            default_only = 0
+            for name in sorted(set(a) & set(b)):
+                va, vb = a[name].get("ParameterValue"), b[name].get("ParameterValue")
+                if str(va) == str(vb):
+                    continue
+                if a[name].get("Source") != "user" and b[name].get("Source") != "user":
+                    default_only += 1  # different engine defaults, nobody changed anything
+                    continue
+                diffs.append(
+                    {
+                        "parameter": name,
+                        "value_a": va,
+                        "value_b": vb,
+                        "source_a": a[name].get("Source"),
+                        "source_b": b[name].get("Source"),
+                        "change_type": a[name].get("ChangeType") or b[name].get("ChangeType"),
+                    }
+                )
+            families = self._parameter_group_families([group_a, group_b])
+            findings = _drift_findings(group_a, group_b, diffs, families)
+            return {
+                "group_a": group_a,
+                "group_b": group_b,
+                "families": families,
+                "differences": diffs,
+                "difference_count": len(diffs),
+                "only_in_a": sorted(set(a) - set(b)),
+                "only_in_b": sorted(set(b) - set(a)),
+                "ignored_default_only_differences": default_only,
+                "findings": _sorted_findings(findings),
+            }
+
+        return self._guard(run)
+
+    def _parameter_group_families(self, names: list[str]) -> dict[str, str | None]:
+        out: dict[str, str | None] = {}
+        for name in names:
+            try:
+                groups = self._paginate(
+                    "describe_cache_parameter_groups", "CacheParameterGroups", CacheParameterGroupName=name
+                )
+            except (BotoCoreError, ClientError):
+                groups = []
+            out[name] = groups[0].get("CacheParameterGroupFamily") if groups else None
+        return out
+
+    # --------------------------------------------------------------- triage
+    def triage(self, replication_group_id: str) -> dict:
+        """One-call incident summary for a replication group: worst findings first, per-section status."""
+
+        def run() -> dict:
+            now = self._clock()
+            members: list[str] = []
+            sections: list[dict] = []
+            findings: list[dict] = []
+
+            def section(name: str, fn: Callable[[], tuple[str, list[dict]]]) -> None:
+                try:
+                    summary, found = fn()
+                except (NoCredentialsError, NoRegionError):
+                    raise
+                except ClientError as exc:
+                    err = exc.response.get("Error", {})
+                    code = err.get("Code", "ClientError")
+                    if code in _TRIAGE_FATAL:
+                        raise
+                    detail = f"{code}: {err.get('Message', exc)}"
+                except BotoCoreError as exc:
+                    detail = f"{type(exc).__name__}: {exc}"
+                else:
+                    status = _worst_status(found)
+                    sections.append({"section": name, "status": status, "summary": summary})
+                    findings.extend(
+                        {**f, "section": name, "resource": f.get("resource", replication_group_id)} for f in found
+                    )
+                    return
+                sections.append({"section": name, "status": "unavailable", "summary": detail})
+                findings.append(
+                    finding("warning", f"{name} unavailable ({detail})", resource=replication_group_id, section=name)
+                )
+
+            def rg_section() -> tuple[str, list[dict]]:
+                groups = self._paginate(
+                    "describe_replication_groups", "ReplicationGroups", ReplicationGroupId=replication_group_id
+                )
+                if not groups:
+                    raise _TriageEmpty(f"replication group {replication_group_id} not found")
+                g = groups[0]
+                members.extend(g.get("MemberClusters", []))
+                found = _triage_rg_findings(g)
+                summary = (
+                    f"status {g.get('Status')}, multi-az {g.get('MultiAZ')}, failover {g.get('AutomaticFailover')}, "
+                    f"{len(members)} member(s), {len(g.get('NodeGroups', []))} shard(s)"
+                )
+                return summary, found
+
+            def events_section() -> tuple[str, list[dict]]:
+                events = self._paginate(
+                    "describe_events",
+                    "Events",
+                    SourceIdentifier=replication_group_id,
+                    SourceType="replication-group",
+                    Duration=TRIAGE_WINDOW_HOURS * 60,
+                )
+                found, notable = _triage_event_findings(events)
+                return f"{len(events)} event(s) in the last {TRIAGE_WINDOW_HOURS}h, {notable} notable", found
+
+            def metrics_section() -> tuple[str, list[dict]]:
+                if not members:
+                    raise _TriageEmpty("no member clusters known (replication group section failed)")
+                summary, _, found = self._collect_metrics(
+                    members, TRIAGE_METRICS, TRIAGE_WINDOW_HOURS * 60, 300, None, False, rightsizing=False
+                )
+                peaks = _triage_peaks(summary)
+                text = ", ".join(f"{k} {v['value']:.4g} on {v['member']}" for k, v in peaks.items())
+                return f"peaks over {TRIAGE_WINDOW_HOURS}h: {text or 'no datapoints'}", found
+
+            def updates_section() -> tuple[str, list[dict]]:
+                actions = self._paginate(
+                    "describe_update_actions",
+                    "UpdateActions",
+                    ReplicationGroupIds=[replication_group_id],
+                    UpdateActionStatus=list(_PENDING_ACTION_STATUSES),
+                )
+                found = _triage_update_findings(actions, now)
+                return f"{len(actions)} pending service update action(s)", found
+
+            def snapshots_section() -> tuple[str, list[dict]]:
+                snaps = self._paginate("describe_snapshots", "Snapshots", ReplicationGroupId=replication_group_id)
+                views = [_snapshot_view(x, now) for x in snaps]
+                ages = [v["age_hours"] for v in views if v["status"] == "available" and v["age_hours"] is not None]
+                found = _snapshot_findings(views, now, 36)
+                text = f"newest available snapshot {min(ages):.0f}h old" if ages else "no available snapshot"
+                return text, found
+
+            section("replication_group", rg_section)
+            section("events", events_section)
+            section("metrics", metrics_section)
+            section("service_updates", updates_section)
+            section("snapshots", snapshots_section)
+            ordered = _sorted_findings(findings)
+            return {
+                "replication_group_id": replication_group_id,
+                "generated_at": now.isoformat(),
+                "window_hours": TRIAGE_WINDOW_HOURS,
+                "overall": _worst_status(ordered) if ordered else "ok",
+                "sections": sections,
+                "findings": ordered[:MAX_TRIAGE_FINDINGS],
+                "findings_total": len(ordered),
+                "truncated": len(ordered) > MAX_TRIAGE_FINDINGS,
+            }
+
+        return self._guard(run)
+
+    def _serverless_limits(self, targets: list[str]) -> dict[str, dict]:
+        """Configured usage limits per serverless cache; best effort, never fails the metrics call."""
+        out: dict[str, dict] = {}
+        for target in targets:
+            try:
+                caches = self._paginate("describe_serverless_caches", "ServerlessCaches", ServerlessCacheName=target)
+            except (BotoCoreError, ClientError):
+                continue
+            if caches:
+                out[target] = caches[0].get("CacheUsageLimits") or {}
+        return out
 
 
 def _validate_window(minutes: Any, period_seconds: Any) -> str | None:
@@ -638,6 +904,307 @@ def _metric_findings(resource: str, summary: dict[str, dict]) -> list[dict]:
         add(
             "warning",
             f"network bandwidth allowance exceeded {bw:.0f} times (packets shaped); consider a larger node type",
+        )
+    return out
+
+
+class _TriageEmpty(BotoCoreError):
+    """A triage section has nothing to work with; reported as an unavailable section."""
+
+    fmt = "{detail}"
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail=detail)
+
+
+def _worst_status(findings: list[dict]) -> str:
+    sevs = {f["severity"] for f in findings}
+    if "critical" in sevs:
+        return "critical"
+    if sevs & {"warning", "important"}:
+        return "warning"
+    return "ok"
+
+
+def _triage_rg_findings(g: dict) -> list[dict]:
+    out: list[dict] = []
+    status = g.get("Status")
+    if status in {"create-failed", "incompatible-network", "snapshot-failed"}:
+        out.append(finding("critical", f"replication group status is {status}"))
+    elif status not in (None, "available"):
+        out.append(finding("warning", f"replication group status is {status}"))
+    if g.get("AutomaticFailover") not in (None, "enabled"):
+        out.append(finding("warning", "automatic failover is not enabled: a primary failure needs manual action"))
+    if g.get("MultiAZ") not in (None, "enabled"):
+        out.append(finding("warning", "Multi-AZ is not enabled"))
+    for ng in g.get("NodeGroups", []):
+        members = ng.get("NodeGroupMembers", [])
+        if ng.get("Status") not in (None, "available"):
+            out.append(finding("warning", f"node group {ng.get('NodeGroupId')} status is {ng.get('Status')}"))
+        if len(members) == 1:
+            out.append(finding("warning", f"node group {ng.get('NodeGroupId')} has no replica: failover is impossible"))
+    if g.get("PendingModifiedValues"):
+        out.append(finding("info", "has pending modified values"))
+    return out
+
+
+_CRITICAL_EVENT_WORDS = ("failure", "failed", "unreachable", "unavailable")
+_WARNING_EVENT_WORDS = ("failover", "replac", "reboot", "restart", "removed", "recover")
+
+
+def _triage_event_findings(events: list[dict]) -> tuple[list[dict], int]:
+    ranked: list[tuple[int, dt.datetime | None, dict]] = []
+    for e in events:
+        msg = str(e.get("Message", ""))
+        low = msg.lower()
+        if any(w in low for w in _CRITICAL_EVENT_WORDS):
+            sev = "critical"
+        elif any(w in low for w in _WARNING_EVENT_WORDS):
+            sev = "warning"
+        else:
+            continue
+        when = e.get("Date")
+        stamp = when.isoformat() if isinstance(when, dt.datetime) else when
+        ranked.append(
+            (
+                _SEVERITY_ORDER[sev],
+                when if isinstance(when, dt.datetime) else None,
+                finding(sev, f"event {stamp}: {msg}", resource=e.get("SourceIdentifier")),
+            )
+        )
+    # worst first, newest first within a severity; keep the section bounded
+    ranked.sort(key=lambda t: (t[0], -(t[1].timestamp() if t[1] else 0)))
+    return [f for _, _, f in ranked[:5]], len(ranked)
+
+
+def _triage_peaks(summary: dict[str, dict[str, dict]]) -> dict[str, dict]:
+    peaks: dict[str, dict] = {}
+    for member, metrics in summary.items():
+        for name in TRIAGE_METRICS:
+            s = metrics.get(name) or {}
+            if not s.get("points"):
+                continue
+            value = s["sum"] if name == "Evictions" else s["max"]
+            if name not in peaks or value > peaks[name]["value"]:
+                peaks[name] = {"member": member, "value": value}
+    return peaks
+
+
+def _triage_update_findings(actions: list[dict], now: dt.datetime) -> list[dict]:
+    out: list[dict] = []
+    for a in actions:
+        name = a.get("ServiceUpdateName")
+        sev = str(a.get("ServiceUpdateSeverity") or "low")
+        apply_by = a.get("ServiceUpdateRecommendedApplyByDate")
+        if apply_by and apply_by < now:
+            out.append(finding("critical", f"{name} ({sev}) is past its recommended apply-by date", resource=name))
+        elif sev in {"critical", "important"}:
+            out.append(finding("warning", f"{sev} service update {name} is pending", resource=name))
+        else:
+            out.append(finding("info", f"{sev} service update {name} is pending", resource=name))
+    return out
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", version))
+
+
+def _version_findings(engine: str, version: str, ctx: dict[str, Any] | None, eol: bool) -> list[dict]:
+    out: list[dict] = []
+    if not version:
+        return out
+    major = _major_minor(version)[0]
+    if eol and engine == "redis" and major <= 6:
+        out.append(
+            finding(
+                "warning",
+                f"Redis OSS {version} is end-of-life upstream; plan the move to Valkey, the engine ElastiCache recommends",
+            )
+        )
+    known = (ctx or {}).get("versions", {}).get(engine, set())
+    newer = [v for v in known if _major_minor(v)[0] == major and _version_tuple(v) > _version_tuple(version)]
+    if newer:
+        latest = max(newer, key=_version_tuple)
+        out.append(finding("info", f"{engine} {version} is behind the newest {major}.x available here ({latest})"))
+    return out
+
+
+def _cluster_findings(c: dict, ctx: dict[str, Any] | None) -> list[dict]:
+    out: list[dict] = []
+    engine = str(c.get("Engine") or "").lower()
+    version = str(c.get("EngineVersion") or "")
+    out += _version_findings(engine, version, ctx, eol=True)
+    pg = c.get("CacheParameterGroup") or {}
+    pg_name = pg.get("CacheParameterGroupName")
+    apply_status = pg.get("ParameterApplyStatus")
+    if apply_status == "pending-reboot":
+        nodes = pg.get("CacheNodeIdsToReboot") or []
+        extra = f" (nodes {', '.join(nodes)})" if nodes else ""
+        out.append(
+            finding(
+                "warning", f"parameter group {pg_name} has changes pending a reboot{extra}; they are not active yet"
+            )
+        )
+    elif apply_status not in (None, "in-sync"):
+        out.append(finding("info", f"parameter group {pg_name} apply status is {apply_status}"))
+    family = (ctx or {}).get("parameter_group_family", {}).get(str(pg_name))
+    expected = (ctx or {}).get("family_of", {}).get((engine, version))
+    if family and expected and family != expected:
+        out.append(
+            finding(
+                "warning",
+                f"parameter group {pg_name} is family {family} but engine {engine} {version} expects {expected}",
+            )
+        )
+    if not c.get("ReplicationGroupId"):  # replication group members are covered by the group-level findings
+        if c.get("TransitEncryptionEnabled") is False:
+            out.append(finding("warning", "encryption in transit is disabled"))
+        if engine in {"redis", "valkey"} and c.get("AuthTokenEnabled") is False:
+            out.append(finding("critical", "no authentication: AUTH token is not enabled on this standalone cluster"))
+        if c.get("AutoMinorVersionUpgrade") is False:
+            out.append(finding("info", "auto minor version upgrade is off"))
+    return out
+
+
+def _drift_findings(group_a: str, group_b: str, diffs: list[dict], families: dict[str, str | None]) -> list[dict]:
+    out: list[dict] = []
+    fa, fb = families.get(group_a), families.get(group_b)
+    if fa and fb and fa != fb:
+        out.append(
+            finding("warning", f"parameter groups belong to different families ({fa} vs {fb}); compare with care")
+        )
+    for d in diffs:
+        if d["parameter"] in IMPORTANT_PARAMETERS:
+            out.append(
+                finding(
+                    "warning",
+                    f"{d['parameter']} differs: {group_a}={d['value_a']!r}, {group_b}={d['value_b']!r}",
+                    resource=d["parameter"],
+                )
+            )
+    if diffs:
+        out.append(finding("info", f"{len(diffs)} modified parameter(s) differ between {group_a} and {group_b}"))
+    else:
+        out.append(finding("info", f"no modified parameter differs between {group_a} and {group_b}"))
+    return out
+
+
+def _serverless_cache_findings(c: dict) -> list[dict]:
+    name = c.get("ServerlessCacheName")
+    engine = str(c.get("Engine") or "").lower()
+    out: list[dict] = []
+
+    def add(sev: str, msg: str) -> None:
+        out.append(finding(sev, msg, resource=name))
+
+    if c.get("Status") not in (None, "available"):
+        add("warning", f"serverless cache status is {c.get('Status')}")
+    limits = c.get("CacheUsageLimits") or {}
+    if (limits.get("DataStorage") or {}).get("Maximum") is None:
+        add("warning", "no DataStorage maximum: stored data (and its cost) can grow without bound")
+    if (limits.get("ECPUPerSecond") or {}).get("Maximum") is None:
+        add("warning", "no ECPUPerSecond maximum: a runaway client can drive compute cost without a cap")
+    if engine != "memcached":
+        if not c.get("DailySnapshotTime") and not c.get("SnapshotRetentionLimit"):
+            add("warning", "no daily snapshot configured (DailySnapshotTime and SnapshotRetentionLimit are unset)")
+        if not c.get("UserGroupId"):
+            add("warning", "no user group attached: access is the open default user")
+    return out
+
+
+_STORAGE_UNIT = {"GB": 1024**3, "TB": 1024**4}
+
+
+def _limits_view(limits: dict | None, summary: dict[str, dict], period_seconds: int) -> dict:
+    limits = limits or {}
+    storage_max = (limits.get("DataStorage") or {}).get("Maximum")
+    unit = (limits.get("DataStorage") or {}).get("Unit", "GB")
+    ecpu_max = (limits.get("ECPUPerSecond") or {}).get("Maximum")
+    used = summary.get("BytesUsedForCache") or {}
+    ecpu = summary.get("ElastiCacheProcessingUnits") or {}
+    view: dict[str, Any] = {
+        "data_storage_max": storage_max,
+        "data_storage_unit": unit,
+        "ecpu_per_second_max": ecpu_max,
+        "bytes_used_max": used.get("max") if used.get("points") else None,
+        "ecpu_per_second_peak": ecpu["max"] / period_seconds if ecpu.get("points") else None,
+    }
+    if storage_max and view["bytes_used_max"] is not None:
+        view["data_storage_used_pct"] = round(
+            100 * view["bytes_used_max"] / (storage_max * _STORAGE_UNIT.get(unit, 1024**3)), 1
+        )
+    if ecpu_max and view["ecpu_per_second_peak"] is not None:
+        view["ecpu_used_pct"] = round(100 * view["ecpu_per_second_peak"] / ecpu_max, 1)
+    return view
+
+
+def _serverless_limit_findings(
+    resource: str, summary: dict[str, dict], limits: dict | None, period_seconds: int
+) -> list[dict]:
+    if not limits:
+        return []
+    view = _limits_view(limits, summary, period_seconds)
+    out: list[dict] = []
+    pct = view.get("data_storage_used_pct")
+    if pct is not None and pct > 80:
+        out.append(
+            finding(
+                "critical" if pct > 90 else "warning",
+                f"BytesUsedForCache peaked at {pct:.0f}% of the DataStorage maximum ({view['data_storage_max']} {view['data_storage_unit']}); writes are rejected at the limit",
+                resource=resource,
+            )
+        )
+    pct = view.get("ecpu_used_pct")
+    if pct is not None and pct > 80:
+        out.append(
+            finding(
+                "critical" if pct >= 100 else "warning",
+                f"ElastiCacheProcessingUnits peaked at {pct:.0f}% of the ECPUPerSecond maximum ({view['ecpu_per_second_max']}); requests are throttled at the limit",
+                resource=resource,
+            )
+        )
+    return out
+
+
+def _rightsizing_findings(resource: str, summary: dict[str, dict], minutes: int) -> list[dict]:
+    """Downsize / upsize hints from the whole window; 'sustained' means the maximum stayed on one side."""
+
+    def get(name: str, field: str, min_points: int = 1) -> float | None:
+        s = summary.get(name) or {}
+        return s.get(field) if s.get("points", 0) >= min_points else None
+
+    out: list[dict] = []
+    cpu_max = get("EngineCPUUtilization", "max", 3)
+    mem_max = get("DatabaseMemoryUsagePercentage", "max", 3)
+    evictions = get("Evictions", "sum") or 0
+    window = f"over the {minutes}-minute window"
+    if cpu_max is not None and mem_max is not None and cpu_max < 10 and mem_max < 30 and not evictions:
+        out.append(
+            finding(
+                "info",
+                f"right-sizing: EngineCPUUtilization max {cpu_max:.0f}% and memory max {mem_max:.0f}% {window}; "
+                "a smaller node type (or fewer replicas/shards) would likely carry this load",
+                resource=resource,
+                category="right-sizing",
+            )
+        )
+    if mem_max is not None and mem_max > 80:
+        out.append(
+            finding(
+                "warning",
+                f"right-sizing: memory peaked at {mem_max:.0f}% {window}; move to a larger node type or add shards",
+                resource=resource,
+                category="right-sizing",
+            )
+        )
+    if evictions:
+        out.append(
+            finding(
+                "warning",
+                f"right-sizing: {evictions:.0f} evictions {window}; the dataset does not fit, scale up or out",
+                resource=resource,
+                category="right-sizing",
+            )
         )
     return out
 
@@ -750,7 +1317,7 @@ def _major_minor(version: str) -> tuple[int, int]:
     return (nums[0] if nums else 0, nums[1] if len(nums) > 1 else 0)
 
 
-def _rg_findings(g: dict, engine_version: tuple[str, str] | None) -> list[dict]:
+def _rg_findings(g: dict, engine_version: tuple[str, str] | None, ctx: dict[str, Any] | None = None) -> list[dict]:
     out: list[dict] = []
     if g.get("Status") not in (None, "available"):
         out.append(finding("warning", f"status is {g.get('Status')}"))
@@ -772,12 +1339,23 @@ def _rg_findings(g: dict, engine_version: tuple[str, str] | None) -> list[dict]:
         engine, version = engine_version
         if engine.lower() == "redis" and _major_minor(version) < (7, 0):
             out.append(finding("warning", f"Redis OSS {version} is old (< 7.0); plan an upgrade (Valkey or 7.x)"))
+        out += _version_findings(engine.lower(), version, ctx, eol=False)
+    for ng in g.get("NodeGroups", []):
+        members = ng.get("NodeGroupMembers", [])
+        azs = {m.get("PreferredAvailabilityZone") for m in members if m.get("PreferredAvailabilityZone")}
+        if len(members) > 1 and len(azs) == 1:
+            out.append(
+                finding(
+                    "warning",
+                    f"node group {ng.get('NodeGroupId')}: primary and replicas all sit in {next(iter(azs))}; an AZ outage takes the whole shard",
+                )
+            )
     if g.get("PendingModifiedValues"):
         out.append(finding("info", "has pending modified values"))
     return out
 
 
-def _rg_view(g: dict, engine_version: tuple[str, str] | None = None) -> dict:
+def _rg_view(g: dict, engine_version: tuple[str, str] | None = None, ctx: dict[str, Any] | None = None) -> dict:
     return {
         "id": g.get("ReplicationGroupId"),
         "description": g.get("Description"),
@@ -794,7 +1372,7 @@ def _rg_view(g: dict, engine_version: tuple[str, str] | None = None) -> dict:
         "auto_minor_version_upgrade": g.get("AutoMinorVersionUpgrade"),
         "member_clusters": g.get("MemberClusters", []),
         "configuration_endpoint": _jsonable(g.get("ConfigurationEndpoint")),
-        "findings": _rg_findings(g, engine_version),
+        "findings": _rg_findings(g, engine_version, ctx),
         "node_groups": [
             {
                 "id": ng.get("NodeGroupId"),
@@ -818,8 +1396,9 @@ def _rg_view(g: dict, engine_version: tuple[str, str] | None = None) -> dict:
     }
 
 
-def _cluster_view(c: dict) -> dict:
+def _cluster_view(c: dict, ctx: dict[str, Any] | None = None) -> dict:
     return {
+        "findings": _cluster_findings(c, ctx),
         "id": c.get("CacheClusterId"),
         "status": c.get("CacheClusterStatus"),
         "engine": c.get("Engine"),

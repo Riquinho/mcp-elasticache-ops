@@ -10,7 +10,12 @@ import socket
 ALLOWED_STAT_GROUPS = {"", "settings", "slabs", "items", "conns"}
 
 
+ALLOWED_COMMANDS = {f"stats {g}".strip() for g in ALLOWED_STAT_GROUPS} | {"version"}
+
+
 def _query(host: str, port: int, command: str, timeout: float) -> list[str]:
+    if command not in ALLOWED_COMMANDS:  # defence in depth: nothing but stats/version ever reaches the socket
+        raise ValueError(f"memcached command not allowed: {command!r}")
     with socket.create_connection((host, port), timeout=timeout) as sock:
         sock.sendall(command.encode("ascii") + b"\r\n")
         buf = b""

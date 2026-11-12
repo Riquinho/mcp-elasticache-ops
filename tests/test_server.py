@@ -31,7 +31,7 @@ async def test_all_tools_read_only():
     async with Client(server.mcp) as c:
         tools = await c.list_tools()
     names = {t.name for t in tools}
-    assert len(tools) == 26
+    assert len(tools) == 29
     assert {
         "node_health",
         "node_info",
@@ -62,6 +62,7 @@ async def test_all_tools_read_only():
         "aws_service_updates",
         "aws_subnet_groups",
     } <= names
+    assert {"node_config", "aws_triage", "aws_parameter_drift"} <= names  # round 02
     for t in tools:
         assert t.annotations.read_only_hint is True, t.name
         assert t.annotations.destructive_hint is False, t.name
@@ -91,3 +92,11 @@ async def test_tools_end_to_end(env):
         assert slow["returned"] <= 5
         aws = _data(await c.call_tool("aws_replication_groups", {}))
         assert "unavailable" in aws
+
+
+@pytest.mark.integration
+async def test_node_config_end_to_end(env):
+    async with Client(server.mcp) as c:
+        cfg = _data(await c.call_tool("node_config", {}))
+    assert "findings" in cfg and "available" in cfg
+    assert "requirepass" not in cfg.get("config", {})

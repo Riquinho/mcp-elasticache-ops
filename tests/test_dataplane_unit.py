@@ -420,3 +420,209 @@ def test_helpers():
 @pytest.mark.parametrize("info,engine", [({"server_name": "valkey"}, "valkey"), ({"redis_version": "7"}, "redis")])
 def test_engine_of(info, engine):
     assert dataplane.engine_of(info)["engine"] == engine
+
+
+# ------------------------------------------------------------------ node_config
+
+
+class ConfigFake(FakeRedis):
+    """Serves CONFIG GET from a dict (glob patterns like the real server) and records every request."""
+
+    def __init__(self, values: dict[str, str] | None = None, refuse: bool = False, **kw):
+        super().__init__(**kw)
+        self.values = values or {}
+        self.refuse = refuse
+        self.requested: list[str] = []
+
+    def config_get(self, pattern):
+        self.requested.append(pattern)
+        if self.refuse:
+            raise redis.ResponseError("unknown command 'CONFIG'")
+        import fnmatch
+
+        return {k: v for k, v in self.values.items() if fnmatch.fnmatchcase(k, pattern)}
+
+
+def _messages(out: dict) -> str:
+    return " | ".join(f["message"] for f in out["findings"])
+
+
+def test_config_view_findings_for_a_misconfigured_cache():
+    values = {
+        "maxmemory": "1000",
+        "maxmemory-policy": "noeviction",
+        "timeout": "0",
+        "appendonly": "yes",
+        "latency-monitor-threshold": "0",
+        "slowlog-log-slower-than": "-1",
+        "notify-keyspace-events": "KEA",
+        "io-threads": "4",
+        "client-output-buffer-limit": "normal 0 0 0 replica 268435456 67108864 60 pubsub 33554432 8388608 60",
+    }
+    fake = ConfigFake(values)
+    fake.clients = [{"idle": "7200"}] * 25 + [{"idle": "1"}]
+    out = dataplane.config_view(fake)
+    assert out["available"] is True
+    assert out["config"]["io-threads"] == "4"
+    assert out["config"]["client-output-buffer-limit"].startswith("normal 0 0 0")
+    text = _messages(out)
+    for needle in (
+        "noeviction",
+        "timeout is 0",
+        "25 clients",
+        "appendonly is yes",
+        "latency-monitor-threshold is 0",
+        "slow log is disabled",
+        "notify-keyspace-events",
+    ):
+        assert needle in text, needle
+    severities = [f["severity"] for f in out["findings"]]
+    assert severities == sorted(severities, key={"critical": 0, "warning": 1, "info": 2}.get)
+    assert {f["parameter"] for f in out["findings"]} >= {"maxmemory-policy", "timeout", "appendonly"}
+
+
+def test_config_view_clean_config_has_no_findings():
+    values = {
+        "maxmemory": "1000",
+        "maxmemory-policy": "allkeys-lru",
+        "timeout": "300",
+        "appendonly": "no",
+        "latency-monitor-threshold": "100",
+        "slowlog-log-slower-than": "10000",
+        "notify-keyspace-events": "",
+    }
+    out = dataplane.config_view(ConfigFake(values))
+    assert out["findings"] == []
+
+
+def test_config_view_timeout_zero_needs_many_idle_clients():
+    fake = ConfigFake({"timeout": "0"})
+    fake.clients = [{"idle": "7200"}] * 3
+    assert dataplane.config_view(fake)["findings"] == []
+
+
+def test_config_view_slowlog_zero_and_narrow_keyspace_events():
+    out = dataplane.config_view(ConfigFake({"slowlog-log-slower-than": "0", "notify-keyspace-events": "Ex"}))
+    by_param = {f["parameter"]: f for f in out["findings"]}
+    assert "every command is logged" in by_param["slowlog-log-slower-than"]["message"]
+    assert by_param["notify-keyspace-events"]["severity"] == "info"
+
+
+def test_config_view_falls_back_when_config_is_refused():
+    out = dataplane.config_view(ConfigFake(refuse=True))
+    assert out["available"] is False
+    assert out["config"] == {} and out["findings"] == []
+    assert "aws_parameters" in " ".join(out["notes"])
+
+
+def test_config_view_partial_refusal_keeps_what_it_got():
+    class Partial(ConfigFake):
+        def config_get(self, pattern):
+            if pattern.startswith("slowlog"):
+                self.requested.append(pattern)
+                raise redis.ResponseError("denied")
+            return super().config_get(pattern)
+
+    out = dataplane.config_view(Partial({"timeout": "5"}))
+    assert out["available"] is True and out["config"] == {"timeout": "5"}
+    assert out["refused_patterns"] == ["slowlog-*"]
+
+
+def test_config_view_never_requests_secret_parameters():
+    from mcp_elasticache_ops import safe_client
+
+    fake = ConfigFake({"requirepass": "hunter2", "masterauth": "hunter2", "masteruser": "u", "timeout": "5"})
+    out = dataplane.config_view(fake)
+    assert fake.requested, "nothing was requested"
+    secret = ("requirepass", "masterauth", "masteruser", "tls-", "aclfile", "user")
+    for pattern in fake.requested:
+        assert not pattern.startswith(secret), pattern
+        assert pattern != "*" and "?" not in pattern
+        safe_client.check(("CONFIG", "GET", pattern))  # the SafeRedis allowlist accepts every request
+    assert "hunter2" not in str(out)
+    assert set(out["config"]) == {"timeout"}
+
+
+def test_config_view_through_safe_redis_is_never_blocked(monkeypatch):
+    """Every pattern config_view sends passes the real SafeRedis CONFIG GET check."""
+    from mcp_elasticache_ops import safe_client
+
+    seen = []
+    monkeypatch.setattr(redis.Redis, "execute_command", lambda self, *a, **k: seen.append(a) or {})
+    client = safe_client.SafeRedis()
+    dataplane.config_view(client)
+    assert seen and all(a[0] == "CONFIG GET" for a in seen)
+
+
+# -------------------------------------------------------------------- serverless
+
+
+class RefusingRedis(FakeRedis):
+    """Behaves like an endpoint that rejects admin commands with ResponseError."""
+
+    def slowlog_get(self, count):
+        raise redis.ResponseError("unknown command 'SLOWLOG'")
+
+    def slowlog_len(self):
+        raise redis.ResponseError("unknown command 'SLOWLOG'")
+
+    def memory_stats(self):
+        raise redis.ResponseError("unknown command 'MEMORY'")
+
+    def info(self, section=None):
+        if section is None or section in {"cluster", "memory", "stats"}:
+            raise redis.ResponseError("ERR unsupported INFO section")
+        return super().info(section)
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("mycache-abc123.serverless.use1.cache.amazonaws.com", True),
+        ("MyCache.SERVERLESS.eu-west-1.cache.amazonaws.com", True),
+        ("my-rg.abc123.ng.0001.use1.cache.amazonaws.com", False),
+        ("serverless.example.com", False),
+        ("127.0.0.1", False),
+        (None, False),
+    ],
+)
+def test_is_serverless_host(host, expected):
+    assert dataplane.is_serverless_host(host) is expected
+
+
+def test_serverless_tools_return_notes_instead_of_raising():
+    r = RefusingRedis(infos={"server": {"redis_version": "7.1"}, "clients": {"connected_clients": 3}})
+    health = dataplane.health_summary(r, serverless=True)
+    assert health["connected_clients"] == 3 and health["serverless"] is True
+    assert any("serverless: command not supported" in n for n in health["notes"])
+
+    mem = dataplane.memory_report(r, serverless=True)
+    assert any("INFO memory" in n and "serverless: command not supported" in n for n in mem["notes"])
+    assert any("aws_metrics" in n for n in mem["notes"])
+
+    slow = dataplane.slowlog(r, serverless=True)
+    assert slow["entries"] == [] and slow["slowlog_len"] is None
+    assert "serverless: command not supported" in slow["notes"][0]
+
+    cl = dataplane.cluster(r, serverless=True)
+    assert cl["cluster_enabled"] is True
+    assert any("CLUSTER" in n for n in cl["notes"])
+
+    nodes = dataplane.cluster_nodes(r, serverless=True)
+    assert nodes["cluster_enabled"] is True and "unavailable" in nodes
+    assert any("single TLS endpoint" in n or "one TLS endpoint" in n for n in nodes["notes"])
+
+
+def test_refused_commands_on_a_plain_endpoint_say_unavailable():
+    r = RefusingRedis()
+    health = dataplane.health_summary(r)
+    assert health["findings"] == ["INFO is not available on this endpoint"]
+    assert all("serverless" not in n for n in health["notes"])
+    assert dataplane.slowlog(r)["notes"][0].startswith("SLOWLOG GET: unavailable")
+    assert dataplane.cluster(r)["cluster_enabled"] is False
+
+
+def test_working_endpoint_output_is_unchanged_by_serverless_flag():
+    info = {"server": {"redis_version": "7.2"}, "default": {"role": "master", "used_memory": 10, "maxmemory": 100}}
+    out = dataplane.health_summary(FakeRedis(infos=info))
+    assert "notes" not in out and "serverless" not in out

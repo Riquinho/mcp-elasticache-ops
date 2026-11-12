@@ -10,7 +10,7 @@ written from scratch for ElastiCache.
 
 ## Tools
 
-All 26 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
+All 29 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 
 **Data plane** (redis-py, talks to the node endpoint)
 
@@ -19,6 +19,7 @@ All 26 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `node_health` | One-shot summary: engine/version, role, memory, clients, hit ratio, evictions, findings |
 | `node_info` | Raw `INFO`, optionally one section; password-like fields (`masterauth`, `requirepass`, ...) are redacted |
 | `node_memory` | used/RSS/peak/dataset/overhead, maxmemory + policy, fragmentation verdict, `MEMORY STATS/DOCTOR` |
+| `node_config` | Allowlisted `CONFIG GET` values (never secrets) with findings: `noeviction` with a maxmemory limit, `timeout 0` with idle clients, AOF, slowlog and latency monitor off, broad keyspace events. Points at `aws_parameters` when the endpoint refuses `CONFIG` |
 | `node_slowlog` | `SLOWLOG GET` with per-command totals; arguments beyond the key are hidden |
 | `node_clients` | `CLIENT LIST` aggregated by IP, name, user and last command; idle and buffer outliers |
 | `node_latency` | Client-side PING RTT percentiles + `LATENCY LATEST` |
@@ -47,8 +48,17 @@ All 26 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `aws_reserved_nodes` | `DescribeReservedCacheNodes` vs running nodes: coverage, unused and expiring reservations |
 | `aws_service_updates` | `DescribeServiceUpdates`: pending updates, past or near apply-by dates |
 | `aws_subnet_groups` | `DescribeCacheSubnetGroups`: AZ spread (Multi-AZ needs 2+) |
+| `aws_triage` | One call per replication group: status/Multi-AZ/failover, last 6h events, CloudWatch peaks per member (EngineCPU, memory %, Evictions, ReplicationLag, CurrConnections), pending service updates, newest snapshot. Worst-first findings (max 30); a failing section is reported `unavailable` |
+| `aws_parameter_drift` | Diff of two parameter groups: only modified parameters whose values differ, family mismatch, important parameters flagged |
 
-`aws_replication_groups` also returns per-group findings (Multi-AZ, failover, encryption, auth, snapshots, old Redis OSS).
+`aws_replication_groups` also returns per-group findings (Multi-AZ, failover, encryption, auth, snapshots, old Redis OSS,
+engine behind the newest minor, primary and replicas in one AZ). `aws_cache_clusters` adds findings for Redis OSS end of life,
+parameter group family mismatch, changes pending a reboot, no TLS, no AUTH and auto minor upgrade off. `aws_serverless_caches`
+flags missing usage limits, snapshots and user group; `aws_metrics` on a serverless cache compares usage with the configured limits
+and gives right-sizing hints (info/warning) on node clusters.
+
+Serverless endpoints refuse many commands (`INFO` sections, `CLUSTER NODES`, `CONFIG`). The data-plane tools detect
+`*.serverless.*.cache.amazonaws.com` hosts and, on any endpoint, degrade to a note instead of an error.
 Control-plane tools return `findings` first (`{"severity", "message", "resource"}`, worst first).
 
 Without AWS credentials or region, the `aws_*` tools return `{"unavailable": ...}` instead of failing,
@@ -70,6 +80,51 @@ so the server is useful against a plain Redis/Valkey too.
 - Control plane only calls `Describe*` / `List*` / `GetMetricData`. Give it an IAM policy with
   `elasticache:Describe*` and `cloudwatch:GetMetricData` only.
 - Passwords / AUTH tokens come from the environment or a file and are never returned by tools.
+
+### Allowlist
+
+Generated from `safe_client.py`; the tests fail if this drifts from the code.
+
+<!-- allowlist:start -->
+- Allowed commands (41): `CLIENT GETNAME`, `CLIENT ID`, `CLIENT INFO`, `CLIENT LIST`, `CLUSTER INFO`, `CLUSTER MYID`, `CLUSTER NODES`, `CLUSTER SHARDS`, `CLUSTER SLOTS`, `COMMAND COUNT`, `COMMAND DOCS`, `CONFIG GET`, `DBSIZE`, `EXISTS`, `HLEN`, `INFO`, `LASTSAVE`, `LATENCY DOCTOR`, `LATENCY HISTORY`, `LATENCY LATEST`, `LLEN`, `MEMORY DOCTOR`, `MEMORY STATS`, `MEMORY USAGE`, `OBJECT ENCODING`, `OBJECT FREQ`, `OBJECT IDLETIME`, `PFCOUNT`, `PING`, `PTTL`, `ROLE`, `SCAN`, `SCARD`, `SLOWLOG GET`, `SLOWLOG LEN`, `STRLEN`, `TIME`, `TTL`, `TYPE`, `XLEN`, `ZCARD`
+- `CONFIG GET` exact names: `appendfsync`, `appendonly`, `client-query-buffer-limit`, `cluster-allow-reads-when-down`, `cluster-enabled`, `cluster-node-timeout`, `cluster-require-full-coverage`, `databases`, `dynamic-hz`, `hz`, `io-threads`, `lfu-decay-time`, `lfu-log-factor`, `maxclients`, `min-replicas-max-lag`, `min-replicas-to-write`, `notify-keyspace-events`, `proto-max-bulk-len`, `rdbcompression`, `repl-backlog-size`, `repl-backlog-ttl`, `repl-diskless-sync`, `replica-read-only`, `save`, `tcp-keepalive`, `timeout`
+- `CONFIG GET` prefixes: `maxmemory*`, `slowlog-*`, `latency-*`, `activedefrag*`, `active-defrag-*`, `lazyfree-*`, `hash-max-*`, `list-max-*`, `set-max-*`, `zset-max-*`, `client-output-buffer-limit*`
+- Always refused (self-tested never to be allowed): `ACL`, `ACL GETUSER`, `ACL LIST`, `ACL SETUSER`, `AUTH`, `BGREWRITEAOF`, `BGSAVE`, `CLIENT KILL`, `CLIENT PAUSE`, `CLIENT REPLY`, `CLIENT TRACKING`, `CLIENT UNPAUSE`, `CLUSTER FAILOVER`, `CLUSTER RESET`, `CONFIG RESETSTAT`, `CONFIG REWRITE`, `CONFIG SET`, `DEBUG`, `DEL`, `DUMP`, `EVAL`, `EVALSHA`, `EXEC`, `EXPIRE`, `FAILOVER`, `FCALL`, `FLUSHALL`, `FLUSHDB`, `FUNCTION`, `GET`, `HELLO`, `HGET`, `HGETALL`, `KEYS`, `LATENCY RESET`, `LRANGE`, `MEMORY PURGE`, `MGET`, `MIGRATE`, `MODULE LOAD`, `MONITOR`, `MULTI`, `OBJECT HELP`, `PSUBSCRIBE`, `PSYNC`, `PUBLISH`, `REPLICAOF`, `RESTORE`, `SAVE`, `SCRIPT`, `SCRIPT FLUSH`, `SCRIPT LOAD`, `SET`, `SHUTDOWN`, `SLAVEOF`, `SLOWLOG RESET`, `SMEMBERS`, `SORT`, `SSUBSCRIBE`, `SUBSCRIBE`, `SYNC`, `UNLINK`, `WATCH`, `XRANGE`, `XREAD`, `XREADGROUP`, `ZRANGE`
+- Memcached: only `stats`, `stats settings|slabs|items|conns` and `version`.
+- AWS: operation names must start with `describe_`, `list_` or `get_metric_data`.
+<!-- allowlist:end -->
+
+### Minimal IAM policy
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "elasticache:DescribeReplicationGroups",
+        "elasticache:DescribeCacheClusters",
+        "elasticache:DescribeServerlessCaches",
+        "elasticache:DescribeEvents",
+        "elasticache:DescribeCacheParameters",
+        "elasticache:DescribeCacheParameterGroups",
+        "elasticache:DescribeCacheEngineVersions",
+        "elasticache:DescribeSnapshots",
+        "elasticache:DescribeUsers",
+        "elasticache:DescribeUserGroups",
+        "elasticache:DescribeGlobalReplicationGroups",
+        "elasticache:DescribeReservedCacheNodes",
+        "elasticache:DescribeServiceUpdates",
+        "elasticache:DescribeUpdateActions",
+        "elasticache:DescribeCacheSubnetGroups",
+        "cloudwatch:GetMetricData"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
 
 ## Configuration
 

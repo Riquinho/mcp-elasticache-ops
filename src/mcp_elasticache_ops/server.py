@@ -38,6 +38,11 @@ def redis_client() -> SafeRedis:
     return build_client(DataPlaneConfig.from_env())
 
 
+def _serverless() -> bool:
+    """True when ELASTICACHE_HOST is an ElastiCache Serverless endpoint."""
+    return dataplane.is_serverless_host(DataPlaneConfig.from_env().host)
+
+
 def _node_client(host: str, port: int) -> SafeRedis:
     return build_client(DataPlaneConfig.from_env(), host=host, port=port)
 
@@ -62,7 +67,7 @@ def node_health() -> dict:
     """One-shot health summary of the configured Redis/Valkey endpoint: engine and
     version, role, clients, hit ratio, memory vs maxmemory, fragmentation,
     evictions and a list of findings."""
-    return dataplane.health_summary(redis_client())
+    return dataplane.health_summary(redis_client(), _serverless())
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -83,7 +88,16 @@ def node_memory() -> dict:
     """Memory breakdown: used/RSS/peak/dataset/overhead, maxmemory and policy,
     fragmentation ratio with a verdict, evictions, MEMORY STATS and MEMORY DOCTOR
     when the engine allows them."""
-    return dataplane.memory_report(redis_client())
+    return dataplane.memory_report(redis_client(), _serverless())
+
+
+@mcp.tool(annotations=READ_ONLY)
+def node_config() -> dict:
+    """Allowlisted CONFIG GET view (maxmemory policy, timeout, appendonly, output buffer limits,
+    keyspace notifications, slowlog and latency thresholds, io-threads) with findings. Secret
+    parameters are never requested. Falls back to a pointer at aws_parameters when the endpoint
+    refuses CONFIG, as ElastiCache usually does."""
+    return dataplane.config_view(redis_client())
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -93,7 +107,7 @@ def node_slowlog(
 ) -> dict:
     """SLOWLOG entries plus per-command totals. Arguments beyond the key are hidden
     unless include_args is true."""
-    return dataplane.slowlog(redis_client(), count, include_args)
+    return dataplane.slowlog(redis_client(), count, include_args, _serverless())
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -145,14 +159,14 @@ def node_replication() -> dict:
 def node_cluster() -> dict:
     """Cluster-mode view: CLUSTER INFO, slots per primary and CLUSTER SHARDS when
     available. Reports cluster mode disabled otherwise."""
-    return dataplane.cluster(redis_client())
+    return dataplane.cluster(redis_client(), _serverless())
 
 
 @mcp.tool(annotations=READ_ONLY)
 def node_cluster_nodes() -> dict:
     """CLUSTER NODES parsed into per-shard primary/replica endpoints, slot counts and
     failing nodes, plus how to target each shard with ELASTICACHE_HOST."""
-    return dataplane.cluster_nodes(redis_client())
+    return dataplane.cluster_nodes(redis_client(), _serverless())
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -298,6 +312,24 @@ def aws_metrics(
     return control_plane().metrics(
         cache_cluster_id, metrics, minutes, period_seconds, node_id, serverless, include_series, replication_group_id
     )
+
+
+@mcp.tool(annotations=READ_ONLY)
+def aws_parameter_drift(
+    group_a: Annotated[str, Field(description="First cache parameter group name (e.g. production)")],
+    group_b: Annotated[str, Field(description="Second cache parameter group name (e.g. staging)")],
+) -> dict:
+    """DescribeCacheParameters on two groups: only parameters whose values differ and that someone
+    modified (default-only differences are counted, not listed), plus family mismatch warnings."""
+    return control_plane().parameter_drift(group_a, group_b)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def aws_triage(replication_group_id: Annotated[str, Field(description="ReplicationGroupId to triage")]) -> dict:
+    """One-call incident summary for a replication group: status, Multi-AZ/failover, last 6h events,
+    CloudWatch peaks per member, pending service updates and snapshot age. Findings are worst-first
+    (max 30); a section that fails is reported as unavailable instead of failing the call."""
+    return control_plane().triage(replication_group_id)
 
 
 # ------------------------------------------------------------------------ main
