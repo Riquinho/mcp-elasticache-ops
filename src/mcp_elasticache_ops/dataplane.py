@@ -127,7 +127,46 @@ def server_info(r: redis.Redis, section: str | None = None) -> dict:
     return {"section": section or "default", "info": redact(data)}
 
 
-INFO_SECTIONS = ("server", "clients", "memory", "stats", "replication", "keyspace")
+INFO_SECTIONS = ("server", "clients", "memory", "persistence", "stats", "replication", "keyspace")
+
+# Documented in the README ("Finding thresholds"); all bounded, none configurable on purpose.
+MEMORY_HIGH_RATIO = 0.9  # used / maxmemory above this is critical
+NOEVICTION_USAGE_RATIO = 0.85  # noeviction at this fill level means OOM errors are close
+FRAGMENTATION_HIGH = 1.5
+FRAGMENTATION_LOW = 1.0
+CLIENT_BUFFER_WARN_BYTES = 16 * 1024 * 1024  # client_recent_max_output_buffer / input buffer
+
+
+def _persistence_findings(info: dict) -> list[str]:
+    out: list[str] = []
+    if str(info.get("rdb_last_bgsave_status", "ok")).lower() not in ("ok", ""):
+        out.append(
+            "persistence: last RDB background save failed (rdb_last_bgsave_status=err); backups and full resyncs "
+            "may fail, and writes are refused when stop-writes-on-bgsave-error is yes"
+        )
+    if str(info.get("aof_last_write_status", "ok")).lower() not in ("ok", ""):
+        out.append(f"persistence: last AOF write failed (aof_last_write_status={info.get('aof_last_write_status')})")
+    return out
+
+
+def _buffer_findings(info: dict) -> list[str]:
+    out: list[str] = []
+    for key, label in (("client_recent_max_output_buffer", "output"), ("client_recent_max_input_buffer", "input")):
+        size = _num(info.get(key))
+        if size >= CLIENT_BUFFER_WARN_BYTES:
+            out.append(
+                f"client {label} buffer peaked at {int(size) // (1024 * 1024)} MiB ({key}); "
+                "slow consumers or huge replies, see node_clients"
+            )
+    return out
+
+
+def _eviction_rate_text(info: dict) -> str:
+    uptime = _num(info.get("uptime_in_seconds"))
+    evicted = _num(info.get("evicted_keys"))
+    if uptime <= 0 or evicted <= 0:
+        return ""
+    return f", about {evicted * 60 / uptime:.1f}/min on average"
 
 
 def _info_all(r: redis.Redis, serverless: bool) -> tuple[dict, list[str]]:
@@ -155,13 +194,18 @@ def health_summary(r: redis.Redis, serverless: bool = False) -> dict:
     used = _num(info.get("used_memory"))
     frag = _num(info.get("mem_fragmentation_ratio"), default=1.0)
     findings: list[str] = []
-    if maxmemory and used / maxmemory > 0.9:
+    if maxmemory and used / maxmemory > MEMORY_HIGH_RATIO:
         findings.append(f"memory at {used / maxmemory:.0%} of maxmemory")
+    if info.get("maxmemory_policy") == "noeviction" and maxmemory and used / maxmemory >= NOEVICTION_USAGE_RATIO:
+        findings.append(
+            f"noeviction at {used / maxmemory:.0%} of maxmemory: writes fail with OOM once memory is full "
+            "(switch to an eviction policy or add memory)"
+        )
     if _num(info.get("evicted_keys")) > 0:
-        findings.append(f"{int(_num(info.get('evicted_keys')))} keys evicted since restart")
-    if frag > 1.5:
+        findings.append(f"{int(_num(info.get('evicted_keys')))} keys evicted since restart{_eviction_rate_text(info)}")
+    if frag > FRAGMENTATION_HIGH:
         findings.append(f"high fragmentation ratio {frag:.2f}")
-    elif frag < 1.0 and used > 0:
+    elif frag < FRAGMENTATION_LOW and used > 0:
         findings.append(f"fragmentation ratio {frag:.2f} < 1: possible swapping")
     if _num(info.get("rejected_connections")) > 0:
         findings.append(f"{int(_num(info.get('rejected_connections')))} rejected connections (maxclients)")
@@ -169,6 +213,8 @@ def health_summary(r: redis.Redis, serverless: bool = False) -> dict:
         findings.append(f"{int(_num(info.get('blocked_clients')))} blocked clients")
     if info.get("role") == "slave" and info.get("master_link_status") != "up":
         findings.append(f"replica link is {info.get('master_link_status')}")
+    findings += _persistence_findings(info)
+    findings += _buffer_findings(info)
     return {
         **engine_of(info),
         "role": info.get("role"),
@@ -209,14 +255,16 @@ def memory_report(r: redis.Redis, serverless: bool = False) -> dict:
     memory_stats, stats_err = _try(r.memory_stats)
     doctor, doctor_err = _try(r.execute_command, "MEMORY", "DOCTOR")
 
-    if frag > 1.5:
+    if frag > FRAGMENTATION_HIGH:
         frag_verdict = "high: RSS well above dataset; consider activedefrag (Redis 4+/Valkey) or node replacement"
-    elif frag < 1.0 and used > 0:
+    elif frag < FRAGMENTATION_LOW and used > 0:
         frag_verdict = "below 1.0: memory may be swapped; check SwapUsage in CloudWatch"
     else:
         frag_verdict = "normal"
 
+    findings = _memory_findings(mem, stats, used, maxmemory, frag)
     return {
+        "findings": findings,
         "used_memory": int(used),
         "used_memory_human": mem.get("used_memory_human"),
         "used_memory_rss": int(rss),
@@ -247,6 +295,30 @@ def memory_report(r: redis.Redis, serverless: bool = False) -> dict:
             "compare with the BytesUsedForCache and DatabaseMemoryUsagePercentage metrics."
         ),
     }
+
+
+def _memory_findings(mem: dict, stats: dict, used: float, maxmemory: float, frag: float) -> list[dict]:
+    out: list[dict] = []
+    ratio = used / maxmemory if maxmemory else None
+    if ratio is not None and ratio > MEMORY_HIGH_RATIO:
+        out.append(_finding("critical", f"memory at {ratio:.0%} of maxmemory"))
+    if mem.get("maxmemory_policy") == "noeviction" and ratio is not None and ratio >= NOEVICTION_USAGE_RATIO:
+        out.append(
+            _finding(
+                "critical",
+                f"maxmemory-policy is noeviction at {ratio:.0%} of maxmemory: writes fail with OOM once memory is full",
+            )
+        )
+    if frag > FRAGMENTATION_HIGH:
+        out.append(
+            _finding("warning", f"mem_fragmentation_ratio {frag:.2f} > {FRAGMENTATION_HIGH}: RSS well above data")
+        )
+    elif frag < FRAGMENTATION_LOW and used > 0:
+        out.append(_finding("warning", f"mem_fragmentation_ratio {frag:.2f} < 1: memory may be swapped"))
+    evicted = int(_num(stats.get("evicted_keys")))
+    if evicted > 0:
+        out.append(_finding("warning", f"{evicted} keys evicted since restart"))
+    return out
 
 
 def _serverless_hint(serverless: bool) -> list[str]:
@@ -1762,7 +1834,7 @@ def _safe(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> tuple[Any, str |
 
 
 def _health_severity(message: str) -> str:
-    if message.startswith(("replica link", "memory at")):
+    if message.startswith(("replica link", "memory at", "noeviction at")):
         return "critical"
     return "warning"
 

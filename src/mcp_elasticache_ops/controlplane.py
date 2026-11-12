@@ -142,6 +142,46 @@ ALARM_NAMESPACE = "AWS/ElastiCache"
 _SEVERITY_ORDER = {"critical": 0, "important": 1, "warning": 2, "medium": 3, "low": 4, "info": 5}
 
 
+_DENIED_CODES = frozenset(
+    {"AccessDenied", "AccessDeniedException", "UnauthorizedOperation", "UnauthorizedAccess", "AuthFailure"}
+)
+_THROTTLE_CODES = frozenset(
+    {"Throttling", "ThrottlingException", "ThrottledException", "RequestLimitExceeded", "TooManyRequestsException"}
+)
+_NETWORK_ERRORS = frozenset(
+    {
+        "ConnectTimeoutError",
+        "ReadTimeoutError",
+        "EndpointConnectionError",
+        "ConnectionClosedError",
+        "ProxyConnectionError",
+        "SSLError",
+    }
+)
+
+
+def aws_error_hint(code: str) -> str | None:
+    """Short, actionable next step for an AWS error code or botocore exception name; None when nothing specific applies."""
+    if code in _DENIED_CODES or code.endswith("AccessDenied"):
+        return (
+            "The AWS principal lacks permission for this read-only call; compare its policy with the "
+            "'Minimal IAM policy' in the README (Describe*, cloudwatch:GetMetricData/DescribeAlarms)."
+        )
+    if code in _THROTTLE_CODES:
+        return "AWS throttled the request; wait a few seconds and retry, or narrow the call by id."
+    if code in _NETWORK_ERRORS:
+        return (
+            "The AWS API did not answer in time; check AWS_REGION, network egress or a VPC endpoint/proxy for "
+            "elasticache and monitoring, then retry."
+        )
+    return None
+
+
+def _error_result(code: str, message: str) -> dict:
+    hint = aws_error_hint(code)
+    return {"error": code, "message": message, **({"hint": hint} if hint else {})}
+
+
 def finding(severity: str, message: str, **extra: Any) -> dict:
     return {"severity": severity, "message": message, **extra}
 
@@ -183,9 +223,10 @@ class ControlPlane:
             return {"unavailable": "no AWS region configured (set AWS_REGION)"}
         except ClientError as exc:
             err = exc.response.get("Error", {})
-            return {"error": err.get("Code", "ClientError"), "message": err.get("Message", str(exc))}
+            code = err.get("Code", "ClientError")
+            return _error_result(code, err.get("Message", str(exc)))
         except BotoCoreError as exc:
-            return {"error": type(exc).__name__, "message": str(exc)}
+            return _error_result(type(exc).__name__, str(exc))
 
     def _paginate(self, op: str, key: str, **kwargs) -> list[dict]:
         if not op.startswith(ALLOWED_PREFIXES):  # belt and braces: never call a write API
@@ -1436,7 +1477,18 @@ def _version_findings(engine: str, version: str, ctx: dict[str, Any] | None, eol
                 f"Redis OSS {version} is end-of-life upstream; plan the move to Valkey, the engine ElastiCache recommends",
             )
         )
+    if engine == "memcached" and _version_tuple(version)[:2] < (1, 6):
+        out.append(
+            finding("warning", f"Memcached {version} is end-of-life (< 1.6); upgrade to a current 1.6.x release")
+        )
     known = (ctx or {}).get("versions", {}).get(engine, set())
+    if engine == "memcached" and known and version not in known:
+        out.append(
+            finding(
+                "warning",
+                f"Memcached {version} is no longer offered by DescribeCacheEngineVersions; it is retired, plan an upgrade",
+            )
+        )
     newer = [v for v in known if _major_minor(v)[0] == major and _version_tuple(v) > _version_tuple(version)]
     if newer:
         latest = max(newer, key=_version_tuple)
@@ -1469,6 +1521,16 @@ def _cluster_findings(c: dict, ctx: dict[str, Any] | None) -> list[dict]:
             finding(
                 "warning",
                 f"parameter group {pg_name} is family {family} but engine {engine} {version} expects {expected}",
+            )
+        )
+    config_endpoint = c.get("ConfigurationEndpoint")
+    if engine == "memcached" and config_endpoint and (c.get("NumCacheNodes") or 0) > 1:
+        out.append(
+            finding(
+                "info",
+                f"auto-discovery endpoint {config_endpoint.get('Address')}:{config_endpoint.get('Port')} fronts "
+                f"{c.get('NumCacheNodes')} nodes; per-node stats need the node endpoints (see nodes), "
+                "set them in MEMCACHED_NODES",
             )
         )
     if not c.get("ReplicationGroupId"):  # replication group members are covered by the group-level findings

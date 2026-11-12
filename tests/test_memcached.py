@@ -243,3 +243,136 @@ def test_memcached_cluster_stats_tool(fake_cluster, monkeypatch):
     monkeypatch.setenv("MEMCACHED_NODES", "m1:11211,m2:11212")
     out = server.memcached_cluster_stats()
     assert out["status"] == "ok" and out["nodes_total"] == 2
+
+
+# ------------------------------------------------------------------ usage and endpoint findings
+
+
+def _report(evictions=0, hits=90, misses=10, used=10 * 1024 * 1024, items=1000, node="n1:11211"):
+    return {
+        "node": node,
+        "status": "ok",
+        "limit_maxbytes": 64 * 1024 * 1024,
+        "bytes": used,
+        "curr_items": items,
+        "evictions": evictions,
+        "gets": hits + misses,
+        "get_hit_ratio": hits / (hits + misses),
+        "listen_disabled_num": 0,
+        "curr_connections": 1,
+        "max_connections": 1000,
+        "slabs": {"findings": [], "notes": []},
+    }
+
+
+def _messages(report):
+    return " | ".join(f["message"] for f in memcached.cluster_findings([report]))
+
+
+def test_evictions_with_low_hit_rate_say_the_working_set_does_not_fit():
+    text = _messages(_report(evictions=500, hits=50, misses=50, used=60 * 1024 * 1024))
+    assert "working set does not fit" in text
+    assert "working set" not in _messages(_report(evictions=500, hits=95, misses=5, used=60 * 1024 * 1024))
+    assert "working set" not in _messages(
+        _report(evictions=500, hits=1, misses=5, used=60 * 1024 * 1024)
+    )  # too few gets
+
+
+def test_evictions_far_below_the_memory_limit_point_at_slab_imbalance():
+    assert "slab imbalance" in _messages(_report(evictions=3, used=8 * 1024 * 1024))
+    assert "slab imbalance" not in _messages(_report(evictions=3, used=60 * 1024 * 1024))
+    assert "slab imbalance" not in _messages(_report(evictions=0, used=8 * 1024 * 1024))
+
+
+def test_near_full_node_with_huge_average_items_is_flagged():
+    assert "averaging" in _messages(_report(used=62 * 1024 * 1024, items=100))
+    assert "averaging" not in _messages(_report(used=62 * 1024 * 1024, items=100_000))
+
+
+def test_summary_adds_eviction_context(monkeypatch):
+    stats = {"evictions": "9", "get_hits": "40", "get_misses": "60", "bytes": "1000", "limit_maxbytes": "100000"}
+    monkeypatch.setattr(memcached, "stats", lambda *a, **k: stats)
+    text = " | ".join(memcached.summary("h")["findings"])
+    assert "working set does not fit" in text and "slab imbalance" in text
+
+
+def test_auto_discovery_endpoint_in_memcached_nodes_is_flagged():
+    cfg = "mc.abc123.cfg.use1.cache.amazonaws.com"
+    assert memcached.is_discovery_endpoint(cfg)
+    assert not memcached.is_discovery_endpoint("mc.abc123.0001.use1.cache.amazonaws.com")
+    assert not memcached.is_discovery_endpoint("10.0.0.5")
+    alone = memcached.cluster_findings([_report(node=f"{cfg}:11211")])
+    assert any("single arbitrary node" in f["message"] for f in alone)
+    mixed = memcached.cluster_findings(
+        [_report(node=f"{cfg}:11211"), _report(node="mc.abc123.0001.use1.cache.amazonaws.com:11211")]
+    )
+    assert any("counted twice" in f["message"] for f in mixed)
+    assert not any("auto-discovery" in f["message"] for f in memcached.cluster_findings([_report()]))
+
+
+# ------------------------------------------------------------------ control plane: engine versions
+
+
+def _control_plane(cluster, versions):
+    import datetime as dt
+
+    import boto3
+    from botocore.stub import Stubber
+
+    from mcp_elasticache_ops.config import ControlPlaneConfig
+    from mcp_elasticache_ops.controlplane import ControlPlane
+
+    ec = boto3.client("elasticache", region_name="us-east-1", aws_access_key_id="t", aws_secret_access_key="t")
+    stub = Stubber(ec)
+    stub.add_response("describe_cache_clusters", {"CacheClusters": [cluster]})
+    stub.add_response("describe_cache_engine_versions", {"CacheEngineVersions": versions})
+    stub.add_response("describe_cache_parameter_groups", {"CacheParameterGroups": []})
+
+    class Session:
+        def client(self, service, region_name=None):
+            return ec
+
+    cp = ControlPlane(
+        ControlPlaneConfig(region="us-east-1"),
+        session_factory=Session,
+        clock=lambda: dt.datetime(2026, 11, 12, tzinfo=dt.UTC),
+    )
+    return cp, stub
+
+
+def test_aws_cache_clusters_flags_old_and_retired_memcached_version_and_discovery_endpoint():
+    cluster = {
+        "CacheClusterId": "mc",
+        "Engine": "memcached",
+        "EngineVersion": "1.4.34",
+        "CacheClusterStatus": "available",
+        "NumCacheNodes": 3,
+        "ConfigurationEndpoint": {"Address": "mc.x.cfg.use1.cache.amazonaws.com", "Port": 11211},
+    }
+    versions = [
+        {"Engine": "memcached", "EngineVersion": "1.6.6", "CacheParameterGroupFamily": "memcached1.6"},
+        {"Engine": "memcached", "EngineVersion": "1.6.22", "CacheParameterGroupFamily": "memcached1.6"},
+    ]
+    cp, stub = _control_plane(cluster, versions)
+    with stub:
+        out = cp.cache_clusters()
+    text = " | ".join(f["message"] for f in out["findings"])
+    assert "end-of-life (< 1.6)" in text
+    assert "no longer offered" in text
+    assert "auto-discovery endpoint mc.x.cfg.use1.cache.amazonaws.com:11211 fronts 3 nodes" in text
+
+
+def test_aws_cache_clusters_is_quiet_for_a_current_memcached_version():
+    cluster = {
+        "CacheClusterId": "mc",
+        "Engine": "memcached",
+        "EngineVersion": "1.6.22",
+        "CacheClusterStatus": "available",
+        "NumCacheNodes": 1,
+    }
+    versions = [{"Engine": "memcached", "EngineVersion": "1.6.22", "CacheParameterGroupFamily": "memcached1.6"}]
+    cp, stub = _control_plane(cluster, versions)
+    with stub:
+        out = cp.cache_clusters()
+    text = " | ".join(f["message"] for f in out["findings"])
+    assert "end-of-life" not in text and "no longer offered" not in text and "auto-discovery" not in text

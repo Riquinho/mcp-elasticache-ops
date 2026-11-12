@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased (round 05)
+
+### Added
+- Data-plane findings: `noeviction` at >= 85% of maxmemory (critical), failed RDB/AOF persistence, client input/output
+  buffer peaks >= 16 MiB, average eviction rate since start; `node_memory` gains `findings`. Thresholds are listed in the
+  README ("Finding thresholds"). `persistence` is part of the per-section `INFO` fallback.
+- Memcached: evictions with a low hit ratio, evictions far below `limit_maxbytes` (slab imbalance), near-full nodes of huge
+  items, auto-discovery endpoint listed in `MEMCACHED_NODES`; `aws_cache_clusters` flags Memcached < 1.6, retired
+  Memcached versions (missing from `DescribeCacheEngineVersions`) and the discovery endpoint vs node endpoints.
+- Failures are structured: `aws_*` errors carry a `hint` for AccessDenied, throttling and connect timeouts; node and
+  Memcached connection, timeout and TLS handshake failures return `{error, message, hint}` instead of raising.
+- Tests: README table and tool count must match the registry, every aws/node/memcached tool under injected failures,
+  cluster-health integration test. `scripts/release-check.sh` (CHANGELOG entry for the pyproject version, README tool
+  count) runs in CI.
+
 ## Unreleased (round 04)
 
 ### Added

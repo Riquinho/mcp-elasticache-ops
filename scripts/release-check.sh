@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Release consistency checks, run in CI and locally:
+#   1. CHANGELOG.md has a section for the version in pyproject.toml (or an "Unreleased" section);
+#   2. the tool count in README.md equals the number of tools the server registers;
+#   3. every registered tool has a row in the README tool table.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+version=$(uv run python -I -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+if ! grep -Eq "^## (\[?v?${version//./\.}\]?|Unreleased)" CHANGELOG.md; then
+  echo "CHANGELOG.md has no entry for version ${version} (and no Unreleased section)" >&2
+  exit 1
+fi
+
+uv run python -I - <<'PY'
+import asyncio
+import re
+import sys
+from pathlib import Path
+
+from mcp_elasticache_ops.server import mcp
+
+registered = {t.name for t in asyncio.run(mcp.list_tools())}
+readme = Path("README.md").read_text(encoding="utf-8")
+claimed = re.search(r"All (\d+) tools are annotated", readme)
+documented = set(re.findall(r"^\| `([a-z_]+)` \|", readme, flags=re.MULTILINE))
+problems = []
+if not claimed or int(claimed.group(1)) != len(registered):
+    problems.append(f"README claims {claimed.group(1) if claimed else 'no'} tools, server registers {len(registered)}")
+problems += [f"tool {n} missing from the README table" for n in sorted(registered - documented)]
+problems += [f"README table lists unknown tool {n}" for n in sorted(documented - registered)]
+if problems:
+    print("\n".join(problems), file=sys.stderr)
+    sys.exit(1)
+print(f"release check ok: {len(registered)} tools")
+PY
+echo "release check ok: CHANGELOG has an entry for ${version} or Unreleased"

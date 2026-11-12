@@ -954,3 +954,124 @@ def test_acl_log_clean_and_unsupported():
     old = FakeRedis(infos={"server": {"redis_version": "5.0.7"}})
     got = dataplane.acl_log(old, 25)
     assert got["entries"] == [] and "not supported by redis 5.0.7" in got["notes"][0]
+
+
+# ------------------------------------------------- round 05: policy, fragmentation, persistence, buffers
+
+
+def _risk_infos(**over):
+    """Healthy single node; ``over`` is merged into the memory/stats/persistence/clients sections by prefix."""
+    infos = {
+        "server": {"redis_version": "7.2.4", "uptime_in_seconds": 6000},
+        "memory": {
+            "used_memory": 10,
+            "maxmemory": 100,
+            "used_memory_rss": 12,
+            "mem_fragmentation_ratio": 1.1,
+            "maxmemory_policy": "allkeys-lru",
+        },
+        "stats": {"keyspace_hits": 90, "keyspace_misses": 10, "evicted_keys": 0},
+        "persistence": {"rdb_last_bgsave_status": "ok", "aof_last_write_status": "ok"},
+        "clients": {"connected_clients": 3},
+        "replication": {
+            "role": "master",
+            "connected_slaves": 1,
+            "master_repl_offset": 1000,
+            "slave0": {"ip": "10.0.0.2", "port": 6379, "state": "online", "offset": 1000, "lag": 0},
+        },
+        "commandstats": {},
+    }
+    for section, values in over.items():
+        infos[section] = {**infos[section], **values}
+    return infos
+
+
+def _triage_messages(**over):
+    out = dataplane.triage(FakeRedis(infos=_risk_infos(**over)), None)
+    return out, {f["message"]: f for f in out["findings"]}
+
+
+def _find(messages, needle):
+    hits = [f for m, f in messages.items() if needle in m]
+    assert hits, f"no finding containing {needle!r} in {list(messages)}"
+    return hits[0]
+
+
+def test_triage_baseline_is_quiet():
+    out, _ = _triage_messages()
+    # only the fake latency event (info) remains
+    assert [f["severity"] for f in out["findings"]] == ["info"]
+
+
+def test_triage_noeviction_with_high_memory_is_critical():
+    _, msgs = _triage_messages(memory={"used_memory": 88, "maxmemory_policy": "noeviction"})
+    assert _find(msgs, "noeviction at 88%")["severity"] == "critical"
+    _, quiet = _triage_messages(memory={"used_memory": 50, "maxmemory_policy": "noeviction"})
+    assert not any("noeviction at" in m for m in quiet)
+    _, other = _triage_messages(memory={"used_memory": 88})
+    assert not any("noeviction at" in m for m in other)
+
+
+def test_triage_high_fragmentation_ratio():
+    _, msgs = _triage_messages(memory={"mem_fragmentation_ratio": 1.8})
+    assert _find(msgs, "high fragmentation ratio 1.80")["severity"] == "warning"
+
+
+def test_triage_fragmentation_below_one_means_swapping():
+    _, msgs = _triage_messages(memory={"mem_fragmentation_ratio": 0.6})
+    assert _find(msgs, "fragmentation ratio 0.60 < 1")
+
+
+def test_triage_evicted_keys_report_average_rate():
+    _, msgs = _triage_messages(stats={"evicted_keys": 500})
+    # 500 keys over 6000 s of uptime = 5.0 per minute
+    assert _find(msgs, "500 keys evicted since restart, about 5.0/min on average")
+
+
+def test_triage_failed_rdb_bgsave_is_reported():
+    _, msgs = _triage_messages(persistence={"rdb_last_bgsave_status": "err"})
+    assert _find(msgs, "rdb_last_bgsave_status=err")["severity"] == "warning"
+    _, aof = _triage_messages(persistence={"aof_last_write_status": "err"})
+    assert _find(aof, "aof_last_write_status=err")
+
+
+def test_triage_replica_link_down_is_critical():
+    _, msgs = _triage_messages(replication={"role": "slave", "master_link_status": "down"})
+    assert any(f["severity"] == "critical" and "link is down" in m for m, f in msgs.items())
+
+
+def test_triage_large_client_output_buffer():
+    _, msgs = _triage_messages(clients={"client_recent_max_output_buffer": 64 * 1024 * 1024})
+    assert _find(msgs, "client output buffer peaked at 64 MiB")["severity"] == "warning"
+    _, inp = _triage_messages(clients={"client_recent_max_input_buffer": 32 * 1024 * 1024})
+    assert _find(inp, "client input buffer peaked at 32 MiB")
+    _, small = _triage_messages(clients={"client_recent_max_output_buffer": 20_000})
+    assert not any("buffer peaked" in m for m in small)
+
+
+def test_health_summary_falls_back_to_the_persistence_section():
+    class NoBareInfo(FakeRedis):
+        def info(self, section=None):
+            if section is None:
+                raise redis.ResponseError("unknown command 'INFO'")
+            return super().info(section)
+
+    out = dataplane.health_summary(NoBareInfo(infos=_risk_infos(persistence={"rdb_last_bgsave_status": "err"})))
+    assert any("rdb_last_bgsave_status=err" in f for f in out["findings"])
+
+
+def test_memory_report_findings_cover_policy_fragmentation_and_evictions():
+    def run(mem=None, stats=None):
+        infos = _risk_infos(memory=mem or {}, stats=stats or {})
+        return dataplane.memory_report(FakeRedis(infos=infos))["findings"]
+
+    def messages(findings):
+        return " | ".join(f["message"] for f in findings)
+
+    assert run() == []
+    noevict = run(mem={"used_memory": 92, "maxmemory_policy": "noeviction"})
+    assert {f["severity"] for f in noevict} == {"critical"}
+    assert "maxmemory-policy is noeviction at 92%" in messages(noevict) and "memory at 92%" in messages(noevict)
+    assert "mem_fragmentation_ratio 1.70 > 1.5" in messages(run(mem={"mem_fragmentation_ratio": 1.7}))
+    assert "mem_fragmentation_ratio 0.50 < 1" in messages(run(mem={"mem_fragmentation_ratio": 0.5}))
+    assert "42 keys evicted since restart" in messages(run(stats={"evicted_keys": 42}))

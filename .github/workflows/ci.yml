@@ -22,6 +22,8 @@ jobs:
       - name: Dependency audit
         run: uv export --locked --no-hashes --no-emit-project -o /tmp/req.txt && uvx pip-audit --disable-pip -r /tmp/req.txt
         shell: bash
+      - name: Release check (CHANGELOG entry for the version, README tool table matches the registry)
+        run: bash scripts/release-check.sh
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - name: Build wheel and smoke test it in an isolated interpreter
@@ -58,6 +60,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: uv sync --locked
+      # Runs unit and integration tests, including the live Memcached test (MEMCACHED_TEST_HOST is set).
       - run: uv run pytest -q --cov=mcp_elasticache_ops --cov-fail-under=90
 
   cluster:
@@ -76,6 +79,7 @@ jobs:
         env:
           CLUSTER_TEST_HOST: 127.0.0.1
           CLUSTER_TEST_PORT: "7001"
+        # covers CLUSTER NODES, node_cluster_health and the keyspace/memory/slowlog fan-out against real nodes
         run: uv run pytest -q -m integration tests/test_dataplane_integration.py -k cluster
       - name: Tear down
         if: always()

@@ -7,10 +7,13 @@ import functools
 import json
 import logging
 import os
+import socket
+import ssl
 from collections.abc import Callable
 from functools import lru_cache
 from typing import Annotated, Any, Literal
 
+import redis
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
@@ -104,6 +107,51 @@ def cap_output(result: Any, limit: int) -> Any:
     }
 
 
+def connection_error_result(exc: BaseException) -> dict:
+    """Structured result for a network failure towards a node: error type, message and a next step."""
+    name, message = type(exc).__name__, str(exc)
+    low = message.lower()
+    if isinstance(exc, redis.exceptions.AuthenticationError):
+        hint = "The node rejected the credentials; check ELASTICACHE_USERNAME and ELASTICACHE_PASSWORD(_FILE)."
+    elif "ssl" in low or "tls" in low or "certificate" in low or "handshake" in low:
+        hint = (
+            "TLS handshake failed; check ELASTICACHE_TLS (true for in-transit encryption, false otherwise), that "
+            "ELASTICACHE_HOST is the endpoint DNS name (needed for certificate verification), and "
+            "ELASTICACHE_TLS_CA_FILE / ELASTICACHE_TLS_VERIFY."
+        )
+    elif isinstance(exc, TimeoutError | redis.exceptions.TimeoutError):
+        hint = (
+            "The node did not answer in time; check security groups and routing to the endpoint, raise "
+            "ELASTICACHE_TIMEOUT, or retry (the node may be busy or failing over)."
+        )
+    else:
+        hint = (
+            "Cannot reach the node; check ELASTICACHE_HOST/ELASTICACHE_PORT (or MEMCACHED_HOST/MEMCACHED_NODES), "
+            "the security group and, if the endpoint requires it, ELASTICACHE_TLS."
+        )
+    return {"error": name, "message": message, "hint": hint}
+
+
+def _guarded(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Turn connection failures into a structured error result instead of a raw exception."""
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return fn(*args, **kwargs)
+        except (
+            redis.exceptions.ConnectionError,
+            redis.exceptions.TimeoutError,
+            ConnectionError,
+            TimeoutError,
+            socket.gaierror,
+            ssl.SSLError,
+        ) as exc:
+            return connection_error_result(exc)
+
+    return wrapper
+
+
 def _capped(fn: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -115,7 +163,7 @@ def _capped(fn: Callable[..., Any]) -> Callable[..., Any]:
 
 def read_tool(fn: Callable[..., Any]) -> Callable[..., Any]:
     """Register ``fn`` as a read-only MCP tool whose result is size-capped."""
-    return mcp.tool(annotations=READ_ONLY)(_capped(fn))
+    return mcp.tool(annotations=READ_ONLY)(_capped(_guarded(fn)))
 
 
 @lru_cache(maxsize=1)

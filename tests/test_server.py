@@ -181,3 +181,131 @@ def test_tool_wrapper_rejects_invalid_limit(monkeypatch):
     monkeypatch.setenv("MCP_MAX_OUTPUT_CHARS", "lots")
     with pytest.raises(ConfigError, match="MCP_MAX_OUTPUT_CHARS"):
         server.node_triage()
+
+
+# ------------------------------------------------------------------ README / registry sync
+
+
+def _readme_text() -> str:
+    from pathlib import Path
+
+    return (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+
+
+async def test_readme_tool_table_lists_exactly_the_registered_tools():
+    import re
+
+    registered = {t.name for t in await server.mcp.list_tools()}
+    documented = set(re.findall(r"^\| `([a-z_]+)` \|", _readme_text(), flags=re.MULTILINE))
+    assert registered - documented == set(), "tools missing from the README table"
+    assert documented - registered == set(), "README lists tools that are not registered"
+
+
+async def test_readme_tool_count_matches_registry():
+    import re
+
+    match = re.search(r"All (\d+) tools are annotated", _readme_text())
+    assert match is not None
+    assert int(match.group(1)) == len(await server.mcp.list_tools())
+
+
+def test_capped_wrapper_keeps_findings_first_and_marks_truncation(monkeypatch):
+    monkeypatch.setenv("MCP_MAX_OUTPUT_CHARS", "4000")
+
+    @server._capped
+    def fake_tool() -> dict:
+        return _big()
+
+    out = fake_tool()
+    assert list(out)[: len(_big())] == list(_big())  # original key order, findings stay before bulky lists
+    keys = list(out)
+    assert keys.index("findings") < keys.index("rows")
+    assert out["truncated"] is True and out["omitted"] > 0
+    assert len(out["findings"]) == 5
+
+
+# ------------------------------------------------------------------ failure modes (node_* and memcached_*)
+
+
+class _Unreachable:
+    """Stands in for a redis client whose every call fails with ``make()``."""
+
+    def __init__(self, make):
+        self._make = make
+
+    def __getattr__(self, name):
+        def call(*args, **kwargs):
+            raise self._make()
+
+        return call
+
+
+def _redis_failures():
+    import redis
+
+    return {
+        "timeout": (lambda: redis.TimeoutError("Timeout reading from socket"), "did not answer"),
+        "refused": (
+            lambda: redis.ConnectionError("Error 111 connecting to h:6379. Connection refused."),
+            "Cannot reach",
+        ),
+        "tls": (
+            lambda: redis.ConnectionError("Error 1 connecting to h:6379. [SSL: WRONG_VERSION_NUMBER] wrong version"),
+            "ELASTICACHE_TLS",
+        ),
+        "auth": (lambda: redis.AuthenticationError("invalid username-password pair"), "credentials"),
+    }
+
+
+@pytest.mark.parametrize("failure", ["timeout", "refused", "tls", "auth"])
+async def test_every_node_tool_returns_a_structured_failure_with_a_hint(monkeypatch, failure):
+    make, hint_part = _redis_failures()[failure]
+    monkeypatch.setenv("ELASTICACHE_HOST", "node.example.invalid")
+    monkeypatch.setattr(server, "redis_client", lambda: _Unreachable(make))
+    monkeypatch.setattr(server, "_node_client", lambda host, port: _Unreachable(make))
+    async with Client(server.mcp) as client:
+        tools = [t for t in await client.list_tools() if t.name.startswith("node_")]
+        assert len(tools) >= 18
+        for tool in tools:
+            args = dict.fromkeys(tool.input_schema.get("required", []), "x")
+            result = await client.call_tool(tool.name, args, raise_on_error=False)
+            assert not result.is_error, f"{tool.name} raised: {result.content}"
+            data = _data(result)
+            text = json.dumps(data, default=str)
+            assert "Traceback" not in text, tool.name
+            top_level_error = isinstance(data, dict) and "error" in data and "hint" in data
+            degraded = isinstance(data, dict) and (
+                data.get("status") in {"partial", "error"}
+                or data.get("unavailable")
+                or data.get("notes")
+                or data.get("findings")
+                or data.get("shards_unreachable") is not None
+            )
+            assert top_level_error or degraded, f"{tool.name}: {text[:300]}"
+            if top_level_error:
+                assert hint_part in data["hint"], f"{tool.name}: {data['hint']}"
+
+
+def test_tls_handshake_error_hints_at_tls_and_endpoint_settings():
+    import redis
+
+    out = server.connection_error_result(redis.ConnectionError("[SSL: CERTIFICATE_VERIFY_FAILED] hostname mismatch"))
+    assert "ELASTICACHE_TLS" in out["hint"] and "ELASTICACHE_HOST" in out["hint"]
+    assert out["error"] == "ConnectionError"
+
+
+@pytest.mark.parametrize("tool", ["memcached_stats", "memcached_cluster_stats"])
+async def test_memcached_tools_survive_socket_timeouts(monkeypatch, tool):
+    import socket
+
+    def timeout(*args, **kwargs):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(socket, "create_connection", timeout)
+    monkeypatch.setenv("MEMCACHED_HOST", "mc.example.invalid")
+    monkeypatch.setenv("MEMCACHED_NODES", "mc1.example.invalid:11211,mc2.example.invalid:11211")
+    async with Client(server.mcp) as client:
+        result = await client.call_tool(tool, {}, raise_on_error=False)
+    assert not result.is_error
+    data = _data(result)
+    assert data.get("hint") or data.get("status") in {"partial", "error"}

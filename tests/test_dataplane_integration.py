@@ -156,3 +156,11 @@ def test_cluster_acl_log_integration(cluster_seed):
     assert out["whoami"] == "default"
     with pytest.raises(ReadOnlyViolation):
         cluster_seed.execute_command("ACL", "LOG", "RESET")
+
+
+@needs_cluster
+def test_cluster_health_integration(cluster_seed, cluster_factory):
+    out = dataplane.cluster_health(cluster_seed, cluster_factory)
+    assert out["cluster_enabled"] is True
+    assert out["nodes_probed"] == 3 and out["slots_covered"] == 16384
+    assert all("error" not in node for node in out["per_node"].values())

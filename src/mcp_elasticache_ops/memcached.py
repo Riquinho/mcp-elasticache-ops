@@ -61,6 +61,10 @@ def summary(host: str, port: int = 11211, timeout: float = 5.0) -> dict:
     findings = []
     if n("evictions") > 0:
         findings.append(f"{int(n('evictions'))} evictions since start")
+        if hits + misses >= MIN_GETS_FOR_RATIO and hits / (hits + misses) < LOW_HIT_RATIO:
+            findings.append(f"evicting with a {hits / (hits + misses):.0%} hit ratio: the working set does not fit")
+        if limit and n("bytes") / limit < CALCIFIED_MEMORY_RATIO:
+            findings.append(f"evicting at only {n('bytes') / limit:.0%} of limit_maxbytes: possible slab imbalance")
     if limit and n("bytes") / limit > 0.9:
         findings.append(f"memory at {n('bytes') / limit:.0%} of limit_maxbytes")
     if n("listen_disabled_num") > 0:
@@ -92,6 +96,10 @@ CONNECTIONS_NEAR_MAX = 0.85
 MEMORY_NEAR_LIMIT = 0.9
 SLAB_DOMINANT_PCT = 60.0
 SLAB_MIN_PAGES = 5
+LOW_HIT_RATIO = 0.80  # evictions plus a hit ratio below this: the working set does not fit
+CALCIFIED_MEMORY_RATIO = 0.70  # evicting while below this share of limit_maxbytes points at slab imbalance
+LARGE_AVG_ITEM_BYTES = 256 * 1024  # average item size where a near-full node holds very few items
+MIN_GETS_FOR_RATIO = 100  # fewer gets than this: a hit ratio means nothing
 _SEVERITY_RANK = {"critical": 0, "warning": 1, "info": 2}
 
 
@@ -104,6 +112,48 @@ def _f(stats_map: dict[str, str], key: str) -> float:
 
 def _finding(severity: str, message: str, **extra) -> dict:
     return {"severity": severity, "message": message, **extra}
+
+
+def is_discovery_endpoint(host: str) -> bool:
+    """True for a Memcached configuration (auto-discovery) endpoint, e.g. ``x.abc.cfg.use1.cache.amazonaws.com``."""
+    labels = host.lower().split(".")
+    return "cfg" in labels[1:] and host.lower().endswith(".amazonaws.com")
+
+
+def usage_findings(name: str, n: dict) -> list[dict]:
+    """Right-sizing findings for one node report: eviction context, slab calcification, huge average items."""
+    out: list[dict] = []
+    limit, used, items = n["limit_maxbytes"], n["bytes"], n["curr_items"]
+    ratio = n["get_hit_ratio"]
+    gets_known = n.get("gets", MIN_GETS_FOR_RATIO) >= MIN_GETS_FOR_RATIO
+    if n["evictions"] > 0 and ratio is not None and gets_known and ratio < LOW_HIT_RATIO:
+        out.append(
+            _finding(
+                "warning",
+                f"node {name} evicts ({n['evictions']}) with a {ratio:.0%} hit ratio: the working set does not fit, "
+                "add memory (bigger node type or more nodes) or shorten TTLs",
+                node=name,
+            )
+        )
+    if limit and n["evictions"] > 0 and used / limit < CALCIFIED_MEMORY_RATIO:
+        out.append(
+            _finding(
+                "warning",
+                f"node {name} evicts at only {used / limit:.0%} of limit_maxbytes ({items} items): "
+                "slab imbalance, check the slab report and slab_reassign/slab_automove",
+                node=name,
+            )
+        )
+    if limit and items and used / limit >= MEMORY_NEAR_LIMIT and used / items >= LARGE_AVG_ITEM_BYTES:
+        out.append(
+            _finding(
+                "info",
+                f"node {name} is {used / limit:.0%} full with {items} items averaging {used // items} bytes: "
+                "large values leave little room for churn",
+                node=name,
+            )
+        )
+    return out
 
 
 def slab_report(slabs: dict[str, str], items: dict[str, str]) -> dict:
@@ -176,6 +226,7 @@ def node_report(host: str, port: int, timeout: float) -> dict:
         }
     )
     hits, misses = _f(general, "get_hits"), _f(general, "get_misses")
+    out["gets"] = int(hits + misses)
     out["get_hit_ratio"] = round(hits / (hits + misses), 4) if hits + misses else None
     errors = []
     groups = {}
@@ -189,6 +240,29 @@ def node_report(host: str, port: int, timeout: float) -> dict:
     if errors:
         out["status"] = "partial"
         out["error"] = "; ".join(errors)
+    return out
+
+
+def _endpoint_findings(nodes: list[dict]) -> list[dict]:
+    """A configuration endpoint answers for one arbitrary node; stats per node need the node endpoints."""
+    out: list[dict] = []
+    names = [n["node"] for n in nodes]
+    discovery = [name for name in names if is_discovery_endpoint(name.rsplit(":", 1)[0])]
+    for name in discovery:
+        others = len(names) - len(discovery)
+        detail = (
+            "it is mixed with node endpoints, so one node is counted twice"
+            if others
+            else "stats describe a single arbitrary node, not the cluster"
+        )
+        out.append(
+            _finding(
+                "warning",
+                f"{name} is the auto-discovery (configuration) endpoint: {detail}; "
+                "list each node endpoint in MEMCACHED_NODES (aws_cache_clusters shows them)",
+                node=name,
+            )
+        )
     return out
 
 
@@ -225,10 +299,12 @@ def cluster_findings(nodes: list[dict]) -> list[dict]:
             findings.append(
                 _finding("warning", f"node {name} memory at {n['bytes'] / n['limit_maxbytes']:.0%} of limit", node=name)
             )
+        findings += usage_findings(name, n)
         for f in n["slabs"]["findings"]:
             findings.append({**f, "message": f"node {name}: {f['message']}", "node": name})
         for note in n["slabs"]["notes"]:
             findings.append(_finding("info", f"node {name}: {note}", node=name))
+    findings += _endpoint_findings(nodes)
     ratios = [n["get_hit_ratio"] for n in ok if n["get_hit_ratio"] is not None]
     if len(ratios) >= 3:
         median = statistics.median(ratios)

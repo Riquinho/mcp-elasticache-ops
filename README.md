@@ -19,7 +19,7 @@ All 37 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `node_health` | One-shot summary: engine/version, role, memory, clients, hit ratio, evictions, findings |
 | `node_triage` | On-call snapshot in one call: health, memory, replication, clients, failed/rejected commandstats, top-5 slowlog and latency. Findings merged worst-first (max 30) with a per-section summary; a failing section is `unavailable`, the rest still run. No extra Redis commands |
 | `node_info` | Raw `INFO`, optionally one section; password-like fields (`masterauth`, `requirepass`, ...) are redacted |
-| `node_memory` | used/RSS/peak/dataset/overhead, maxmemory + policy, fragmentation verdict, `MEMORY STATS/DOCTOR` |
+| `node_memory` | used/RSS/peak/dataset/overhead, maxmemory + policy, fragmentation verdict, `findings` (memory > 90%, `noeviction` near full, fragmentation, evictions), `MEMORY STATS/DOCTOR` |
 | `node_config` | Allowlisted `CONFIG GET` values (never secrets) with findings: `noeviction` with a maxmemory limit, `timeout 0` with idle clients, AOF, slowlog and latency monitor off, broad keyspace events. Points at `aws_parameters` when the endpoint refuses `CONFIG` |
 | `node_slowlog` | `SLOWLOG GET` with per-command totals; arguments beyond the key are hidden |
 | `node_clients` | `CLIENT LIST` aggregated by IP, name, user and last command; idle and buffer outliers |
@@ -34,8 +34,8 @@ All 37 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `node_cluster_slowlog` | Same fan-out for `SLOWLOG GET`: merged slowest commands labelled by shard |
 | `node_cluster_memory` | Same fan-out for memory: per-shard used/maxmemory/fragmentation/evictions, skew and >90% findings |
 | `node_acl_log` | `ACL WHOAMI` + `ACL LOG` (optional count): auth failures and denied commands aggregated by reason and user, client info reduced and redacted, findings on bursts. `ACL LIST`, `GETUSER`, `SETUSER`, `DELUSER` and `LOG RESET` stay refused |
-| `memcached_stats` | Memcached `stats` summary (hit ratio, memory, evictions) or a raw stats group |
-| `memcached_cluster_stats` | Fan-out over `MEMCACHED_NODES` (bounded concurrency, per-node timeout), only `stats`, `stats slabs`, `stats items`. Findings first: evictions, hit-ratio outliers vs the median, item/memory imbalance, `listen_disabled_num`, connections near maxconns, slab classes evicting or out of memory, one class holding most pages. A dead node gives `status: partial` |
+| `memcached_stats` | Memcached `stats` summary (hit ratio, memory, evictions; evictions are put in context of hit ratio and fill level) or a raw stats group |
+| `memcached_cluster_stats` | Fan-out over `MEMCACHED_NODES` (bounded concurrency, per-node timeout), only `stats`, `stats slabs`, `stats items`. Findings first: evictions, hit-ratio outliers vs the median, item/memory imbalance, `listen_disabled_num`, connections near maxconns, slab classes evicting or out of memory, one class holding most pages, evictions with a low hit ratio, evictions far below the memory limit (slab imbalance), a near-full node of huge items, and an auto-discovery endpoint listed in `MEMCACHED_NODES`. A dead node gives `status: partial` |
 
 **Control plane** (boto3, optional)
 
@@ -71,6 +71,25 @@ Control-plane tools return `findings` first (`{"severity", "message", "resource"
 
 Without AWS credentials or region, the `aws_*` tools return `{"unavailable": ...}` instead of failing,
 so the server is useful against a plain Redis/Valkey too.
+
+### Finding thresholds
+
+Fixed, bounded thresholds (not configurable) behind the data-plane findings that `node_health`, `node_triage`
+and `node_memory` emit:
+
+| Finding | Threshold | Severity |
+|---|---|---|
+| Memory near the limit | `used_memory / maxmemory` > 90% | critical |
+| `noeviction` close to OOM | `maxmemory-policy` is `noeviction` and usage >= 85% | critical |
+| Fragmentation | `mem_fragmentation_ratio` > 1.5 (high) or < 1.0 with data (swapping) | warning |
+| Evictions | `evicted_keys` > 0; the message adds the average per minute since start | warning |
+| Failed persistence | `rdb_last_bgsave_status` or `aof_last_write_status` not `ok` | warning |
+| Replica link down | `master_link_status` not `up` on a replica | critical |
+| Large client buffers | `client_recent_max_output_buffer` or `..._input_buffer` >= 16 MiB; per client `omem + qbuf` >= 10 MiB in `node_triage` | warning |
+| Memcached evictions, low hit ratio | evictions > 0, hit ratio < 80% over at least 100 gets | warning |
+| Memcached evictions below limit | evictions > 0 while `bytes` < 70% of `limit_maxbytes` | warning |
+| Memcached huge items | node >= 90% full with an average item of 256 KiB or more | info |
+| Engine version | Redis OSS <= 6.x, Memcached < 1.6 (end-of-life), a Memcached version missing from `DescribeCacheEngineVersions` (retired) | warning |
 
 ## Safety model
 

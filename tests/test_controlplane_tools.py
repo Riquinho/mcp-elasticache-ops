@@ -781,3 +781,94 @@ def test_iam_policy_allows_describe_alarms_and_nothing_else_beyond_describe_list
     assert "cloudwatch:GetMetricData" in actions
     for action in actions:
         assert re.match(r"^(elasticache|cloudwatch):(Describe|List|GetMetricData)", action), action
+
+
+# ----------------------------------------------------------------- failure modes (every aws_* tool)
+
+
+def _boto_failures():
+    from botocore.exceptions import ClientError, ConnectTimeoutError
+
+    def client_error(code):
+        return ClientError({"Error": {"Code": code, "Message": f"{code} for test"}}, "Describe")
+
+    return {
+        "AccessDenied": lambda: client_error("AccessDenied"),
+        "ThrottlingException": lambda: client_error("ThrottlingException"),
+        "ConnectTimeout": lambda: ConnectTimeoutError(endpoint_url="https://elasticache.us-east-1.amazonaws.com"),
+    }
+
+
+class _AlwaysFails:
+    """Stands in for a boto3 client: every API call raises the configured exception."""
+
+    def __init__(self, make):
+        self._make = make
+
+    def __getattr__(self, name):
+        def call(*args, **kwargs):
+            raise self._make()
+
+        return call
+
+
+def _example_args(tool) -> dict:
+    args = dict.fromkeys(tool.input_schema.get("required", []), "x")
+    if tool.name == "aws_metrics":  # needs one of two optional ids
+        args["cache_cluster_id"] = "x"
+    return args
+
+
+def _contains_marker(value) -> bool:
+    """A structured failure: an error with a hint, or a partial/unavailable section somewhere in the result."""
+    if isinstance(value, dict):
+        if "error" in value and "hint" in value:
+            return True
+        if (
+            value.get("partial") is True
+            or value.get("status") in {"partial", "error", "unavailable"}
+            or "unavailable" in value
+        ):
+            return True
+        return any(_contains_marker(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_contains_marker(v) for v in value)
+    return False
+
+
+@pytest.mark.parametrize("failure", ["AccessDenied", "ThrottlingException", "ConnectTimeout"])
+async def test_every_aws_tool_returns_a_structured_failure_with_a_hint(monkeypatch, failure):
+    import json
+
+    make = _boto_failures()[failure]
+
+    class Session:
+        def client(self, service, region_name=None):
+            return _AlwaysFails(make)
+
+    plane = ControlPlane(ControlPlaneConfig(region=REGION), session_factory=Session, clock=lambda: NOW)
+    monkeypatch.setattr(server, "control_plane", lambda: plane)
+    async with Client(server.mcp) as client:
+        tools = [t for t in await client.list_tools() if t.name.startswith("aws_")]
+        assert len(tools) >= 17
+        for tool in tools:
+            result = await client.call_tool(tool.name, _example_args(tool), raise_on_error=False)
+            assert not result.is_error, f"{tool.name} raised: {result.content}"
+            data = result.structured_content or json.loads(result.content[0].text)
+            data = data.get("result", data)
+            assert isinstance(data, dict), tool.name
+            assert _contains_marker(data), f"{tool.name} gave no structured failure: {str(data)[:300]}"
+            assert "Traceback" not in json.dumps(data, default=str), tool.name
+
+
+@pytest.mark.parametrize("failure", ["AccessDenied", "ThrottlingException", "ConnectTimeout"])
+def test_guarded_aws_errors_carry_a_specific_hint(failure):
+    class Session:
+        def client(self, service, region_name=None):
+            return _AlwaysFails(_boto_failures()[failure])
+
+    plane = ControlPlane(ControlPlaneConfig(region=REGION), session_factory=Session, clock=lambda: NOW)
+    out = plane.replication_groups()
+    assert out["error"] and out["message"]
+    expected = {"AccessDenied": "IAM", "ThrottlingException": "throttled", "ConnectTimeout": "did not answer"}
+    assert expected[failure] in out["hint"]
