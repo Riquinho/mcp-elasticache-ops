@@ -13,7 +13,9 @@ import pytest
 from fastmcp import Client
 
 from mcp_elasticache_ops import server
-from mcp_elasticache_ops.config import MemcachedConfig
+from mcp_elasticache_ops.config import DEFAULT_MAX_OUTPUT_CHARS, MemcachedConfig
+
+from .test_server import AUDIT_CALLS, audit  # noqa: F401  (fixture: recording fake planes shared with the read-only audit)
 
 LIMIT = 8_000
 BULK = 600
@@ -156,3 +158,80 @@ async def test_tool_output_stays_under_the_cap_with_findings_first(bulk_backends
     assert data["findings"] == [{"severity": "warning", "message": "something is off"}]  # never trimmed
     assert data["truncated"] is True and data["omitted"] > 0
     assert "Narrow the call" in data["truncation_hint"] and str(LIMIT) in data["truncation_hint"]
+
+
+# --------------------------------------------------------------------- findings-first contract (real tools)
+# Every registered tool is run through the server layer on the recording fake planes from test_server (real
+# data-plane, memcached and control-plane code; only the wire is faked). A payload must lead with a top-level
+# ``findings`` list: bounded, with dict entries ordered critical, warning, info. Tools that return something
+# else by design are listed here with the reason; an entry that stops being needed fails the test below.
+SEVERITY_ORDER = ("critical", "warning", "info")
+MAX_FINDINGS = 100
+
+NO_FINDINGS_EXEMPT: dict[str, str] = {
+    "node_info": "raw INFO passthrough of one section; node_health and node_triage carry the verdict",
+    "node_slowlog": "raw slowlog entries with a by_command rollup; node_triage flags slow commands",
+    "node_cluster_slowlog": "per-shard raw slowlog entries; node_cluster_triage carries the verdict",
+    "node_latency": "raw PING samples and LATENCY LATEST; node_latency_events and node_triage carry the verdict",
+    "node_cluster": "CLUSTER INFO passthrough; node_cluster_health carries the verdict",
+    "node_cluster_nodes": "parsed CLUSTER NODES table; topology findings live in node_cluster_health",
+    "node_cluster_health": "cluster views return a one-line note when the node is not clustered",
+}
+# Legacy payloads whose ``findings`` are plain sentences rather than {severity, message} objects.
+STRING_FINDINGS = {"node_health", "node_connectivity", "memcached_stats"}
+# memcached_stats with ``group`` returns the raw stats group, which has no findings.
+RAW_GROUP_CALLS = {("memcached_stats", "slabs")}
+
+
+def _call_id(call: tuple[str, dict]) -> str:
+    name, args = call
+    return name + ("-" + "-".join(f"{k}={v}" for k, v in sorted(args.items())) if args else "")
+
+
+async def _run(name: str, args: dict) -> dict:
+    async with Client(server.mcp) as c:
+        result = await c.call_tool(name, args)
+    data = result.structured_content
+    assert isinstance(data, dict)
+    return data.get("result", data)
+
+
+def _exempt(name: str, args: dict, data: dict) -> bool:
+    if name in NO_FINDINGS_EXEMPT and "findings" not in data:
+        return True
+    return (name, args.get("group")) in RAW_GROUP_CALLS and "findings" not in data
+
+
+@pytest.mark.parametrize("call", AUDIT_CALLS, ids=_call_id)
+async def test_tool_leads_with_a_bounded_severity_ordered_findings_list(audit, call):  # noqa: F811
+    name, args = call
+    data = await _run(name, args)
+    assert len(json.dumps(data, default=str, ensure_ascii=False)) <= DEFAULT_MAX_OUTPUT_CHARS * 2
+    if _exempt(name, args, data):
+        return
+    assert isinstance(data.get("findings"), list), f"{name}: no top-level findings list (keys: {list(data)[:8]})"
+    findings = data["findings"]
+    assert len(findings) <= MAX_FINDINGS, f"{name}: {len(findings)} findings is unbounded"
+    if name in STRING_FINDINGS:
+        assert all(isinstance(f, str) and f for f in findings)
+        return
+    assert all(isinstance(f, dict) and f.get("message") for f in findings), f"{name}: finding without a message"
+    ranks = [SEVERITY_ORDER.index(f["severity"]) for f in findings]
+    assert ranks == sorted(ranks), (
+        f"{name}: findings not ordered critical, warning, info: {[f['severity'] for f in findings]}"
+    )
+
+
+async def test_findings_contract_covers_every_registered_tool():
+    registered = {t.name for t in await server.mcp.list_tools()}
+    covered = {name for name, _ in AUDIT_CALLS}
+    assert covered == registered, f"uncovered: {sorted(registered - covered)}; stale: {sorted(covered - registered)}"
+    assert set(NO_FINDINGS_EXEMPT) <= registered and registered >= STRING_FINDINGS
+
+
+async def test_exemptions_are_still_needed(audit):  # noqa: F811
+    """An exempt tool that now returns findings must leave the exemption list."""
+    for name in NO_FINDINGS_EXEMPT:
+        args = dict(next(a for n, a in AUDIT_CALLS if n == name))
+        if "findings" in await _run(name, args):
+            pytest.fail(f"{name} returns findings now; remove it from NO_FINDINGS_EXEMPT")

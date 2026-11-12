@@ -82,7 +82,7 @@ def test_triage_merges_findings_worst_first_and_caps_them():
 
 def test_triage_caps_at_thirty_findings(monkeypatch):
     many = [dataplane._finding("warning", f"w{i}") for i in range(45)]
-    monkeypatch.setattr(dataplane, "_triage_replication", lambda d: ({}, many))
+    monkeypatch.setattr(dataplane.triage_report, "_triage_replication", lambda d: ({}, many))
     out = dataplane.triage(FakeRedis(infos=_healthy_infos()), None)
     assert len(out["findings"]) == 30
     assert out["findings_total"] == 46 and out["findings_omitted"] == 16

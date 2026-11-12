@@ -245,6 +245,8 @@ def _audit_reply(args: tuple) -> Any:
         if len(args) > 1 and name in {"CONFIG", "CLIENT", "SLOWLOG", "ACL", "LATENCY"}
         else name
     )
+    if name == "INFO" and len(args) > 1 and str(args[1]).lower() == "commandstats":
+        return {"cmdstat_get": {"calls": 10, "usec": 100, "usec_per_call": 10.0}}
     if name == "INFO":
         return {
             "redis_version": "7.1.0",

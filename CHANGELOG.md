@@ -1,8 +1,24 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 - 2026-11-12
 
 ### Added
+- Round 17 (0.2.0 cut): `dataplane.py` is now the `dataplane/` package (`_core`, `health`, `doctor`, `config_stats`,
+  `keyspace`, `replication`, `topology`, `fanout`, `acl_pubsub`, `triage_report`; no module over 470 lines, every
+  name re-exported; `tests/test_dataplane_package.py` pins the public and helper names and a 1300-line cap); the only
+  test edit is the monkeypatch target of one triage test, now `dataplane.triage_report`; `tests/test_readonly_audit.py`
+  scans every module of `controlplane/` and `dataplane/` (AST): only `describe_*`, `list_*`, `get_metric_data` and
+  paginators over them on boto3 clients, no raw Redis constructor, `SafeRedis` outside `connection.py`, no wire bypass
+  (`connection_pool`, `send_command`), and a new module fails until it is added to the audited list; findings-first
+  contract in `tests/test_output_budget.py` runs every registered tool on the recording fake planes (top-level
+  `findings`, at most 100, critical before warning before info; seven raw-view tools exempt with a stated reason,
+  three legacy tools keep sentence findings); `tests/test_release.py` checks version, CHANGELOG heading and README
+  count, table and registry (removing a tool from the README fails it); `scripts/integration.sh` gets a reduced
+  footprint mode (one small Valkey container, no cluster) above `REDUCED_MIN_FREE_GB=2` and runs the cluster suite only
+  in the full mode; `scripts/cluster-integration.sh` has its own 3G gate; `scripts/integration.ps1` mirrors both.
+  Integration run on 2026-11-12 against `valkey/valkey:8-alpine` in WSL Docker: reduced mode at 4G free on C: and
+  full mode at 7.2G free, both with 0 failures (1271 passed, 5 skipped without the cluster; cluster suite 4 passed,
+  1 skipped), no `prova-elasticache-*` container left.
 - Round 16: `controlplane.py` is now the `controlplane/` package (core plumbing, shared helpers, inventory, monitoring,
   cost, security, triage; every module under 1200 lines, all names re-exported so `server.py` and the tests import
   unchanged; the two AST scans over the former single file now walk the package); mypy in the dev group and in CI

@@ -6,6 +6,13 @@
 #   DOCKER="wsl -d Ubuntu -e docker" scripts/cluster-integration.sh
 set -euo pipefail
 
+MIN_FREE_GB=${MIN_FREE_GB:-3}
+FREE_GB=$(df -Pk "${DISK_PATH:-.}" | awk 'NR==2 {printf "%d", $4/1048576}')
+if [ "$FREE_GB" -lt "$MIN_FREE_GB" ]; then
+  echo "disk gate: ${FREE_GB}G free (< ${MIN_FREE_GB}G required): CLUSTER INTEGRATION SKIPPED, nothing was started"
+  exit 0
+fi
+
 DOCKER=${DOCKER:-docker}
 COMPOSE_FILE=${COMPOSE_FILE:-tests/docker-compose.cluster.yml}
 HERE=$(cd "$(dirname "$0")/.." && pwd)

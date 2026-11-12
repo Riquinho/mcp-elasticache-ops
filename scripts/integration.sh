@@ -7,10 +7,18 @@
 #   IMAGE=redis:7-alpine scripts/integration.sh
 set -euo pipefail
 
+# Two gates. Full run (single container, then the 3-primary cluster) needs MIN_FREE_GB. Below that, a
+# reduced-footprint run (one small Valkey container, no cluster; tens of MB) needs only REDUCED_MIN_FREE_GB.
 MIN_FREE_GB=${MIN_FREE_GB:-5}
+REDUCED_MIN_FREE_GB=${REDUCED_MIN_FREE_GB:-2}
 FREE_GB=$(df -Pk "${DISK_PATH:-.}" | awk 'NR==2 {printf "%d", $4/1048576}')
-if [ "$FREE_GB" -lt "$MIN_FREE_GB" ]; then
-  echo "disk gate: ${FREE_GB}G free (< ${MIN_FREE_GB}G required)"
+if [ "$FREE_GB" -ge "$MIN_FREE_GB" ]; then
+  MODE=full
+elif [ "$FREE_GB" -ge "$REDUCED_MIN_FREE_GB" ]; then
+  MODE=reduced
+  echo "disk gate: ${FREE_GB}G free (< ${MIN_FREE_GB}G): reduced-footprint mode, one Valkey container and no cluster"
+else
+  echo "disk gate: ${FREE_GB}G free (< ${REDUCED_MIN_FREE_GB}G required even for the reduced run)"
   echo "INTEGRATION SKIPPED: nothing was started. Free only what tests created, then re-run (the gate is not lowered):"
   echo "  1. wsl -d Ubuntu -e docker image prune -f"
   echo "  2. wsl -d Ubuntu -e docker volume ls -q -f dangling=true   (remove only 64-hex anonymous names)"
@@ -40,3 +48,7 @@ for _ in $(seq 1 30); do
 done
 
 REDIS_TEST_URL="redis://127.0.0.1:${PORT}/0" uv run pytest -q "$@"
+
+if [ "$MODE" = full ]; then
+  bash "$(dirname "$0")/cluster-integration.sh" "$@"
+fi
