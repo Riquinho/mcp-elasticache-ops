@@ -3,6 +3,13 @@
 ## Unreleased
 
 ### Added
+- Round 09: optional `region` argument on every `aws_*` tool (validated against a region pattern) and
+  `ELASTICACHE_REGIONS` fan-out for `aws_replication_groups` / `aws_triage`; global datastore findings
+  (`GlobalDatastoreReplicationLag`, secondary node type / engine version mismatch, member status); sustained-vs-spike
+  analysis with `p95` and a memory trend / time-to-full hint; tags and ownership via `ListTagsForResource` (new IAM
+  action `elasticache:ListTagsForResource`) in `aws_cluster_overview`, `aws_triage`, `aws_serverless_triage`; four
+  on-call MCP prompts (`oncall_high_cpu`, `oncall_evictions_memory`, `oncall_replication_lag`,
+  `oncall_connection_storm`).
 - `aws_serverless_triage`: one-call incident summary for a serverless cache (configuration findings, snapshot health,
   `ThrottledCmds`/ECPU/storage against the usage limits), sections with per-section `unavailable` on errors such as
   `AccessDenied`, findings worst-first. Describe/GetMetricData calls only, no new IAM actions. Tool count is now 42.

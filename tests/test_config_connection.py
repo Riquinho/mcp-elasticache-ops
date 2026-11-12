@@ -307,3 +307,15 @@ def test_aws_call_bounds_reject_bad_values(monkeypatch, name, value):
     monkeypatch.setenv(name, value)
     with pytest.raises(ConfigError):
         ControlPlaneConfig.from_env()
+
+
+def test_elasticache_regions_parsing(monkeypatch):
+    from mcp_elasticache_ops.config import ConfigError, ControlPlaneConfig, aws_regions
+
+    assert aws_regions(None) == () and aws_regions(" ") == ()
+    assert aws_regions("us-east-1, eu-west-1,us-east-1,") == ("us-east-1", "eu-west-1")
+    for bad in ("us-east-1;x", "nowhere", ",".join(f"us-east-{i}" for i in range(1, 10))):
+        with pytest.raises(ConfigError):
+            aws_regions(bad)
+    monkeypatch.setenv("ELASTICACHE_REGIONS", "us-east-1,us-west-2")
+    assert ControlPlaneConfig.from_env().regions == ("us-east-1", "us-west-2")

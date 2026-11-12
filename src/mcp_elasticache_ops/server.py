@@ -21,7 +21,7 @@ from pydantic import Field
 from . import dataplane, memcached
 from .config import ControlPlaneConfig, DataPlaneConfig, MemcachedConfig, max_output_chars
 from .connection import build_client
-from .controlplane import ControlPlane
+from .controlplane import REGION_PATTERN, ControlPlane
 from .safe_client import SafeRedis
 
 log = logging.getLogger("mcp_elasticache_ops")
@@ -183,6 +183,22 @@ def _node_client(host: str, port: int) -> SafeRedis:
 @lru_cache(maxsize=1)
 def control_plane() -> ControlPlane:
     return ControlPlane(ControlPlaneConfig.from_env())
+
+
+Region = Annotated[
+    str | None,
+    Field(
+        pattern=REGION_PATTERN,
+        max_length=32,
+        description="AWS region to query (for example the secondary region of a global datastore); "
+        "defaults to AWS_REGION",
+    ),
+]
+
+
+def _cp(region: str | None) -> ControlPlane:
+    """The control plane for ``region`` (the configured one when omitted); invalid names are refused."""
+    return control_plane().in_region(region)
 
 
 def _memcached_target() -> MemcachedConfig:
@@ -419,23 +435,24 @@ def memcached_cluster_stats() -> dict:
 
 
 @read_tool
-def aws_replication_groups(replication_group_id: str | None = None) -> dict:
+def aws_replication_groups(replication_group_id: str | None = None, region: Region = None) -> dict:
     """DescribeReplicationGroups: status, engine, cluster mode, node type, Multi-AZ,
-    failover, encryption, shards with primary/reader endpoints and member roles."""
-    return control_plane().replication_groups(replication_group_id)
+    failover, encryption, shards with primary/reader endpoints and member roles. Queries every region in
+    ELASTICACHE_REGIONS unless `region` is given."""
+    return control_plane().replication_groups_fan_out(replication_group_id, region)
 
 
 @read_tool
-def aws_cache_clusters(cache_cluster_id: str | None = None, show_nodes: bool = True) -> dict:
+def aws_cache_clusters(cache_cluster_id: str | None = None, show_nodes: bool = True, region: Region = None) -> dict:
     """DescribeCacheClusters: per-node-cluster engine version, node type, parameter
     group and apply status, maintenance window, pending changes and node endpoints."""
-    return control_plane().cache_clusters(cache_cluster_id, show_nodes)
+    return _cp(region).cache_clusters(cache_cluster_id, show_nodes)
 
 
 @read_tool
-def aws_serverless_caches() -> dict:
+def aws_serverless_caches(region: Region = None) -> dict:
     """DescribeServerlessCaches for ElastiCache Serverless (Valkey/Redis OSS/Memcached)."""
-    return control_plane().serverless_caches()
+    return _cp(region).serverless_caches()
 
 
 @read_tool
@@ -448,16 +465,17 @@ def aws_events(
         ),
     ] = None,
     hours: Annotated[int, Field(ge=1, le=336)] = 24,
+    region: Region = None,
 ) -> dict:
     """DescribeEvents: failovers, node replacements, maintenance, snapshots."""
-    return control_plane().events(source_identifier, source_type, hours)
+    return _cp(region).events(source_identifier, source_type, hours)
 
 
 @read_tool
-def aws_parameters(parameter_group: str, only_modified: bool = True) -> dict:
+def aws_parameters(parameter_group: str, only_modified: bool = True, region: Region = None) -> dict:
     """DescribeCacheParameters for a parameter group; by default only values changed
     from the engine defaults (Source=user)."""
-    return control_plane().parameters(parameter_group, only_modified)
+    return _cp(region).parameters(parameter_group, only_modified)
 
 
 @read_tool
@@ -466,10 +484,11 @@ def aws_snapshots(
     cache_cluster_id: str | None = None,
     source: Annotated[Literal["automated", "manual"] | None, Field(description="Filter by snapshot source")] = None,
     stale_hours: Annotated[int, Field(ge=1, le=8760, description="Flag automatic snapshots older than this")] = 36,
+    region: Region = None,
 ) -> dict:
     """DescribeSnapshots: age, size, status, automatic vs manual, with findings for
     retention gaps, failed snapshots and groups without automatic backups."""
-    return control_plane().snapshots(replication_group_id, cache_cluster_id, source, stale_hours)
+    return _cp(region).snapshots(replication_group_id, cache_cluster_id, source, stale_hours)
 
 
 @read_tool
@@ -479,46 +498,51 @@ def aws_serverless_snapshots(
         Literal["automatic", "manual"] | None, Field(description="Filter by snapshot type")
     ] = None,
     stale_hours: Annotated[int, Field(ge=1, le=8760, description="Flag caches whose newest snapshot is older")] = 24,
+    region: Region = None,
 ) -> dict:
     """DescribeServerlessCacheSnapshots plus DescribeServerlessCaches: findings for caches without a
     recent snapshot, failed snapshots, snapshots about to expire, missing KMS key and unset retention."""
-    return control_plane().serverless_snapshots(serverless_cache_name, snapshot_type, stale_hours)
+    return _cp(region).serverless_snapshots(serverless_cache_name, snapshot_type, stale_hours)
 
 
 @read_tool
-def aws_users(engine: Annotated[Literal["redis", "valkey"] | None, Field(description="Engine filter")] = None) -> dict:
+def aws_users(
+    engine: Annotated[Literal["redis", "valkey"] | None, Field(description="Engine filter")] = None,
+    region: Region = None,
+) -> dict:
     """DescribeUsers (RBAC): authentication type and access strings, never passwords.
     Flags users with '~* +@all' access and users without a password."""
-    return control_plane().users(engine)
+    return _cp(region).users(engine)
 
 
 @read_tool
-def aws_user_groups() -> dict:
+def aws_user_groups(region: Region = None) -> dict:
     """DescribeUserGroups: members, attached replication groups/serverless caches, pending changes."""
-    return control_plane().user_groups()
+    return _cp(region).user_groups()
 
 
 @read_tool
-def aws_global_replication_groups() -> dict:
+def aws_global_replication_groups(region: Region = None) -> dict:
     """DescribeGlobalReplicationGroups: global datastore members, regions, roles and status."""
-    return control_plane().global_replication_groups()
+    return _cp(region).global_replication_groups()
 
 
 @read_tool
-def aws_reserved_nodes() -> dict:
+def aws_reserved_nodes(region: Region = None) -> dict:
     """DescribeReservedCacheNodes plus running nodes: reservation coverage per node type and
     engine, on-demand nodes not covered, unused or soon-expiring reservations."""
-    return control_plane().reserved_nodes()
+    return _cp(region).reserved_nodes()
 
 
 @read_tool
 def aws_reserved_offerings(
     node_type: Annotated[str, Field(description="Node type, e.g. cache.r6g.large", min_length=1, max_length=64)],
     engine: Annotated[Literal["redis", "valkey", "memcached"], Field(description="Cache engine")],
+    region: Region = None,
 ) -> dict:
     """DescribeReservedCacheNodesOfferings: 1y/3y offerings for a node type and engine (capped), the number of
     running nodes no reservation covers and the cheapest offering per term. Never purchases anything."""
-    return control_plane().reserved_offerings(node_type, engine)
+    return _cp(region).reserved_offerings(node_type, engine)
 
 
 @read_tool
@@ -527,31 +551,33 @@ def aws_engine_versions(
     version_prefix: Annotated[
         str | None, Field(description="Only versions starting with this, e.g. '7.')", max_length=16)
     ] = None,
+    region: Region = None,
 ) -> dict:
     """DescribeCacheEngineVersions: available versions with parameter group family, plus upgrade
     targets (latest minor of each major; latest Valkey when asking about Redis OSS)."""
-    return control_plane().engine_versions(engine, version_prefix)
+    return _cp(region).engine_versions(engine, version_prefix)
 
 
 @read_tool
-def aws_parameter_groups() -> dict:
+def aws_parameter_groups(region: Region = None) -> dict:
     """DescribeCacheParameterGroups joined with running clusters: family, which clusters use each
     group, unused custom groups (info) and groups whose family differs from the running engine (warning)."""
-    return control_plane().parameter_groups()
+    return _cp(region).parameter_groups()
 
 
 @read_tool
 def aws_service_updates(
     status: Annotated[Literal["available", "cancelled", "expired"], Field(description="Update status")] = "available",
+    region: Region = None,
 ) -> dict:
     """DescribeServiceUpdates: pending updates by severity with apply-by and auto-update dates."""
-    return control_plane().service_updates(status)
+    return _cp(region).service_updates(status)
 
 
 @read_tool
-def aws_subnet_groups() -> dict:
+def aws_subnet_groups(region: Region = None) -> dict:
     """DescribeCacheSubnetGroups: VPC, subnets and AZ spread (flags groups in fewer than 2 AZs)."""
-    return control_plane().subnet_groups()
+    return _cp(region).subnet_groups()
 
 
 @read_tool
@@ -569,11 +595,12 @@ def aws_metrics(
     replication_group_id: Annotated[
         str | None, Field(description="Query every member node of this replication group (cluster mode aware)")
     ] = None,
+    region: Region = None,
 ) -> dict:
     """CloudWatch AWS/ElastiCache metrics (EngineCPUUtilization, memory %, Evictions,
     CurrConnections, CacheHitRate, ReplicationLag, ...). Findings first, then a
     min/avg/max/latest summary; the raw series only with include_series=true."""
-    return control_plane().metrics(
+    return _cp(region).metrics(
         cache_cluster_id, metrics, minutes, period_seconds, node_id, serverless, include_series, replication_group_id
     )
 
@@ -582,28 +609,32 @@ def aws_metrics(
 def aws_parameter_drift(
     group_a: Annotated[str, Field(description="First cache parameter group name (e.g. production)")],
     group_b: Annotated[str, Field(description="Second cache parameter group name (e.g. staging)")],
+    region: Region = None,
 ) -> dict:
     """DescribeCacheParameters on two groups: only parameters whose values differ and that someone
     modified (default-only differences are counted, not listed), plus family mismatch warnings."""
-    return control_plane().parameter_drift(group_a, group_b)
+    return _cp(region).parameter_drift(group_a, group_b)
 
 
 @read_tool
-def aws_triage(replication_group_id: Annotated[str, Field(description="ReplicationGroupId to triage")]) -> dict:
+def aws_triage(
+    replication_group_id: Annotated[str, Field(description="ReplicationGroupId to triage")], region: Region = None
+) -> dict:
     """One-call incident summary for a replication group: status, Multi-AZ/failover, last 6h events,
     CloudWatch peaks per member, pending service updates and snapshot age. Findings are worst-first
     (max 30); a section that fails is reported as unavailable instead of failing the call."""
-    return control_plane().triage(replication_group_id)
+    return control_plane().triage_fan_out(replication_group_id, region)
 
 
 @read_tool
 def aws_serverless_triage(
     serverless_cache_name: Annotated[str, Field(description="ServerlessCacheName to triage")],
+    region: Region = None,
 ) -> dict:
     """One-call incident summary for a serverless cache: status and usage limits, snapshot health, and
     6h ThrottledCmds/ECPU/storage against the limits. Findings are worst-first (max 30); a section that
     fails (for example AccessDenied) is reported as unavailable instead of failing the call."""
-    return control_plane().serverless_triage(serverless_cache_name)
+    return _cp(region).serverless_triage(serverless_cache_name)
 
 
 @read_tool
@@ -612,23 +643,115 @@ def aws_alarms(
         str | None,
         Field(description="Limit to one replication group; omit to check every group, cluster and serverless cache"),
     ] = None,
+    region: Region = None,
 ) -> dict:
     """CloudWatch alarm coverage for ElastiCache (DescribeAlarms, read-only). Findings first: alarms in
     ALARM, INSUFFICIENT_DATA or with actions disabled, and members with no alarm on EngineCPUUtilization,
     DatabaseMemoryUsagePercentage, Evictions, ReplicationLag, CurrConnections, SwapUsage (plus ThrottledCmds
     on Serverless). Returns partial=true if DescribeAlarms is denied."""
-    return control_plane().alarms(replication_group_id)
+    return _cp(region).alarms(replication_group_id)
 
 
 @read_tool
 def aws_cluster_overview(
     replication_group_id: Annotated[str, Field(description="ReplicationGroupId to summarise")],
     minutes: Annotated[int, Field(ge=5, le=20160, description="CloudWatch window (multiple of 5 min is fine)")] = 360,
+    region: Region = None,
 ) -> dict:
     """One findings-first call per replication group: shards, replicas, AZ spread, failover and engine
     version joined with per-node CloudWatch signals. Flags nodes above 1.5x peer median, reader endpoint
     gaps and right-sizing hints. Worst-first, bounded; status partial if GetMetricData is denied."""
-    return control_plane().cluster_overview(replication_group_id, minutes)
+    return _cp(region).cluster_overview(replication_group_id, minutes)
+
+
+# ------------------------------------------------------------------- on-call prompts
+# Prompts, not tools: they only return text that tells the model which read-only tools to chain.
+
+RunbookGroup = Annotated[str, Field(description="ReplicationGroupId of the affected replication group")]
+
+
+@mcp.prompt
+def oncall_high_cpu(replication_group_id: RunbookGroup) -> str:
+    """Runbook: EngineCPUUtilization alarm on a replication group."""
+    return f"""On-call runbook: high CPU on replication group `{replication_group_id}`. Read-only tools only; do not guess.
+
+1. `aws_triage` (replication_group_id="{replication_group_id}"). Read `findings` first. A finding that says
+   "transient spike" is not an incident: report it and stop. "sustained" EngineCPUUtilization means keep going.
+   Note `ownership` so you know whom to page.
+2. `aws_cluster_overview` (same id). A node far above the peer median means a hot shard or hot key; all nodes
+   high means load or sizing. Check the right-sizing and CPU-credit findings on cache.t* nodes.
+3. `node_triage` against the hot node (set ELASTICACHE_HOST to its endpoint), then `node_cluster_slowlog` for
+   slow commands across shards and `node_commandstats` for the commands that burn the most time.
+4. `node_clients` for clients with huge output buffers or blocked commands, `node_cluster_health` if the
+   cluster state is not ok.
+5. `aws_metrics` (cache_cluster_id of the hot node, metrics EngineCPUUtilization, CPUUtilization, CurrConnections,
+   NewConnections, minutes=360). EngineCPUUtilization high with CPUUtilization low is the single Redis thread
+   saturated: scale out (shards) or fix the commands, not a bigger host.
+
+Conclude with: sustained or spike, one node or all, the top slow command, and the next step (fix the command,
+add shards or replicas, change node type). Never run anything that writes."""
+
+
+@mcp.prompt
+def oncall_evictions_memory(replication_group_id: RunbookGroup) -> str:
+    """Runbook: evictions or memory pressure on a replication group."""
+    return f"""On-call runbook: evictions or memory pressure on `{replication_group_id}`. Read-only tools only.
+
+1. `aws_triage` (replication_group_id="{replication_group_id}"). Look for DatabaseMemoryUsagePercentage and
+   Evictions findings and for a "growing ... reached in about Nh" trend hint: that is your time budget.
+2. `aws_metrics` (replication_group_id="{replication_group_id}", metrics DatabaseMemoryUsagePercentage,
+   BytesUsedForCache, Evictions, CurrItems, CacheHitRate, SwapUsage, minutes=1440). Evictions with a falling
+   CacheHitRate hurt users now; memory high without evictions means the policy is noeviction and writes may fail.
+3. `node_memory` on the affected node: fragmentation ratio, maxmemory, eviction policy. `node_cluster_memory`
+   to compare shards; one shard far above the others is a hot or big key.
+4. `node_keyspace_sample` (or `node_cluster_keyspace_sample`) to find big keys and missing TTLs; it samples
+   with SCAN and reports sizes only, never values.
+5. `aws_parameters` (the group's parameter group): confirm maxmemory-policy and reserved-memory-percent.
+
+Conclude with: leak (no TTL, growth) or burst, which keys or shard, the eviction policy in force, hours until
+full, and the choice (set TTLs, change policy, add shards, larger node type)."""
+
+
+@mcp.prompt
+def oncall_replication_lag(replication_group_id: RunbookGroup) -> str:
+    """Runbook: replica lag or global datastore lag."""
+    return f"""On-call runbook: replication lag on `{replication_group_id}`. Read-only tools only.
+
+1. `aws_triage` (replication_group_id="{replication_group_id}"): ReplicationLag findings, recent failover or
+   node replacement events and pending service updates.
+2. `aws_events` (source_identifier="{replication_group_id}", source_type="replication-group", hours=24): a
+   failover or replacement just before the lag explains a resync; lag after it should fall by itself.
+3. `node_replication` on the primary: replica offsets, link status, backlog size. A replica with
+   master_link_status down or a growing offset gap is the culprit; `node_cluster_nodes` shows which shard.
+4. `aws_metrics` (replication_group_id="{replication_group_id}", metrics ReplicationLag, ReplicationBytes,
+   EngineCPUUtilization, NetworkBandwidthAllowanceExceeded, minutes=360). Heavy ReplicationBytes with bandwidth
+   allowance exceeded means writes outrun the network of the node type.
+5. Global datastore: `aws_global_replication_groups` (also with region set to the secondary region) reports
+   GlobalDatastoreReplicationLag per secondary and flags secondaries with another node type or engine version.
+   Lag above 1s is a warning, above 10s critical; do not fail over to a secondary that lags or is not associated.
+
+Conclude with: which replica or region lags, since when, whether load, network or a resync explains it, and
+whether a failover would lose data."""
+
+
+@mcp.prompt
+def oncall_connection_storm(replication_group_id: RunbookGroup) -> str:
+    """Runbook: connection spike or maxclients exhaustion."""
+    return f"""On-call runbook: connection storm on `{replication_group_id}`. Read-only tools only.
+
+1. `aws_triage` (replication_group_id="{replication_group_id}"): CurrConnections findings; "transient spike"
+   means a client restarted or deployed, "sustained" means a leak or a missing pool.
+2. `aws_metrics` (replication_group_id="{replication_group_id}", metrics CurrConnections, NewConnections,
+   EngineCPUUtilization, minutes=360). NewConnections high with CurrConnections flat is connection churn
+   (no pooling, TLS handshakes burning CPU); CurrConnections climbing is a leak.
+3. `node_clients` on the busiest node: connections grouped by address and name, idle times and blocked
+   clients. One address owning thousands of connections is the offender.
+4. `node_latency` (ping_samples=50) and `node_cluster_slowlog` to see whether the storm hurts every
+   command or only slow ones; `node_acl_log` for authentication failures that look like a storm of retries.
+5. `aws_alarms` (replication_group_id="{replication_group_id}") to check that a CurrConnections alarm exists.
+
+Conclude with: the client address or service responsible, churn or leak, how close CurrConnections is to
+maxclients (65000 default), and the fix (connection pool, idle timeout, client backoff)."""
 
 
 # ------------------------------------------------------------------------ main

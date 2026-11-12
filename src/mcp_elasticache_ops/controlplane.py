@@ -11,6 +11,7 @@ caller can read the verdict before the raw detail.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import re
 from collections import Counter, defaultdict
@@ -21,7 +22,7 @@ import boto3
 from botocore.config import Config as BotocoreConfig
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError, NoRegionError
 
-from .config import ControlPlaneConfig
+from .config import REGION_PATTERN, ControlPlaneConfig
 
 # Metrics worth looking at first, per engine family. Units follow CloudWatch.
 REDIS_METRICS = [
@@ -35,6 +36,7 @@ REDIS_METRICS = [
     "CurrItems",
     "CacheHitRate",
     "ReplicationLag",
+    "GlobalDatastoreReplicationLag",
     "ReplicationBytes",
     "NetworkBytesIn",
     "NetworkBytesOut",
@@ -69,6 +71,24 @@ SUM_STAT_METRICS = {
 # node types report the credit metrics, so they are requested for them alone.
 BURSTABLE_METRICS = ["CPUCreditBalance", "CPUCreditUsage"]
 CPU_CREDIT_WARN = 20.0  # CPUCreditBalance minimum below this (credits) is a warning, 0 is critical
+
+GLOBAL_LAG_METRIC = "GlobalDatastoreReplicationLag"
+GLOBAL_LAG_WINDOW_MINUTES = 60
+MAX_GLOBAL_SECONDARIES = 6  # secondary regions inspected per global datastore (each costs 3 API calls)
+HEALTHY_GLOBAL_MEMBER_STATUSES = frozenset({"associated", "available"})
+
+# Metric -> value above which a datapoint counts as "high". A breach is only paged on when at least
+# SUSTAINED_FRACTION of the datapoints are high; fewer is reported as a transient spike (info).
+SUSTAINED_FRACTION = 0.5
+TREND_MIN_POINTS = 8  # need this many points to compare the first and last quarter of the window
+TREND_MIN_GROWTH = 2.0  # percentage points between the quarters before memory growth is worth a hint
+TREND_WARN_HOURS = 24.0  # estimated time to a full memory below this is a warning, else info
+
+MAX_TAG_CALLS = 3  # ListTagsForResource calls per tool call (replication group, then a member cluster)
+MAX_TAGS_SHOWN = 25
+MAX_TAG_VALUE_CHARS = 120
+OWNER_TAG_KEYS = ("owner", "team")
+ENVIRONMENT_TAG_KEYS = ("environment", "env")
 
 SWAP_WARN_BYTES = 50 * 1024 * 1024
 MAXCLIENTS_DEFAULT = 65_000  # ElastiCache default maxclients
@@ -109,6 +129,7 @@ TRIAGE_METRICS = [
     "DatabaseMemoryUsagePercentage",
     "Evictions",
     "ReplicationLag",
+    "GlobalDatastoreReplicationLag",
     "CurrConnections",
 ]
 _TRIAGE_FATAL = {"ReplicationGroupNotFoundFault"}  # nothing useful to report: surface it as the tool error
@@ -210,8 +231,78 @@ class ControlPlane:
         self._session_factory = session_factory
         self._clock = clock or (lambda: dt.datetime.now(dt.UTC))
         self._clients: dict[str, Any] = {}
+        self._regional: dict[str, ControlPlane] = {}
 
     # ------------------------------------------------------------ plumbing
+    def in_region(self, region: str | None) -> ControlPlane:
+        """A control plane bound to ``region`` (same credentials, bounds and clock); ``self`` when omitted.
+
+        The name is validated here as well as in the tool schema, so no caller can build a client for a
+        malformed region string."""
+        if region is None or region == self.config.region:
+            return self
+        if not isinstance(region, str) or not re.fullmatch(REGION_PATTERN, region):
+            raise ValueError(f"invalid AWS region {region!r}; expected a name such as us-east-1")
+        if region not in self._regional:
+            cfg = dataclasses.replace(self.config, region=region, regions=())
+            self._regional[region] = ControlPlane(cfg, self._session_factory, self._clock)
+        return self._regional[region]
+
+    def _target_regions(self, region: str | None) -> tuple[str | None, ...]:
+        """Regions a fan-out tool queries: the explicit one, else ELASTICACHE_REGIONS, else the default."""
+        if region:
+            return (region,)
+        return self.config.regions or (None,)
+
+    def replication_groups_fan_out(self, replication_group_id: str | None = None, region: str | None = None) -> dict:
+        """``replication_groups`` over every region in ELASTICACHE_REGIONS (or just ``region``).
+
+        A region that does not hold ``replication_group_id`` is skipped quietly; other failures are
+        reported per region and never hide the regions that answered."""
+        targets = self._target_regions(region)
+        if len(targets) == 1:
+            return self.in_region(targets[0]).replication_groups(replication_group_id)
+        views: list[dict] = []
+        findings: list[dict] = []
+        failures: dict[str, dict] = {}
+        for target in targets:
+            result = self.in_region(target).replication_groups(replication_group_id)
+            if "replication_groups" not in result:
+                if result.get("error") != "ReplicationGroupNotFoundFault":
+                    failures[str(target)] = result
+                continue
+            views.extend({**v, "region": target} for v in result["replication_groups"])
+            findings.extend({**f, "region": target} for f in result["findings"])
+        out: dict[str, Any] = {
+            "regions": [str(t) for t in targets],
+            "count": len(views),
+            "findings": _sorted_findings(findings),
+            "replication_groups": views,
+        }
+        if failures:
+            out["region_errors"] = failures
+        return out
+
+    def triage_fan_out(self, replication_group_id: str, region: str | None = None) -> dict:
+        """``triage`` in the first region of ELASTICACHE_REGIONS that holds the group (or in ``region``)."""
+        targets = self._target_regions(region)
+        if len(targets) == 1:
+            return self.in_region(targets[0]).triage(replication_group_id)
+        failures: dict[str, dict] = {}
+        for target in targets:
+            probe = self.in_region(target).replication_groups(replication_group_id)
+            if probe.get("count"):
+                return {"region": target, **self.in_region(target).triage(replication_group_id)}
+            if "error" in probe and probe["error"] != "ReplicationGroupNotFoundFault":
+                failures[str(target)] = probe
+        out: dict[str, Any] = {
+            "error": "ReplicationGroupNotFoundFault",
+            "message": f"replication group {replication_group_id} not found in {', '.join(map(str, targets))}",
+        }
+        if failures:
+            out["region_errors"] = failures
+        return out
+
     def botocore_config(self) -> BotocoreConfig:
         """Bounded timeouts and standard-mode retries so a stalled endpoint cannot hang a tool."""
         return BotocoreConfig(
@@ -703,7 +794,7 @@ class ControlPlane:
                 if len(members) < 2:
                     findings.append(finding("warning", "global datastore has no secondary region", resource=gid))
                 for m in members:
-                    if m["status"] not in (None, "associated"):
+                    if m["status"] not in HEALTHY_GLOBAL_MEMBER_STATUSES | {None}:
                         findings.append(
                             finding(
                                 "warning",
@@ -711,9 +802,83 @@ class ControlPlane:
                                 resource=gid,
                             )
                         )
+                findings += self._secondary_readiness(g, members)
             return {"count": len(views), "findings": _sorted_findings(findings), "global_replication_groups": views}
 
         return self._guard(run)
+
+    def _secondary_readiness(self, g: dict, members: list[dict]) -> list[dict]:
+        """Failover-readiness findings for the secondary regions of a global datastore.
+
+        Per secondary (at most MAX_GLOBAL_SECONDARIES): its replication group (node type, member nodes), one
+        member's engine version and ``GlobalDatastoreReplicationLag`` in the secondary's own region. Each member
+        dict gets a ``replication_lag`` summary. Best effort: a region that cannot be read yields an info finding."""
+        gid = g.get("GlobalReplicationGroupId")
+        out: list[dict] = []
+        secondaries = [m for m in members if m["role"] == "SECONDARY" and m["replication_group_id"] and m["region"]]
+        if len(secondaries) > MAX_GLOBAL_SECONDARIES:
+            out.append(
+                finding(
+                    "info", f"only the first {MAX_GLOBAL_SECONDARIES} secondary regions were inspected", resource=gid
+                )
+            )
+        for m in secondaries[:MAX_GLOBAL_SECONDARIES]:
+            label = f"{m['replication_group_id']} ({m['region']})"
+            try:
+                regional = self.in_region(m["region"])
+                groups = regional._paginate(
+                    "describe_replication_groups", "ReplicationGroups", ReplicationGroupId=m["replication_group_id"]
+                )
+                member_ids = (groups[0].get("MemberClusters") or []) if groups else []
+                node_type = groups[0].get("CacheNodeType") if groups else None
+                version = None
+                if member_ids:
+                    clusters = regional._paginate(
+                        "describe_cache_clusters", "CacheClusters", CacheClusterId=member_ids[0]
+                    )
+                    version = clusters[0].get("EngineVersion") if clusters else None
+                if member_ids:
+                    summary, _, found = regional._collect_metrics(
+                        member_ids,
+                        [GLOBAL_LAG_METRIC],
+                        GLOBAL_LAG_WINDOW_MINUTES,
+                        60,
+                        None,
+                        False,
+                        rightsizing=False,
+                    )
+                    lags = [s[GLOBAL_LAG_METRIC] for s in summary.values() if s[GLOBAL_LAG_METRIC]["points"]]
+                    if lags:
+                        m["replication_lag"] = max(lags, key=lambda s: s["max"])
+                    out += [
+                        {**f, "resource": gid, "message": f"secondary {label}: {f['message']}"}
+                        for f in found
+                        if GLOBAL_LAG_METRIC in f["message"]
+                    ]
+            except (BotoCoreError, ClientError, ValueError) as exc:
+                out.append(
+                    finding("info", f"secondary {label} could not be inspected: {_error_code(exc)}", resource=gid)
+                )
+                continue
+            m["node_type"], m["engine_version"] = node_type, version
+            if node_type and g.get("CacheNodeType") and node_type != g["CacheNodeType"]:
+                out.append(
+                    finding(
+                        "warning",
+                        f"secondary {label} node type {node_type} differs from the primary ({g['CacheNodeType']}); "
+                        "a failover could land on a differently sized node",
+                        resource=gid,
+                    )
+                )
+            if version and g.get("EngineVersion") and version != g["EngineVersion"]:
+                out.append(
+                    finding(
+                        "warning",
+                        f"secondary {label} engine version {version} differs from the primary ({g['EngineVersion']})",
+                        resource=gid,
+                    )
+                )
+        return out
 
     # ---------------------------------------------------------- reserved nodes
     def reserved_nodes(self, expiring_days: int = 60) -> dict:
@@ -1157,7 +1322,7 @@ class ControlPlane:
                     "timestamps": [t.isoformat() for t, _ in pts],
                     "values": [v for _, v in pts],
                 }
-                summary[target][name] = _summarize([v for _, v in pts])
+                summary[target][name] = _summarize([v for _, v in pts], name, period_seconds)
             findings += _metric_findings(target, summary[target])
             if rightsizing and not serverless:
                 findings += _rightsizing_findings(target, summary[target], minutes)
@@ -1362,9 +1527,14 @@ class ControlPlane:
             section("cache", cache_section)
             section("snapshots", snapshots_section)
             section("limits", limits_section)
+            tag_view, tag_findings = self._tag_context(
+                serverless_cache_name, [cache_box[0].get("ARN")] if cache_box else []
+            )
+            findings += tag_findings
             ordered = _sorted_findings(findings)
             return {
                 "serverless_cache_name": serverless_cache_name,
+                **tag_view,
                 "generated_at": now.isoformat(),
                 "window_hours": TRIAGE_WINDOW_HOURS,
                 "overall": _worst_status(ordered) if ordered else "ok",
@@ -1383,6 +1553,7 @@ class ControlPlane:
             now = self._clock()
             members: list[str] = []
             node_types: list[str | None] = []
+            rg_arn: list[str | None] = []
             sections: list[dict] = []
             findings: list[dict] = []
 
@@ -1395,6 +1566,7 @@ class ControlPlane:
                 if not groups:
                     raise _TriageEmpty(f"replication group {replication_group_id} not found")
                 g = groups[0]
+                rg_arn.append(g.get("ARN"))
                 members.extend(g.get("MemberClusters", []))
                 node_types.append(g.get("CacheNodeType"))
                 found = _triage_rg_findings(g)
@@ -1445,6 +1617,8 @@ class ControlPlane:
                 return text, found
 
             section("replication_group", rg_section)
+            tag_view, tag_findings = self._tag_context(replication_group_id, [rg_arn[0]] if rg_arn else [])
+            findings += tag_findings
             section("events", events_section)
             section("metrics", metrics_section)
             section("service_updates", updates_section)
@@ -1452,6 +1626,7 @@ class ControlPlane:
             ordered = _sorted_findings(findings)
             return {
                 "replication_group_id": replication_group_id,
+                **tag_view,
                 "generated_at": now.isoformat(),
                 "window_hours": TRIAGE_WINDOW_HOURS,
                 "overall": _worst_status(ordered) if ordered else "ok",
@@ -1517,10 +1692,14 @@ class ControlPlane:
                     (n["signals"]["DatabaseMemoryUsagePercentage"].get("avg") or 0 for n in shard["nodes"]), default=0
                 )
             ordered_shards = sorted(topology["shards"], key=lambda sh: -sh["worst_memory_pct"])
+            member_arns = [c.get("ARN") for c in member_clusters if c.get("ReplicationGroupId") == replication_group_id]
+            tag_view, tag_findings = self._tag_context(replication_group_id, [g.get("ARN"), *member_arns])
+            findings += tag_findings
             ordered = _sorted_findings(findings)
             return {
                 "replication_group_id": replication_group_id,
                 "status": status,
+                **tag_view,
                 "window_minutes": int(minutes),
                 "overall": _worst_status(ordered) if ordered else "ok",
                 "topology": {k: v for k, v in topology.items() if k != "shards"},
@@ -1533,6 +1712,47 @@ class ControlPlane:
 
         return self._guard(run)
 
+    def _tag_context(self, resource: str, arns: list[str | None]) -> tuple[dict[str, Any], list[dict]]:
+        """Tags and ownership for one resource, from at most MAX_TAG_CALLS ListTagsForResource calls.
+
+        The ARNs are tried in order (replication group first, then a member cluster) until one carries an
+        owner/team/environment tag. Never fails the tool: an API error becomes ``tags_note`` and no finding."""
+        tags: dict[str, str] = {}
+        note: str | None = None
+        known = [a for a in arns if a][:MAX_TAG_CALLS]
+        if not known:
+            return {}, []
+        ec = self.client("elasticache")
+        for arn in known:
+            try:
+                listed = ec.list_tags_for_resource(ResourceName=arn).get("TagList", [])
+            except (BotoCoreError, ClientError) as exc:
+                note = f"tags unavailable ({_error_code(exc)}); ownership could not be checked"
+                break
+            for t in listed:
+                tags.setdefault(str(t.get("Key", "")), str(t.get("Value", "")))
+            if _tag_ownership(tags):
+                break
+        out: dict[str, Any] = {}
+        if tags:
+            out["tags"] = {k: v[:MAX_TAG_VALUE_CHARS] for k, v in list(tags.items())[:MAX_TAGS_SHOWN]}
+        ownership = _tag_ownership(tags)
+        if ownership:
+            out["ownership"] = ownership
+        if note:
+            out["tags_note"] = note
+            return out, []
+        if not any(k in ownership for k in (*OWNER_TAG_KEYS, *ENVIRONMENT_TAG_KEYS)):
+            return out, [
+                finding(
+                    "info",
+                    "no owner, team or environment tag: on-call cannot tell whom to page; tag the resource",
+                    resource=resource,
+                    category="ownership",
+                )
+            ]
+        return out, []
+
     def _serverless_limits(self, targets: list[str]) -> dict[str, dict]:
         """Configured usage limits per serverless cache; best effort, never fails the metrics call."""
         out: dict[str, dict] = {}
@@ -1544,6 +1764,18 @@ class ControlPlane:
             if caches:
                 out[target] = caches[0].get("CacheUsageLimits") or {}
         return out
+
+
+def _tag_ownership(tags: dict[str, str]) -> dict[str, str]:
+    """The owner, team and environment tags (keys matched case-insensitively; ``env`` reported as environment)."""
+    out: dict[str, str] = {}
+    for key, value in tags.items():
+        low = key.strip().lower()
+        if low in OWNER_TAG_KEYS and value:
+            out.setdefault(low, value[:MAX_TAG_VALUE_CHARS])
+        elif low in ENVIRONMENT_TAG_KEYS and value:
+            out.setdefault("environment", value[:MAX_TAG_VALUE_CHARS])
+    return out
 
 
 def _p95(values: list[float]) -> float | None:
@@ -1737,17 +1969,74 @@ def _validate_window(minutes: Any, period_seconds: Any) -> str | None:
     return None
 
 
-def _summarize(vals: list[float]) -> dict:
+def _sustain_thresholds() -> dict[str, float]:
+    return {
+        "EngineCPUUtilization": 80.0,
+        "DatabaseMemoryUsagePercentage": 80.0,
+        "CurrConnections": 0.8 * MAXCLIENTS_DEFAULT,
+    }
+
+
+def _memory_trend(vals: list[float], period_seconds: int | None) -> dict | None:
+    """Average of the first versus the last quarter of the window, and a rough time until memory is full.
+
+    The estimate is only given for gradual growth (the third quarter already carries at least half of the rise).
+
+    The estimate assumes the growth between the two quarters continues linearly; it is a hint, not a forecast."""
+    n = len(vals)
+    if n < TREND_MIN_POINTS:
+        return None
+    q = n // 4
+    first, last = sum(vals[:q]) / q, sum(vals[-q:]) / q
+    trend: dict[str, Any] = {"first_quarter_avg": first, "last_quarter_avg": last}
+    slope = (last - first) / (n - q)  # percentage points per datapoint, between the two quarter centres
+    third = sum(vals[-2 * q : -q]) / q
+    # Gradual growth only: when most of the rise sits in the last quarter it is a spike, not a trend.
+    gradual = third - first >= 0.5 * (last - first)
+    if period_seconds and slope > 0 and last - first >= TREND_MIN_GROWTH and gradual:
+        remaining = max(0.0, 100.0 - vals[-1])
+        trend["hours_to_full"] = round(remaining / slope * period_seconds / 3600, 1)
+    return trend
+
+
+def _summarize(vals: list[float], name: str | None = None, period_seconds: int | None = None) -> dict:
+    """Min/avg/max/latest plus p95; for the paging metrics also the share of points above the threshold.
+
+    ``name`` selects the extra fields (sustained-vs-spike share, memory trend); ``period_seconds`` is the
+    datapoint spacing, needed for the time-to-full estimate."""
     if not vals:
         return {"points": 0}
-    return {
+    out: dict[str, Any] = {
         "points": len(vals),
         "latest": vals[-1],
         "min": min(vals),
         "max": max(vals),
         "avg": sum(vals) / len(vals),
+        "p95": _p95(vals),
         "sum": sum(vals),
     }
+    threshold = _sustain_thresholds().get(name or "")
+    if threshold is not None:
+        above = sum(1 for v in vals if v > threshold)
+        out["threshold"] = threshold
+        out["points_above_threshold"] = above
+        out["fraction_above_threshold"] = above / len(vals)
+    if name == "DatabaseMemoryUsagePercentage":
+        trend = _memory_trend(vals, period_seconds)
+        if trend:
+            out["trend"] = trend
+    return out
+
+
+def _breach(summary: dict, severity: str) -> tuple[str, str]:
+    """Severity and wording for a threshold breach: sustained keeps ``severity``, a spike is info."""
+    fraction = summary.get("fraction_above_threshold")
+    if fraction is None or fraction >= SUSTAINED_FRACTION:
+        if fraction is None:
+            return severity, ""
+        return severity, f"; sustained (>=50% of points): {fraction:.0%} of points above {summary['threshold']:g}"
+    above, total = summary.get("points_above_threshold", 0), summary["points"]
+    return "info", f"; transient spike: {above} of {total} points above {summary['threshold']:g}, not sustained"
 
 
 def _metric_findings(resource: str, summary: dict[str, dict]) -> list[dict]:
@@ -1762,18 +2051,23 @@ def _metric_findings(resource: str, summary: dict[str, dict]) -> list[dict]:
 
     cpu_max, cpu_avg = get("EngineCPUUtilization", "max"), get("EngineCPUUtilization", "avg")
     if cpu_max is not None and cpu_avg is not None and cpu_max > 80:
-        add(
-            "critical" if cpu_avg > 80 or cpu_max > 90 else "warning",
-            f"EngineCPUUtilization max {cpu_max:.0f}% (avg {cpu_avg:.0f}%) above 80%",
-        )
+        sev, how = _breach(summary["EngineCPUUtilization"], "critical" if cpu_avg > 80 or cpu_max > 90 else "warning")
+        add(sev, f"EngineCPUUtilization max {cpu_max:.0f}% (avg {cpu_avg:.0f}%) above 80%{how}")
     host_cpu = get("CPUUtilization", "max")
     if host_cpu is not None and host_cpu > 90:
         add("warning", f"host CPUUtilization max {host_cpu:.0f}% above 90%")
     mem = get("DatabaseMemoryUsagePercentage", "max")
     if mem is not None and mem > 80:
+        sev, how = _breach(summary["DatabaseMemoryUsagePercentage"], "critical" if mem > 90 else "warning")
+        add(sev, f"DatabaseMemoryUsagePercentage max {mem:.0f}% above {90 if mem > 90 else 80}%{how}")
+    trend = (summary.get("DatabaseMemoryUsagePercentage") or {}).get("trend")
+    if trend and trend.get("hours_to_full") is not None:
+        hours = trend["hours_to_full"]
         add(
-            "critical" if mem > 90 else "warning",
-            f"DatabaseMemoryUsagePercentage max {mem:.0f}% above {90 if mem > 90 else 80}%",
+            "warning" if hours < TREND_WARN_HOURS else "info",
+            f"DatabaseMemoryUsagePercentage is growing: first-quarter avg {trend['first_quarter_avg']:.0f}% -> "
+            f"last-quarter avg {trend['last_quarter_avg']:.0f}%; at this rate the memory limit is reached in "
+            f"about {hours:.0f}h (rough linear estimate)",
         )
     evictions = get("Evictions", "sum")
     if evictions:
@@ -1784,9 +2078,16 @@ def _metric_findings(resource: str, summary: dict[str, dict]) -> list[dict]:
     lag = get("ReplicationLag", "max")
     if lag is not None and lag > 1:
         add("critical" if lag > 10 else "warning", f"ReplicationLag max {lag:.1f}s")
+    global_lag = get(GLOBAL_LAG_METRIC, "max")
+    if global_lag is not None and global_lag > 1:
+        add(
+            "critical" if global_lag > 10 else "warning",
+            f"{GLOBAL_LAG_METRIC} max {global_lag:.1f}s (cross-region replication behind the primary region)",
+        )
     conns = get("CurrConnections", "max")
     if conns is not None and conns > 0.8 * MAXCLIENTS_DEFAULT:
-        add("warning", f"CurrConnections max {conns:.0f} is over 80% of maxclients ({MAXCLIENTS_DEFAULT})")
+        sev, how = _breach(summary["CurrConnections"], "warning")
+        add(sev, f"CurrConnections max {conns:.0f} is over 80% of maxclients ({MAXCLIENTS_DEFAULT}){how}")
     throttled = get("ThrottledCmds", "sum")
     if throttled:
         add("warning", f"{throttled:.0f} throttled commands in the window")

@@ -51,7 +51,7 @@ All 42 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `aws_serverless_snapshots` | `DescribeServerlessCacheSnapshots` + `DescribeServerlessCaches`: caches with no available snapshot in `stale_hours` (default 24), failed snapshots, newest snapshot about to expire, snapshots without a customer KMS key, unset per-cache retention; a failing cache listing degrades to `partial` |
 | `aws_users` | `DescribeUsers` (RBAC): `~* +@all` access strings and users without a password; no secret material is returned |
 | `aws_user_groups` | `DescribeUserGroups`: unattached groups, non-active status |
-| `aws_global_replication_groups` | `DescribeGlobalReplicationGroups`: members per region, status, missing secondary |
+| `aws_global_replication_groups` | `DescribeGlobalReplicationGroups`: members per region, status, missing secondary. Per secondary region (max 6): `GlobalDatastoreReplicationLag` (> 1 s warning, > 10 s critical), node type or engine version that differs from the primary, members not `associated`/`available` |
 | `aws_reserved_nodes` | `DescribeReservedCacheNodes` vs running nodes: coverage by exact node type and engine, unused reservations, reservations expiring with nodes still running; a failing cluster listing degrades to `partial` with the reservation list intact |
 | `aws_reserved_offerings` | `DescribeReservedCacheNodesOfferings` for a `node_type` and `engine` (opt-in, capped at 20): 1y/3y offerings, uncovered running nodes and the cheapest offering per term (upfront + hourly). Never purchases |
 | `aws_service_updates` | `DescribeServiceUpdates`: pending updates, past or near apply-by dates |
@@ -63,6 +63,25 @@ All 42 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `aws_engine_versions` | `DescribeCacheEngineVersions` for `redis`, `valkey` or `memcached` (optional `version_prefix`): versions with parameter group family and upgrade targets (latest minor of each major, latest Valkey for Redis OSS) |
 | `aws_parameter_groups` | `DescribeCacheParameterGroups` joined with running clusters: family, users of each group, unused custom groups (info), family differing from the running engine (warning) |
 | `aws_parameter_drift` | Diff of two parameter groups: only modified parameters whose values differ, family mismatch, important parameters flagged |
+
+### Regions (global datastore, multi-region on-call)
+
+Every `aws_*` tool takes an optional read-only `region` argument (for example `eu-west-1`, the secondary region of a global
+datastore). It must look like an AWS region name (`us-east-1`, `eu-central-2`, `us-gov-west-1`); anything else is rejected.
+The default is `AWS_REGION`. Credentials, timeouts and retry bounds are the same in every region, and only
+`Describe*` / `List*` / `GetMetricData` calls are made.
+
+Set `ELASTICACHE_REGIONS=us-east-1,eu-west-1` (max 8) to fan out: `aws_replication_groups` queries every listed region
+and tags each group and finding with its `region` (a region that fails is listed under `region_errors`), and `aws_triage`
+triages the group in the first region that holds it. Passing `region` explicitly overrides the list.
+
+### Tags and ownership
+
+`aws_cluster_overview`, `aws_triage` and `aws_serverless_triage` read the resource tags with `ListTagsForResource`
+(read-only, at most 3 calls per tool call: the replication group, then a member cluster) and return `tags` (max 25) and
+`ownership` (the `owner`, `team` and `environment`/`env` tags, keys matched case-insensitively) so the on-call person
+knows whom to page. A resource with none of them gets an info finding. If the principal lacks
+`elasticache:ListTagsForResource` the tool still succeeds and returns a `tags_note` instead.
 
 `aws_replication_groups` also returns per-group findings (Multi-AZ, failover, encryption, auth, snapshots, old Redis OSS,
 engine behind the newest minor, primary and replicas in one AZ). `aws_cache_clusters` adds findings for Redis OSS end of life,
@@ -76,6 +95,24 @@ Control-plane tools return `findings` first (`{"severity", "message", "resource"
 
 Without AWS credentials or region, the `aws_*` tools return `{"unavailable": ...}` instead of failing,
 so the server is useful against a plain Redis/Valkey too.
+
+### Sustained versus spike, p95 and trend
+
+`EngineCPUUtilization`, `DatabaseMemoryUsagePercentage` and `CurrConnections` breaches are only reported at warning or
+critical when at least 50% of the datapoints are above the threshold (message says `sustained (>=50% of points)`); a
+shorter breach is an info finding saying `transient spike`. Every metric summary carries `p95`, the paging metrics add
+`fraction_above_threshold`, and memory adds `trend` (first-quarter versus last-quarter average, with a rough
+`hours_to_full` when growth is gradual). The time-to-full hint is a linear estimate: below 24 h it is a warning, else info.
+
+## On-call runbooks (MCP prompts)
+
+Four prompts (not tools, the read-only tool count is unchanged) return a step-by-step runbook that chains the tools
+and says what to conclude from each. Each takes `replication_group_id`.
+
+- `oncall_high_cpu`: `aws_triage`, `aws_cluster_overview`, `node_triage`, `node_cluster_slowlog`, `node_commandstats`, `node_clients`, `aws_metrics`
+- `oncall_evictions_memory`: `aws_triage`, `aws_metrics`, `node_memory`, `node_cluster_memory`, `node_keyspace_sample`, `aws_parameters`
+- `oncall_replication_lag`: `aws_triage`, `aws_events`, `node_replication`, `aws_metrics`, `aws_global_replication_groups`
+- `oncall_connection_storm`: `aws_triage`, `aws_metrics`, `node_clients`, `node_latency`, `node_acl_log`, `aws_alarms`
 
 ### Finding thresholds
 
@@ -166,6 +203,7 @@ Generated from `safe_client.py`; the tests fail if this drifts from the code.
         "elasticache:DescribeServiceUpdates",
         "elasticache:DescribeUpdateActions",
         "elasticache:DescribeCacheSubnetGroups",
+        "elasticache:ListTagsForResource",
         "cloudwatch:GetMetricData",
         "cloudwatch:DescribeAlarms"
       ],
@@ -196,6 +234,7 @@ Generated from `safe_client.py`; the tests fail if this drifts from the code.
 | `MEMCACHED_NODES` | | Comma-separated `host:port` list (max 64, IPv6 as `[::1]:11211`) for `memcached_cluster_stats`; invalid entries stop startup |
 | `MCP_MAX_OUTPUT_CHARS` | `60000` | Cap on any tool result (JSON characters, 1000 to 5000000). Longer lists are cut to their head; `findings`, `summary`, `notes` and counts stay; the result gets `truncated=true`, `omitted` and a hint |
 | `AWS_REGION` (or `AWS_DEFAULT_REGION`), `AWS_PROFILE` | | Standard boto3 credential chain |
+| `ELASTICACHE_REGIONS` | | Comma-separated regions (max 8) that `aws_replication_groups` and `aws_triage` fan out over; the `region` tool argument overrides it |
 | `AWS_CALL_TIMEOUT_SECONDS` | `10` | Connect and read timeout for every AWS API call (greater than 0, at most 120) |
 | `AWS_MAX_ATTEMPTS` | `3` | Attempts per AWS call, botocore `standard` retry mode (1 to 10) |
 | `ELASTICACHE_CONTROL_PLANE` | `true` | `false` disables all `aws_*` calls |

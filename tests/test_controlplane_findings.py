@@ -487,7 +487,11 @@ READ_PREFIX = re.compile(r"^(Describe|List|GetMetricData)")
 
 
 def _public_methods(cp: ControlPlane):
-    return [(n, m) for n, m in inspect.getmembers(cp, inspect.ismethod) if not n.startswith("_") and n != "client"]
+    return [
+        (n, m)
+        for n, m in inspect.getmembers(cp, inspect.ismethod)
+        if not n.startswith("_") and n not in ("client", "in_region")
+    ]
 
 
 def _sample_args(method) -> tuple[list, dict]:
@@ -807,3 +811,233 @@ async def test_cluster_overview_tool_is_registered_and_read_only():
     async with Client(server.mcp) as c:
         tools = {t.name: t for t in await c.list_tools()}
     assert tools["aws_cluster_overview"].annotations.read_only_hint is True
+
+
+# ------------------------------------------------- global datastore readiness
+
+
+def _regional_plane(by_region: dict[str, tuple[Fake, Fake]]) -> ControlPlane:
+    class Session:
+        def client(self, service, region_name=None, config=None):
+            ec, cw = by_region[region_name]
+            return {"elasticache": ec, "cloudwatch": cw}[service]
+
+    return ControlPlane(ControlPlaneConfig(region=REGION), session_factory=Session, clock=lambda: NOW)
+
+
+def _global(node_type="cache.r6g.large", version="7.1", secondary_status="associated"):
+    return {
+        "GlobalReplicationGroups": [
+            {
+                "GlobalReplicationGroupId": "g-1",
+                "Status": "available",
+                "CacheNodeType": node_type,
+                "EngineVersion": version,
+                "Members": [
+                    {
+                        "ReplicationGroupId": "prim",
+                        "ReplicationGroupRegion": REGION,
+                        "Role": "PRIMARY",
+                        "Status": "associated",
+                    },
+                    {
+                        "ReplicationGroupId": "sec",
+                        "ReplicationGroupRegion": "eu-west-1",
+                        "Role": "SECONDARY",
+                        "Status": secondary_status,
+                    },
+                ],
+            }
+        ]
+    }
+
+
+def _global_plane(lag_newest_first: list[float], sec_node_type="cache.r6g.large", sec_version="7.1", **global_kwargs):
+    primary = Fake({"describe_global_replication_groups": _global(**global_kwargs)})
+    secondary_ec = Fake(
+        {
+            "describe_replication_groups": {
+                "ReplicationGroups": [
+                    {"ReplicationGroupId": "sec", "CacheNodeType": sec_node_type, "MemberClusters": ["sec-001"]}
+                ]
+            },
+            "describe_cache_clusters": {"CacheClusters": [{"CacheClusterId": "sec-001", "EngineVersion": sec_version}]},
+        }
+    )
+    secondary_cw = Fake({"get_metric_data": metric_result({"sec-001|GlobalDatastoreReplicationLag": lag_newest_first})})
+    cp = _regional_plane({REGION: (primary, Fake()), "eu-west-1": (secondary_ec, secondary_cw)})
+    return cp, secondary_cw
+
+
+@pytest.mark.parametrize(("lag", "severity"), [([0.4, 0.2], None), ([3.0, 0.5], "warning"), ([14.0, 2.0], "critical")])
+def test_global_datastore_replication_lag_findings(lag, severity):
+    cp, cw = _global_plane(lag)
+    out = cp.global_replication_groups()
+    lag_findings = [f for f in out["findings"] if "GlobalDatastoreReplicationLag" in f["message"]]
+    if severity is None:
+        assert lag_findings == []
+    else:
+        assert [f["severity"] for f in lag_findings] == [severity]
+        assert "eu-west-1" in lag_findings[0]["message"]
+    member = out["global_replication_groups"][0]["members"][1]
+    assert member["replication_lag"]["max"] == max(lag)
+    query = cw.calls[0][1]["MetricDataQueries"][0]["MetricStat"]
+    assert query["Metric"]["MetricName"] == "GlobalDatastoreReplicationLag"
+    assert query["Metric"]["Dimensions"] == [{"Name": "CacheClusterId", "Value": "sec-001"}]
+
+
+def test_global_datastore_flags_mismatched_secondary_node_type_and_engine_version():
+    cp, _ = _global_plane([0.1], sec_node_type="cache.r6g.xlarge", sec_version="6.2")
+    msgs = [f["message"] for f in cp.global_replication_groups()["findings"]]
+    assert any("node type cache.r6g.xlarge differs from the primary (cache.r6g.large)" in m for m in msgs)
+    assert any("engine version 6.2 differs from the primary (7.1)" in m for m in msgs)
+
+
+def test_global_datastore_matching_secondary_has_no_mismatch_finding():
+    cp, _ = _global_plane([0.1])
+    assert [f for f in cp.global_replication_groups()["findings"] if "differs" in f["message"]] == []
+
+
+@pytest.mark.parametrize(
+    ("status", "flagged"),
+    [("associated", False), ("available", False), ("associating", True), ("disassociated", True)],
+)
+def test_global_datastore_member_status_findings(status, flagged):
+    cp, _ = _global_plane([0.1], secondary_status=status)
+    msgs = [f["message"] for f in cp.global_replication_groups()["findings"]]
+    assert any(f"member sec (eu-west-1) is {status}" in m for m in msgs) is flagged
+
+
+def test_global_datastore_unreadable_secondary_degrades_to_info():
+    primary = Fake({"describe_global_replication_groups": _global()})
+    secondary = (Fake({"describe_replication_groups": denied("x")}), Fake())
+    cp = _regional_plane({REGION: (primary, Fake()), "eu-west-1": secondary})
+    out = cp.global_replication_groups()
+    assert any(
+        f["severity"] == "info" and "could not be inspected: AccessDenied" in f["message"] for f in out["findings"]
+    )
+
+
+def test_global_lag_metric_is_in_the_default_metric_sets():
+    assert "GlobalDatastoreReplicationLag" in controlplane.REDIS_METRICS
+    assert "GlobalDatastoreReplicationLag" in controlplane.TRIAGE_METRICS
+
+
+# --------------------------------------------- sustained vs spike, p95, trend
+
+
+def _metrics_for(name: str, chronological: list[float], period: int = 300):
+    cw = Fake({"get_metric_data": metric_result({f"n-001|{name}": list(reversed(chronological))})})
+    return plane(Fake(), cw).metrics("n-001", [name], minutes=len(chronological) * period // 60, period_seconds=period)
+
+
+def _finding_for(out: dict, needle: str) -> dict:
+    return next(f for f in out["findings"] if needle in f["message"])
+
+
+def test_sustained_cpu_is_critical_and_says_so():
+    out = _metrics_for("EngineCPUUtilization", [95.0] * 12)
+    f = _finding_for(out, "EngineCPUUtilization")
+    assert f["severity"] == "critical" and "sustained (>=50% of points)" in f["message"]
+    assert out["summary"]["EngineCPUUtilization"]["fraction_above_threshold"] == 1.0
+
+
+def test_sustained_boundary_is_half_of_the_points():
+    half = _metrics_for("EngineCPUUtilization", [95.0] * 6 + [10.0] * 6)
+    assert _finding_for(half, "EngineCPUUtilization")["severity"] == "critical"
+    less = _metrics_for("EngineCPUUtilization", [95.0] * 5 + [10.0] * 7)
+    assert _finding_for(less, "EngineCPUUtilization")["severity"] == "info"
+
+
+@pytest.mark.parametrize(
+    ("name", "spike"),
+    [("EngineCPUUtilization", 95.0), ("DatabaseMemoryUsagePercentage", 95.0), ("CurrConnections", 60000.0)],
+)
+def test_single_spike_is_downgraded_to_info(name, spike):
+    out = _metrics_for(name, [10.0] * 11 + [spike])
+    f = _finding_for(out, name)
+    assert f["severity"] == "info" and "transient spike: 1 of 12 points" in f["message"]
+    paging = [
+        x for x in out["findings"] if x["severity"] in ("warning", "critical") and x.get("category") != "right-sizing"
+    ]
+    assert not paging  # right-sizing hints are a separate, peak-based check
+
+
+def test_sustained_connections_and_memory_keep_their_severity():
+    conns = _metrics_for("CurrConnections", [60000.0] * 10)
+    assert _finding_for(conns, "CurrConnections")["severity"] == "warning"
+    mem = _metrics_for("DatabaseMemoryUsagePercentage", [92.0] * 10)
+    assert _finding_for(mem, "DatabaseMemoryUsagePercentage")["severity"] == "critical"
+
+
+def test_summary_has_p95():
+    out = _metrics_for("EngineCPUUtilization", [float(v) for v in range(1, 21)])
+    assert out["summary"]["EngineCPUUtilization"]["p95"] == 20.0
+    flat = _metrics_for("EngineCPUUtilization", [5.0] * 10)
+    assert flat["summary"]["EngineCPUUtilization"]["p95"] == 5.0
+
+
+def test_trend_growing_memory_gives_time_to_full_hint():
+    series = [40.0 + 2.0 * i for i in range(12)]  # 5 minutes apart, 40% -> 62%
+    out = _metrics_for("DatabaseMemoryUsagePercentage", series)
+    trend = out["summary"]["DatabaseMemoryUsagePercentage"]["trend"]
+    assert trend["first_quarter_avg"] == pytest.approx(42.0) and trend["last_quarter_avg"] == pytest.approx(60.0)
+    # 38 points left at 2 points per datapoint: 19 datapoints of 5 minutes
+    assert trend["hours_to_full"] == pytest.approx(19 * 5 / 60, abs=0.1)
+    f = _finding_for(out, "is growing")
+    assert f["severity"] == "warning" and "reached in about" in f["message"]
+
+
+def test_trend_slow_growth_is_info_and_flat_or_short_series_have_no_hint():
+    slow = _metrics_for("DatabaseMemoryUsagePercentage", [30.0 + 0.1 * i for i in range(28)], period=3600)
+    assert _finding_for(slow, "is growing")["severity"] == "info"
+    flat = _metrics_for("DatabaseMemoryUsagePercentage", [50.0] * 12)
+    assert "hours_to_full" not in flat["summary"]["DatabaseMemoryUsagePercentage"].get("trend", {})
+    assert not [f for f in flat["findings"] if "growing" in f["message"]]
+    short = _metrics_for("DatabaseMemoryUsagePercentage", [10.0, 50.0, 90.0])
+    assert "trend" not in short["summary"]["DatabaseMemoryUsagePercentage"]
+
+
+# ------------------------------------------------------ tags in the triage tools
+
+
+def test_triage_tags_surface_ownership_and_flag_missing_tags():
+    group = {**rg(), "ARN": "arn:rg"}
+    tagged = Fake(
+        {
+            "describe_replication_groups": {"ReplicationGroups": [group]},
+            "list_tags_for_resource": {"TagList": [{"Key": "owner", "Value": "cache-team"}]},
+        }
+    )
+    out = plane(tagged).triage("prod")
+    assert out["ownership"] == {"owner": "cache-team"} and out["tags"] == {"owner": "cache-team"}
+    assert [c for c in tagged.calls if c[0] == "list_tags_for_resource"] == [
+        ("list_tags_for_resource", {"ResourceName": "arn:rg"})
+    ]
+
+    untagged = Fake(
+        {"describe_replication_groups": {"ReplicationGroups": [group]}, "list_tags_for_resource": {"TagList": []}}
+    )
+    out = plane(untagged).triage("prod")
+    assert any(f.get("category") == "ownership" and f["severity"] == "info" for f in out["findings"])
+
+
+def test_triage_tags_access_denied_is_a_note_not_a_failure():
+    group = {**rg(), "ARN": "arn:rg"}
+    ec = Fake({"describe_replication_groups": {"ReplicationGroups": [group]}, "list_tags_for_resource": denied("x")})
+    out = plane(ec).triage("prod")
+    assert "AccessDenied" in out["tags_note"] and "error" not in out
+    assert not [f for f in out["findings"] if f.get("category") == "ownership"]
+
+
+def test_serverless_triage_tags_use_the_cache_arn():
+    cache = {"ServerlessCacheName": "sc", "Status": "available", "ARN": "arn:sc"}
+    ec = Fake(
+        {
+            "describe_serverless_caches": {"ServerlessCaches": [cache]},
+            "list_tags_for_resource": {"TagList": [{"Key": "Environment", "Value": "staging"}]},
+        }
+    )
+    out = plane(ec).serverless_triage("sc")
+    assert out["ownership"] == {"environment": "staging"}
+    assert ("list_tags_for_resource", {"ResourceName": "arn:sc"}) in ec.calls

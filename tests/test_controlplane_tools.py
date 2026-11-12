@@ -766,6 +766,9 @@ async def test_aws_alarms_tool_registered_read_only_and_delegates(monkeypatch):
     seen = {}
 
     class Plane:
+        def in_region(self, region):
+            return self
+
         def alarms(self, rg=None):
             seen["rg"] = rg
             return {"count": 0, "findings": [], "targets": [], "alarms": []}
@@ -1745,3 +1748,219 @@ def test_serverless_triage_cache_and_metrics_denied_keeps_snapshots():
 def test_serverless_triage_disabled_control_plane():
     cp = ControlPlane(ControlPlaneConfig(region=REGION, enabled=False))
     assert "unavailable" in cp.serverless_triage("sc")
+
+
+# ------------------------------------------------------------------- regions
+
+SECONDARY = "eu-west-1"
+
+
+@pytest.fixture()
+def two_regions():
+    """One Stubber-backed ElastiCache client per region; records the kwargs each client was built with."""
+    clients = {r: boto3.client("elasticache", region_name=r) for r in (REGION, SECONDARY)}
+    built: list[dict] = []
+
+    class Session:
+        def client(self, service, region_name=None, config=None):
+            built.append({"service": service, "region": region_name, "config": config})
+            return clients[region_name]
+
+    def make(**cfg):
+        return ControlPlane(ControlPlaneConfig(region=REGION, **cfg), session_factory=Session, clock=lambda: NOW)
+
+    stubs = {r: Stubber(c) for r, c in clients.items()}
+    for stub in stubs.values():
+        stub.activate()
+    yield make, stubs, built
+    for stub in stubs.values():
+        stub.assert_no_pending_responses()
+        stub.deactivate()
+
+
+def _group(rg_id):
+    return {"ReplicationGroups": [{"ReplicationGroupId": rg_id, "Status": "available"}]}
+
+
+def test_in_region_selects_the_client_for_that_region_and_keeps_bounds(two_regions):
+    make, stubs, built = two_regions
+    cp = make(call_timeout=7.0, max_attempts=2)
+    stubs[SECONDARY].add_response("describe_replication_groups", _group("rg-secondary"))
+    out = cp.in_region(SECONDARY).replication_groups()
+    assert [v["id"] for v in out["replication_groups"]] == ["rg-secondary"]
+    assert [b["region"] for b in built] == [SECONDARY]
+    conf = built[0]["config"]
+    assert conf.read_timeout == 7.0 and conf.retries["max_attempts"] == 2
+    assert cp.in_region(None) is cp and cp.in_region(REGION) is cp
+    assert cp.in_region(SECONDARY) is cp.in_region(SECONDARY)
+
+
+@pytest.mark.parametrize("bad", ["", "us_east_1", "us-east-1; rm", "US-EAST-1", "x" * 40, "us-east", "../etc"])
+def test_in_region_rejects_malformed_region(two_regions, bad):
+    make, _, built = two_regions
+    with pytest.raises(ValueError, match="invalid AWS region"):
+        make().in_region(bad)
+    assert built == []
+
+
+@pytest.mark.parametrize("ok", ["us-east-1", "eu-central-2", "ap-southeast-4", "us-gov-west-1", "cn-north-1"])
+def test_in_region_accepts_real_region_names(two_regions, ok):
+    make, _, _ = two_regions
+    assert make().in_region(ok).config.region == ok
+
+
+def test_fan_out_merges_regions_and_tags_each_group(two_regions):
+    make, stubs, _ = two_regions
+    cp = make(regions=(REGION, SECONDARY))
+    stubs[REGION].add_response("describe_replication_groups", _group("rg-primary"))
+    stubs[SECONDARY].add_response("describe_replication_groups", _group("rg-secondary"))
+    out = cp.replication_groups_fan_out()
+    assert out["regions"] == [REGION, SECONDARY]
+    assert {(v["id"], v["region"]) for v in out["replication_groups"]} == {
+        ("rg-primary", REGION),
+        ("rg-secondary", SECONDARY),
+    }
+
+
+def test_fan_out_skips_regions_without_the_group_and_reports_other_failures(two_regions):
+    make, stubs, _ = two_regions
+    cp = make(regions=(REGION, SECONDARY))
+    stubs[REGION].add_client_error("describe_replication_groups", "ReplicationGroupNotFoundFault")
+    stubs[SECONDARY].add_response("describe_replication_groups", _group("rg-x"), {"ReplicationGroupId": "rg-x"})
+    out = cp.replication_groups_fan_out("rg-x")
+    assert [v["region"] for v in out["replication_groups"]] == [SECONDARY]
+    assert "region_errors" not in out
+
+    stubs[REGION].add_client_error("describe_replication_groups", "AccessDenied")
+    stubs[SECONDARY].add_response("describe_replication_groups", _group("rg-y"))
+    out = cp.replication_groups_fan_out()
+    assert out["region_errors"][REGION]["error"] == "AccessDenied"
+    assert out["count"] == 1
+
+
+def test_explicit_region_beats_the_configured_list(two_regions):
+    make, stubs, _ = two_regions
+    cp = make(regions=(REGION, SECONDARY))
+    stubs[SECONDARY].add_response("describe_replication_groups", _group("only-secondary"))
+    out = cp.replication_groups_fan_out(region=SECONDARY)
+    assert [v["id"] for v in out["replication_groups"]] == ["only-secondary"]
+
+
+def test_triage_fan_out_finds_the_region_holding_the_group(two_regions):
+    make, stubs, _ = two_regions
+    cp = make(regions=(REGION, SECONDARY))
+    stubs[REGION].add_client_error("describe_replication_groups", "ReplicationGroupNotFoundFault")
+    stubs[SECONDARY].add_response("describe_replication_groups", _group("rg-z"))
+    seen = {}
+    cp_secondary = cp.in_region(SECONDARY)
+    cp_secondary.triage = lambda rg: seen.setdefault("rg", rg) and {"overall": "ok"}  # type: ignore[method-assign]
+    out = cp.triage_fan_out("rg-z")
+    assert out == {"region": SECONDARY, "overall": "ok"} and seen == {"rg": "rg-z"}
+
+
+def test_triage_fan_out_not_found_anywhere(two_regions):
+    make, stubs, _ = two_regions
+    cp = make(regions=(REGION, SECONDARY))
+    for r in (REGION, SECONDARY):
+        stubs[r].add_client_error("describe_replication_groups", "ReplicationGroupNotFoundFault")
+    out = cp.triage_fan_out("nope")
+    assert out["error"] == "ReplicationGroupNotFoundFault" and REGION in out["message"] and SECONDARY in out["message"]
+
+
+async def test_region_argument_is_exposed_validated_and_read_only():
+    async with Client(server.mcp) as c:
+        tools = {t.name: t for t in await c.list_tools()}
+        aws_tools = [t for n, t in tools.items() if n.startswith("aws_")]
+        assert aws_tools and all("region" in t.input_schema["properties"] for t in aws_tools)
+        assert all("region" not in t.input_schema.get("required", []) for t in aws_tools)
+        with pytest.raises(ToolError):
+            await c.call_tool("aws_subnet_groups", {"region": "not a region"})
+
+
+# ---------------------------------------------------------------------- tags
+
+RG_ARN = "arn:aws:elasticache:us-east-1:123456789012:replicationgroup:prod"
+CLUSTER_ARN = "arn:aws:elasticache:us-east-1:123456789012:cluster:prod-001"
+
+
+def _overview_stubs(ec, rg_arn=RG_ARN, cluster_arn=CLUSTER_ARN):
+    group = {"ReplicationGroupId": "prod", "Status": "available", **({"ARN": rg_arn} if rg_arn else {})}
+    cluster = {
+        "CacheClusterId": "prod-001",
+        "ReplicationGroupId": "prod",
+        **({"ARN": cluster_arn} if cluster_arn else {}),
+    }
+    ec.add_response("describe_replication_groups", {"ReplicationGroups": [group]}, {"ReplicationGroupId": "prod"})
+    ec.add_response("describe_cache_clusters", {"CacheClusters": [cluster]})
+
+
+def test_overview_tags_show_owner_and_environment(aws):
+    cp, ec, _ = aws
+    _overview_stubs(ec)
+    ec.add_response(
+        "list_tags_for_resource",
+        {
+            "TagList": [
+                {"Key": "Team", "Value": "payments"},
+                {"Key": "env", "Value": "prod"},
+                {"Key": "x", "Value": "y"},
+            ]
+        },
+        {"ResourceName": RG_ARN},
+    )
+    out = cp.cluster_overview("prod")
+    assert out["tags"] == {"Team": "payments", "env": "prod", "x": "y"}
+    assert out["ownership"] == {"team": "payments", "environment": "prod"}
+    assert not [f for f in out["findings"] if f.get("category") == "ownership"]
+
+
+def test_overview_tags_missing_owner_team_environment_is_an_info_finding(aws):
+    cp, ec, _ = aws
+    _overview_stubs(ec)
+    ec.add_response(
+        "list_tags_for_resource", {"TagList": [{"Key": "cost-center", "Value": "42"}]}, {"ResourceName": RG_ARN}
+    )
+    ec.add_response("list_tags_for_resource", {"TagList": []}, {"ResourceName": CLUSTER_ARN})
+    out = cp.cluster_overview("prod")
+    missing = [f for f in out["findings"] if f.get("category") == "ownership"]
+    assert len(missing) == 1 and missing[0]["severity"] == "info"
+    assert "ownership" not in out and out["tags"] == {"cost-center": "42"}
+
+
+def test_overview_tags_fall_back_to_the_member_cluster_and_stop_at_the_cap(aws):
+    cp, ec, _ = aws
+    _overview_stubs(ec)
+    ec.add_response("list_tags_for_resource", {"TagList": []}, {"ResourceName": RG_ARN})
+    ec.add_response(
+        "list_tags_for_resource", {"TagList": [{"Key": "Owner", "Value": "sre"}]}, {"ResourceName": CLUSTER_ARN}
+    )
+    out = cp.cluster_overview("prod")
+    assert out["ownership"] == {"owner": "sre"}
+
+
+def test_overview_tags_access_denied_degrades_to_a_note(aws):
+    cp, ec, _ = aws
+    _overview_stubs(ec)
+    ec.add_client_error("list_tags_for_resource", "AccessDenied", expected_params={"ResourceName": RG_ARN})
+    out = cp.cluster_overview("prod")
+    assert "error" not in out and out["status"] == "ok"
+    assert "AccessDenied" in out["tags_note"]
+    assert not [f for f in out["findings"] if f.get("category") == "ownership"]
+
+
+def test_overview_tags_without_arns_makes_no_tag_call(aws):
+    cp, ec, _ = aws
+    _overview_stubs(ec, rg_arn=None, cluster_arn=None)
+    out = cp.cluster_overview("prod")
+    assert "tags" not in out and "tags_note" not in out
+
+
+def test_iam_policy_lists_list_tags_for_resource():
+    import json
+    import re
+    from pathlib import Path
+
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    block = re.search(r"```json\n(\{\s*\"Version\".*?\})\n```", readme, flags=re.S)
+    actions = [a for st in json.loads(block.group(1))["Statement"] for a in st["Action"]]
+    assert "elasticache:ListTagsForResource" in actions

@@ -325,3 +325,40 @@ async def test_every_tool_has_a_short_docstring_and_readme_rows_match_registry()
     rows = re.findall(r"^\| `((?:node|aws|memcached)_[a-z_]+)` \|", readme, flags=re.M)
     assert len(rows) == len(set(rows)), "duplicate README tool rows"
     assert set(rows) == {t.name for t in tools}
+
+
+# ------------------------------------------------------------- on-call prompts
+
+RUNBOOKS = {"oncall_high_cpu", "oncall_evictions_memory", "oncall_replication_lag", "oncall_connection_storm"}
+
+
+async def test_oncall_prompts_are_registered_and_do_not_change_the_tool_count():
+    prompts = await server.mcp.list_prompts()
+    assert {p.name for p in prompts} == RUNBOOKS
+    async with Client(server.mcp) as c:
+        assert {p.name for p in await c.list_prompts()} == RUNBOOKS
+        assert len(await c.list_tools()) == 42  # prompts are not tools
+
+
+@pytest.mark.parametrize("name", sorted(RUNBOOKS))
+async def test_oncall_prompt_only_names_tools_that_exist_and_chains_several(name):
+    import re
+
+    async with Client(server.mcp) as c:
+        tool_names = {t.name for t in await c.list_tools()}
+        result = await c.get_prompt(name, {"replication_group_id": "orders-prod"})
+    text = "\n".join(m.content.text for m in result.messages)
+    assert "orders-prod" in text
+    named = set(re.findall(r"`((?:aws|node|memcached)_[a-z_]+)`", text))
+    assert len(named) >= 4
+    assert named <= tool_names, sorted(named - tool_names)
+    assert "aws_triage" in named and "aws_metrics" in named
+
+
+async def test_oncall_high_cpu_runs_the_documented_sequence():
+    async with Client(server.mcp) as c:
+        result = await c.get_prompt("oncall_high_cpu", {"replication_group_id": "rg"})
+    text = result.messages[0].content.text
+    order = ["`aws_triage`", "`node_triage`", "`node_cluster_slowlog`", "`aws_metrics`"]
+    positions = [text.index(t) for t in order]
+    assert positions == sorted(positions)

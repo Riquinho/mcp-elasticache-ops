@@ -7,6 +7,7 @@ environment (or an AUTH token file) and are never logged or returned by tools.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -133,16 +134,39 @@ class ControlPlaneConfig:
     enabled: bool = True
     call_timeout: float = 10.0
     max_attempts: int = 3
+    regions: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls) -> ControlPlaneConfig:
         return cls(
+            regions=aws_regions(os.getenv("ELASTICACHE_REGIONS")),
             region=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or None,
             profile=os.getenv("AWS_PROFILE") or None,
             enabled=_bool(os.getenv("ELASTICACHE_CONTROL_PLANE"), default=True),
             call_timeout=_float("AWS_CALL_TIMEOUT_SECONDS", 10.0, 0, 120),
             max_attempts=_int("AWS_MAX_ATTEMPTS", 3, 1, 10),
         )
+
+
+# aws-cn-style and GovCloud names too: us-east-1, eu-central-2, us-gov-west-1, cn-north-1, us-isob-east-1
+REGION_PATTERN = r"^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$"
+MAX_REGIONS = 8
+
+
+def aws_regions(raw: str | None) -> tuple[str, ...]:
+    """Parse ``ELASTICACHE_REGIONS`` (comma-separated region names); duplicates dropped, order kept."""
+    if raw is None or raw.strip() == "":
+        return ()
+    seen: dict[str, None] = {}
+    for entry in (e.strip() for e in raw.split(",")):
+        if not entry:
+            continue
+        if not re.fullmatch(REGION_PATTERN, entry):
+            raise ConfigError(f"ELASTICACHE_REGIONS entries must be AWS region names, got {entry!r}")
+        seen[entry] = None
+    if len(seen) > MAX_REGIONS:
+        raise ConfigError(f"ELASTICACHE_REGIONS lists {len(seen)} regions, the limit is {MAX_REGIONS}")
+    return tuple(seen)
 
 
 DEFAULT_MAX_OUTPUT_CHARS = 60_000
