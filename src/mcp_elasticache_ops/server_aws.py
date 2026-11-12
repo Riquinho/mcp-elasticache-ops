@@ -250,6 +250,19 @@ def aws_backup_audit(
 
 
 @server.read_tool
+def aws_replication_group_audit(
+    replication_group_id: Annotated[
+        str | None, Field(description="Audit only this group (default: all groups)")
+    ] = None,
+    region: Region = None,
+) -> dict:
+    """HA and config posture per replication group in one call. Findings first, each with a `next` tool: Multi-AZ or
+    failover off, zero replicas, replicas in one AZ, big node without cluster mode, no snapshots or log delivery,
+    encryption mix, network type."""
+    return server._cp(region).replication_group_audit(replication_group_id)
+
+
+@server.read_tool
 def aws_snapshot_restore_readiness(
     replication_group_id: Annotated[str | None, Field(description="Replication group to check")] = None,
     serverless_cache_name: Annotated[str | None, Field(description="Serverless cache to check instead")] = None,

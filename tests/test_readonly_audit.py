@@ -36,6 +36,7 @@ AUDITED_MODULES = {
     "controlplane/triage_events.py",
     "controlplane/triage_overview.py",
     "controlplane/alarm_quality.py",
+    "controlplane/group_audit.py",
     "controlplane/triage_shards.py",
     "dataplane/__init__.py",
     "dataplane/_core.py",

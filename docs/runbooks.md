@@ -70,6 +70,8 @@ Conclude: responsible client, churn or leak, distance to maxclients, fix (pool, 
 
 ## 5. Failover or restore readiness (before a drill, an upgrade or a maintenance window)
 
+0. `aws_replication_group_audit` first when the question is "which groups are set up badly": one fleet-wide pass over Multi-AZ, failover, replicas, snapshots, encryption and network type, each finding with a `next` tool. Missing or failing slow-log / engine-log delivery points at `node_slowlog` / `node_commandlog`.
+
 1. `aws_failover_readiness` for the replication group: single-node or no replicas, automatic failover or Multi-AZ off,
    replicas in the primary's AZ, uneven replica counts per shard, replicas not available. The result carries one
    `recovery_risk` (high, medium, low).

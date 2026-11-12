@@ -480,3 +480,132 @@ def test_controlplane_memcached_discovery_end_to_end(fake_cluster):
     assert out["status"] == "ok" and any("mc.0002" in f["message"] for f in out["findings"])
     cluster["Engine"] = "redis"
     assert plane().memcached_discovery("mc")["error"] == "NotMemcached"
+
+
+# ------------------------------------------------------------ round 27: eviction rate, slab calcification, conns
+
+
+def _general_with(**extra):
+    base = {
+        "version": "1.6.29",
+        "uptime": 100,
+        "curr_connections": 3,
+        "max_connections": 1000,
+        "curr_items": 1000,
+        "bytes": 40 * 1024 * 1024,
+        "limit_maxbytes": 64 * 1024 * 1024,
+        "get_hits": 1000,
+        "get_misses": 10,
+        "evictions": 0,
+        "reclaimed": 0,
+        "listen_disabled_num": 0,
+        "accepting_conns": 1,
+        **extra,
+    }
+    return ("".join(f"STAT {k} {v}\r\n" for k, v in base.items()) + "END\r\n").encode()
+
+
+def _msgs(out, severity=None):
+    return [f["message"] for f in out["findings"] if severity in (None, f["severity"])]
+
+
+def test_evictions_weighed_against_get_hits_name_the_reclaimed_count(fake_cluster):
+    nodes, _ = fake_cluster
+    nodes[("a", 11211)] = _node(_general_with(evictions=50, reclaimed=3))
+    out = memcached.cluster_stats([("a", 11211)], timeout=2)
+    msg = next(m for m in _msgs(out) if "per 100 get_hits" in m)
+    assert "5.0 items per 100 get_hits (50 evictions, 1000 hits)" in msg and "only 3 expired items" in msg
+
+
+def test_reclaimed_items_are_named_but_do_not_hide_live_evictions(fake_cluster):
+    nodes, _ = fake_cluster
+    nodes[("a", 11211)] = _node(_general_with(evictions=50, reclaimed=900))
+    msg = next(m for m in _msgs(memcached.cluster_stats([("a", 11211)], timeout=2)) if "per 100 get_hits" in m)
+    assert "900 expired items were reclaimed too" in msg
+
+
+def test_a_trickle_of_evictions_or_too_few_hits_is_not_a_rate_finding(fake_cluster):
+    nodes, _ = fake_cluster
+    nodes[("a", 11211)] = _node(_general_with(evictions=2))  # 0.2 per 100 hits
+    nodes[("b", 11211)] = _node(_general_with(evictions=50, get_hits=20))  # ratio means nothing under 100 hits
+    out = memcached.cluster_stats([("a", 11211), ("b", 11211)], timeout=2)
+    assert not any("per 100 get_hits" in m for m in _msgs(out))
+
+
+def test_slab_calcification_is_a_finding_when_other_classes_hold_free_chunks(fake_cluster):
+    nodes, _ = fake_cluster
+    slabs = (
+        b"STAT 1:chunk_size 96\r\nSTAT 1:total_pages 1\r\nSTAT 1:free_chunks 0\r\n"
+        b"STAT 5:chunk_size 1024\r\nSTAT 5:total_pages 40\r\nSTAT 5:free_chunks 40000\r\nEND\r\n"
+    )
+    nodes[("a", 11211)] = _node(_general_with(), slabs=slabs, items=_items({1: 30, 5: 0}))
+    out = memcached.cluster_stats([("a", 11211)], timeout=2)
+    msg = next(m for m in _msgs(out, "warning") if "slab calcification" in m)
+    assert "slab class 1 evicts (30)" in msg and "39 MiB of free chunks" in msg
+
+
+def test_slab_eviction_without_idle_space_is_not_calcification(fake_cluster):
+    nodes, _ = fake_cluster
+    nodes[("a", 11211)] = _node(_general_with(), slabs=_slabs({1: 5, 5: 5}), items=_items({1: 30, 5: 0}))
+    assert not any("calcification" in m for m in _msgs(memcached.cluster_stats([("a", 11211)], timeout=2)))
+
+
+def test_accepting_conns_zero_is_critical_and_sorts_first(fake_cluster):
+    nodes, _ = fake_cluster
+    nodes[("a", 11211)] = _node(_general_with(accepting_conns=0, listen_disabled_num=4, evictions=60))
+    out = memcached.cluster_stats([("a", 11211)], timeout=2)
+    assert out["findings"][0]["severity"] == "critical" and "accepting_conns=0" in out["findings"][0]["message"]
+    assert any("listen_disabled_num=4" in m for m in _msgs(out))
+
+
+def test_connections_near_max_and_accepting_conns_missing(fake_cluster):
+    nodes, _ = fake_cluster
+    general = _general(conns=900, maxconn=1000)  # no accepting_conns key at all: older builds
+    nodes[("a", 11211)] = _node(general)
+    out = memcached.cluster_stats([("a", 11211)], timeout=2)
+    assert any("connections 900/1000 near maxconns" in m for m in _msgs(out))
+    assert not any("accepting_conns" in m for m in _msgs(out))
+    assert out["nodes"][0]["accepting_conns"] is None
+
+
+def test_timeout_on_one_node_is_partial_not_fatal(fake_cluster):
+    nodes, _ = fake_cluster
+    nodes[("a", 11211)] = _node(_general_with())
+    nodes[("slow", 11211)] = TimeoutError("timed out")
+    out = memcached.cluster_stats([("a", 11211), ("slow", 11211)], timeout=1)
+    assert out["status"] == "partial" and out["nodes_ok"] == 1
+    assert any("slow:11211 unreachable: TimeoutError: timed out" in m for m in _msgs(out))
+
+
+def test_recv_timeout_mid_reply_marks_the_node(monkeypatch):
+    class Stalled(FakeSocket):
+        def recv(self, n):
+            raise TimeoutError("timed out")
+
+    sent: list[bytes] = []
+    monkeypatch.setattr(socket, "create_connection", lambda addr, timeout=None: Stalled({"stats": b""}, sent))
+    report = memcached.node_report("a", 11211, 1)
+    assert report["status"] == "error" and "TimeoutError" in report["error"]
+
+
+def test_stats_cachedump_is_denied_before_the_socket(fake_cluster):
+    nodes, sent = fake_cluster
+    nodes[("a", 11211)] = _node(_general_with())
+    with pytest.raises(ValueError, match="group must be one of"):
+        memcached.stats("a", 11211, "cachedump", 2)
+    for command in ("stats cachedump 1 100", "stats cachedump", "flush_all", "stats reset"):
+        with pytest.raises(ValueError, match="not allowed"):
+            memcached._query("a", 11211, command, 2)
+    assert sent == [] and "stats cachedump" not in memcached.ALLOWED_COMMANDS
+
+
+def test_discovery_node_count_disagreeing_with_numcachenodes_is_a_warning(fake_cluster):
+    nodes, _ = fake_cluster
+    nodes[("mc.cfg", 11211)] = {"config get cluster": CONFIG_REPLY, "version": b"VERSION 1.6.22\r\n"}
+    cluster = _aws_cluster("mc.0001.use1.cache.amazonaws.com", "mc.0002.use1.cache.amazonaws.com")
+    cluster["NumCacheNodes"] = 3
+    out = memcached.discovery_report(cluster, "mc.cfg", 11211, 2)
+    msg = next(m for m in _msgs(out, "warning") if "NumCacheNodes=3" in m)
+    assert "lists 2" in msg
+    cluster["NumCacheNodes"] = 2
+    assert not any("NumCacheNodes" in m for m in _msgs(memcached.discovery_report(cluster, "mc.cfg", 11211, 2)))

@@ -1,5 +1,28 @@
 # Changelog
 
+## Round 27 additions to 0.3.0
+
+Round 27. 63 tools (one new tool, `aws_replication_group_audit`).
+
+### Added
+- `aws_replication_group_audit` (`controlplane/group_audit.py`, `inventory.py`): per-group posture from
+  `DescribeReplicationGroups` and `DescribeCacheClusters` (no new IAM actions): Multi-AZ, automatic failover, zero
+  replicas, single-AZ replicas, big node without cluster mode, auto minor upgrade, no snapshots, log delivery,
+  encryption mix, network type. Capped at 60 findings, each with `resource`, `category`, `next`.
+- Log delivery (`_shared.log_delivery_findings`): slow-log and engine-log missing (warning / info), failing status
+  (warning) and split destination types (info), in `aws_triage`, `aws_replication_groups` and the group audit.
+  Pointers to `node_slowlog` / `node_commandlog`. Serverless is not judged: the API does not expose log delivery.
+- Memcached depth (`memcached.py`): slab calcification warning, eviction-rate finding, `accepting_conns` critical,
+  `reclaimed` / `get_hits` in `node_report`, `NumCacheNodes` vs discovered node count mismatch warning.
+- `tests/test_findings_pointers.py`: cross-tool pointer contract (severity vocabulary, ordering, actionable findings, every
+  referenced tool exists); legacy state-describing findings are grandfathered in an explicit, ratcheted list.
+
+### Changed
+- `MAX_TOOLS_LIST_BYTES` raised from 52_300 to 53_400: the 63rd tool (measured 53_069).
+- Log delivery went into `aws_triage`, not `aws_security_audit`: a new category there breaks the category-order test.
+
+Integration: skipped. `df -h /c` showed 4.4G free (under the 5G floor).
+
 ## Round 26 additions to 0.3.0
 
 Round 26. 62 tools (one new tool, `aws_backup_audit`).
@@ -22,7 +45,6 @@ Round 26. 62 tools (one new tool, `aws_backup_audit`).
 - `MAX_TOOLS_LIST_BYTES` raised from 51_200 to 52_300 in `tests/test_tool_surface.py`: the 62nd tool adds its schema
   and description to `tools/list` (measured 52_253 before trimming the docstring).
 - `MEMORY STATS` was already on the SafeRedis allowlist; the audited fake now answers it with a dict.
-- Round 25 work and round 26 work share one working tree and are not committed yet.
 
 Integration: `scripts/integration.sh` ran with 5.2G free on `/c` (full mode): 1931 passed, 7 skipped. Own `prova-elasticache-*` containers removed; dangling volumes, untagged images and old build cache pruned (`fstrim` not available in the WSL distro).
 

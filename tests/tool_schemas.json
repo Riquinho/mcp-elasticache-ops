@@ -563,6 +563,38 @@
   ],
   "type": "object"
  },
+ "aws_replication_group_audit": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "replication_group_id": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "Audit only this group (default: all groups)"
+   }
+  },
+  "type": "object"
+ },
  "aws_replication_groups": {
   "additionalProperties": false,
   "properties": {

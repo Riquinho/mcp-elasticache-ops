@@ -68,6 +68,8 @@ TOOL_ARGS: dict[str, dict[str, Any]] = {
             "aws_service_updates",
             "aws_subnet_groups",
             "aws_backup_audit",
+            "aws_replication_group_audit",
+            "aws_replication_group_audit",
             "aws_metrics",
             "aws_alarms",
             "aws_maintenance",

@@ -693,27 +693,70 @@ def _auth_token_age_days(obj: dict, ctx: dict[str, Any] | None) -> int | None:
     return max((now - modified).days, 0)
 
 
+_LOG_LIVE = frozenset({"active", "enabling", "modifying"})
+
+
+def log_delivery_findings(obj: dict, engine: str) -> list[dict]:
+    """Slow-log / engine-log delivery posture of a replication group or cluster (Valkey and Redis OSS only).
+
+    Absent delivery points at ``node_slowlog`` / ``node_commandlog``: the live ring buffers are the only trace
+    left. Serverless caches and Memcached expose no ``LogDeliveryConfigurations``, so they are not judged."""
+    if engine not in {"redis", "valkey"}:
+        return []
+    configs = obj.get("LogDeliveryConfigurations") or []
+    out: list[dict] = []
+    if not any(d.get("LogType") == "slow-log" and d.get("Status") in _LOG_LIVE for d in configs):
+        out.append(
+            finding(
+                "warning",
+                "slow-log delivery is not enabled; slow commands leave no trace in CloudWatch/Firehose "
+                "(until enabled, read the live buffer with node_slowlog)",
+                category="log-delivery",
+                next="node_slowlog",
+            )
+        )
+    if not any(d.get("LogType") == "engine-log" and d.get("Status") in _LOG_LIVE for d in configs):
+        out.append(
+            finding(
+                "info",
+                "engine-log delivery is not enabled (node_commandlog shows the live command log meanwhile)",
+                category="log-delivery",
+                next="node_commandlog",
+            )
+        )
+    for d in configs:
+        if str(d.get("Status")).lower() in {"error", "failed", "disabling"}:
+            detail = f": {d['Message']}" if d.get("Message") else ""
+            out.append(
+                finding(
+                    "warning",
+                    f"{d.get('LogType')} delivery status is {d.get('Status')}{detail}; fix the destination "
+                    "(permissions or a deleted log group/stream) or logs are being dropped",
+                    category="log-delivery",
+                    next="node_slowlog" if d.get("LogType") == "slow-log" else "node_commandlog",
+                )
+            )
+    kinds = {
+        d.get("LogType"): d.get("DestinationType")
+        for d in configs
+        if d.get("Status") in _LOG_LIVE and d.get("DestinationType")
+    }
+    if len(kinds) == 2 and len(set(kinds.values())) == 2:
+        out.append(
+            finding(
+                "info",
+                f"slow-log goes to {kinds['slow-log']} but engine-log goes to {kinds['engine-log']}: two "
+                "pipelines to watch; use one destination type unless that split is deliberate",
+                category="log-delivery",
+                next="aws_replication_groups",
+            )
+        )
+    return out
+
+
 def _hardening_findings(obj: dict, engine: str, ctx: dict[str, Any] | None) -> list[dict]:
     """Log delivery, transit-encryption mode and AUTH token age; shared by replication groups and standalone clusters."""
-    out: list[dict] = []
-    if engine in {"redis", "valkey"}:
-        configs = obj.get("LogDeliveryConfigurations") or []
-        live = {"active", "enabling", "modifying"}
-        for log_type in ("slow-log", "engine-log"):
-            if not any(d.get("LogType") == log_type and d.get("Status") in live for d in configs):
-                if log_type == "slow-log":
-                    out.append(
-                        finding(
-                            "warning",
-                            "slow-log delivery is not enabled; slow commands leave no trace in CloudWatch/Firehose",
-                        )
-                    )
-                else:
-                    out.append(finding("info", "engine-log delivery is not enabled"))
-        for d in configs:
-            if d.get("Status") in {"error", "disabling"}:
-                detail = f": {d['Message']}" if d.get("Message") else ""
-                out.append(finding("warning", f"{d.get('LogType')} delivery status is {d.get('Status')}{detail}"))
+    out: list[dict] = log_delivery_findings(obj, engine)
     if obj.get("TransitEncryptionEnabled") is True and obj.get("TransitEncryptionMode") == "preferred":
         out.append(
             finding(
@@ -732,9 +775,9 @@ def _rg_findings(g: dict, engine_version: tuple[str, str] | None, ctx: dict[str,
     if g.get("Status") not in (None, "available"):
         out.append(finding("warning", f"status is {g.get('Status')}"))
     if g.get("MultiAZ") not in (None, "enabled"):
-        out.append(finding("warning", "Multi-AZ is not enabled"))
+        out.append(finding("warning", "Multi-AZ is not enabled", next="aws_failover_readiness"))
     if g.get("AutomaticFailover") not in (None, "enabled"):
-        out.append(finding("warning", "automatic failover is not enabled"))
+        out.append(finding("warning", "automatic failover is not enabled", next="aws_failover_readiness"))
     if g.get("AtRestEncryptionEnabled") is False:
         out.append(finding("warning", "encryption at rest is disabled"))
     if g.get("TransitEncryptionEnabled") is False:
@@ -744,7 +787,9 @@ def _rg_findings(g: dict, engine_version: tuple[str, str] | None, ctx: dict[str,
     if g.get("AutoMinorVersionUpgrade") is False:
         out.append(finding("info", "auto minor version upgrade is off"))
     if g.get("SnapshotRetentionLimit") == 0:
-        out.append(finding("warning", "automatic snapshots are off (SnapshotRetentionLimit is 0)"))
+        out.append(
+            finding("warning", "automatic snapshots are off (SnapshotRetentionLimit is 0)", next="aws_backup_audit")
+        )
     if engine_version:
         engine, version = engine_version
         if engine.lower() == "redis" and _major_minor(version) < (7, 0):

@@ -37,6 +37,7 @@ from ._shared import (
     finding,
     is_burstable,
     is_data_tiered,
+    log_delivery_findings,
 )
 from .failover import failover_readiness_findings, reader_endpoint_findings
 from .scale import LAG_RISK_SECONDS, _pick
@@ -187,16 +188,29 @@ def _triage_rg_findings(g: dict) -> list[dict]:
     elif status not in (None, "available"):
         out.append(finding("warning", f"replication group status is {status}"))
     if g.get("AutomaticFailover") not in (None, "enabled"):
-        out.append(finding("warning", "automatic failover is not enabled: a primary failure needs manual action"))
+        out.append(
+            finding(
+                "warning",
+                "automatic failover is not enabled: a primary failure needs manual action",
+                next="aws_failover_readiness",
+            )
+        )
     if g.get("MultiAZ") not in (None, "enabled"):
-        out.append(finding("warning", "Multi-AZ is not enabled"))
+        out.append(finding("warning", "Multi-AZ is not enabled", next="aws_failover_readiness"))
     out += _az_placement_findings(g, None)
     for ng in g.get("NodeGroups", []):
         members = ng.get("NodeGroupMembers", [])
         if ng.get("Status") not in (None, "available"):
             out.append(finding("warning", f"node group {ng.get('NodeGroupId')} status is {ng.get('Status')}"))
         if len(members) == 1:
-            out.append(finding("warning", f"node group {ng.get('NodeGroupId')} has no replica: failover is impossible"))
+            out.append(
+                finding(
+                    "warning",
+                    f"node group {ng.get('NodeGroupId')} has no replica: failover is impossible",
+                    next="aws_failover_readiness",
+                )
+            )
+    out += log_delivery_findings(g, str(g.get("Engine") or "").lower())
     if g.get("PendingModifiedValues"):
         out.append(finding("info", "has pending modified values"))
     return out

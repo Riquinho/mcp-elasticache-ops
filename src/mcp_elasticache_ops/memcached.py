@@ -101,6 +101,8 @@ SLAB_MIN_PAGES = 5
 LOW_HIT_RATIO = 0.80  # evictions plus a hit ratio below this: the working set does not fit
 CALCIFIED_MEMORY_RATIO = 0.70  # evicting while below this share of limit_maxbytes points at slab imbalance
 LARGE_AVG_ITEM_BYTES = 256 * 1024  # average item size where a near-full node holds very few items
+EVICTIONS_PER_100_HITS = 1.0  # evictions this high relative to get_hits: the cache churns live data
+SLAB_FREE_MIN_BYTES = 16 * 1024 * 1024  # free chunk space idle in other classes while one class evicts
 MIN_GETS_FOR_RATIO = 100  # fewer gets than this: a hit ratio means nothing
 _SEVERITY_RANK = {"critical": 0, "warning": 1, "info": 2}
 
@@ -158,6 +160,29 @@ def usage_findings(name: str, n: dict) -> list[dict]:
     return out
 
 
+def eviction_rate_findings(name: str, n: dict) -> list[dict]:
+    """Evictions weighed against get_hits; ``reclaimed`` (expired items reused) is the healthy way to free space."""
+    hits, evictions, reclaimed = n.get("get_hits", 0), n.get("evictions", 0), n.get("reclaimed", 0)
+    if not evictions or hits < MIN_GETS_FOR_RATIO:
+        return []
+    per_100 = evictions * 100.0 / hits
+    if per_100 < EVICTIONS_PER_100_HITS:
+        return []
+    detail = (
+        f"only {reclaimed} expired items were reclaimed, so live data is being thrown out"
+        if reclaimed < evictions
+        else f"{reclaimed} expired items were reclaimed too, but evictions still take live data"
+    )
+    return [
+        _finding(
+            "warning",
+            f"node {name} evicts {per_100:.1f} items per 100 get_hits ({evictions} evictions, {hits} hits): {detail}; "
+            "add memory or shorten TTLs",
+            node=name,
+        )
+    ]
+
+
 def slab_report(slabs: dict[str, str], items: dict[str, str]) -> dict:
     """Per slab class pages, items, evictions and out-of-memory from ``stats slabs`` and ``stats items``."""
     classes: dict[str, dict] = {}
@@ -176,6 +201,7 @@ def slab_report(slabs: dict[str, str], items: dict[str, str]) -> dict:
             {
                 "class": int(cls),
                 "chunk_size": int(_f(d, "chunk_size")),
+                "free_bytes": int(_f(d, "free_chunks") * _f(d, "chunk_size")),
                 "total_pages": int(_f(d, "total_pages")),
                 "items": int(_f(d, "items_number") or _f(d, "used_chunks")),
                 "evicted": int(_f(d, "items_evicted")),
@@ -193,6 +219,18 @@ def slab_report(slabs: dict[str, str], items: dict[str, str]) -> dict:
                     "warning",
                     f"slab class {v['class']} (chunk {v['chunk_size']} B): {v['evicted']} evictions, "
                     f"{v['outofmemory']} out-of-memory errors",
+                    slab_class=v["class"],
+                )
+            )
+    for v in views:
+        idle = sum(o["free_bytes"] for o in views if o is not v)
+        if v["evicted"] and idle >= SLAB_FREE_MIN_BYTES:
+            findings.append(
+                _finding(
+                    "warning",
+                    f"slab class {v['class']} evicts ({v['evicted']}) while other classes hold "
+                    f"{idle // (1024 * 1024)} MiB of free chunks: slab calcification, enable slab_automove or "
+                    "restart the node after changing the item size mix",
                     slab_class=v["class"],
                 )
             )
@@ -225,6 +263,9 @@ def node_report(host: str, port: int, timeout: float) -> dict:
             "limit_maxbytes": int(_f(general, "limit_maxbytes")),
             "evictions": int(_f(general, "evictions")),
             "listen_disabled_num": int(_f(general, "listen_disabled_num")),
+            "reclaimed": int(_f(general, "reclaimed")),
+            "get_hits": int(_f(general, "get_hits")),
+            "accepting_conns": int(_f(general, "accepting_conns")) if "accepting_conns" in general else None,
         }
     )
     hits, misses = _f(general, "get_hits"), _f(general, "get_misses")
@@ -281,6 +322,16 @@ def cluster_findings(nodes: list[dict]) -> list[dict]:
             findings.append(_finding("info", f"node {name}: {n['error']}", node=name))
         if n["evictions"] > 0:
             findings.append(_finding("warning", f"node {name} has {n['evictions']} evictions since start", node=name))
+        if n.get("accepting_conns") == 0:
+            findings.append(
+                _finding(
+                    "critical",
+                    f"node {name}: accepting_conns=0, it refuses new connections right now (maxconns reached); "
+                    "raise maxconns or shed clients",
+                    node=name,
+                )
+            )
+        findings += eviction_rate_findings(name, n)
         if n["listen_disabled_num"] > 0:
             findings.append(
                 _finding(
@@ -451,6 +502,15 @@ def discovery_findings(cluster: dict, config: dict) -> list[dict]:
                 f"discovery config lists {key[0]}:{key[1]} but AWS has no such node of {cid}: stale entry, "
                 "clients will time out on it until the config refreshes",
                 node=f"{key[0]}:{key[1]}",
+            )
+        )
+    expected = cluster.get("NumCacheNodes")
+    if isinstance(expected, int) and expected != len(listed):
+        findings.append(
+            _finding(
+                "warning",
+                f"AWS reports NumCacheNodes={expected} for {cid} but the discovery config lists {len(listed)}: "
+                "a scale operation is in flight or the discovery endpoint is stale",
             )
         )
     if _version_mismatch(config.get("version"), cluster.get("EngineVersion")):

@@ -29,6 +29,7 @@ from ._shared import (
     _sorted_findings,
     finding,
 )
+from .group_audit import GROUP_AUDIT_MAX_FINDINGS, group_audit_findings
 from .inventory_views import (  # noqa: F401
     _EVENTS_CRITICAL_WORDS,
     _EVENTS_WARNING_WORDS,
@@ -427,6 +428,51 @@ class _InventoryMixin(_CoreMixin):
                 "snapshots_checked": len(views),
                 "findings": ordered[:BACKUP_AUDIT_MAX_FINDINGS],
                 **({"findings_truncated": len(ordered)} if len(ordered) > BACKUP_AUDIT_MAX_FINDINGS else {}),
+                **({"partial": True, "notes": notes} if notes else {}),
+            }
+
+        return self._guard(run)
+
+    def replication_group_audit(self, replication_group_id: str | None = None) -> dict:
+        """HA and configuration posture of every replication group (or one) in a single call. Findings first.
+
+        DescribeReplicationGroups plus DescribeCacheClusters (both paginated); each finding names the tool that
+        covers the topic in depth. A failing DescribeCacheClusters degrades to group-level checks with ``partial``."""
+
+        def run() -> dict:
+            kwargs = {"ReplicationGroupId": replication_group_id} if replication_group_id else {}
+            groups = self._paginate("describe_replication_groups", "ReplicationGroups", **kwargs)
+            if replication_group_id and not groups:
+                return {"error": "NotFound", "message": f"replication group {replication_group_id} not found"}
+            notes: list[str] = []
+            try:
+                clusters = self._paginate("describe_cache_clusters", "CacheClusters")
+            except (BotoCoreError, ClientError) as exc:
+                clusters = []
+                notes.append(f"DescribeCacheClusters failed ({_error_code(exc)}); node-level checks were skipped")
+            by_group: dict[str, list[dict]] = {}
+            for c in clusters:
+                if c.get("ReplicationGroupId"):
+                    by_group.setdefault(str(c["ReplicationGroupId"]), []).append(c)
+            found: list[dict] = []
+            worst: dict[str, int] = {}
+            for g in groups:
+                gid = str(g.get("ReplicationGroupId"))
+                mine = group_audit_findings(g, by_group.get(gid, []))
+                worst[gid] = len(mine)
+                found += mine
+            ordered = _sorted_findings(found)
+            counts: dict[str, int] = {}
+            for f in ordered:
+                counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+            return {
+                "summary": {
+                    "groups_checked": len(groups),
+                    "groups_with_findings": sum(1 for n in worst.values() if n),
+                    "severity_counts": counts,
+                },
+                "findings": ordered[:GROUP_AUDIT_MAX_FINDINGS],
+                **({"findings_truncated": len(ordered)} if len(ordered) > GROUP_AUDIT_MAX_FINDINGS else {}),
                 **({"partial": True, "notes": notes} if notes else {}),
             }
 

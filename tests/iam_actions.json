@@ -76,6 +76,10 @@
   "elasticache:DescribeCacheClusters",
   "elasticache:DescribeReplicationGroups"
  ],
+ "aws_replication_group_audit": [
+  "elasticache:DescribeCacheClusters",
+  "elasticache:DescribeReplicationGroups"
+ ],
  "aws_replication_groups": [
   "elasticache:DescribeCacheClusters",
   "elasticache:DescribeCacheEngineVersions",
