@@ -4,6 +4,8 @@ import pytest
 import redis
 
 from mcp_elasticache_ops import dataplane
+from mcp_elasticache_ops.dataplane.health import command_tail
+from mcp_elasticache_ops.dataplane.topology import cluster_links
 from mcp_elasticache_ops.safe_client import ReadOnlyViolation, SafeRedis
 
 pytestmark = pytest.mark.integration
@@ -164,3 +166,88 @@ def test_cluster_health_integration(cluster_seed, cluster_factory):
     assert out["cluster_enabled"] is True
     assert out["nodes_probed"] == 3 and out["slots_covered"] == 16384
     assert all("error" not in node for node in out["per_node"].values())
+
+
+# ---------------------------------------------------------------- COMMANDLOG, LATENCY HISTOGRAM, CLUSTER LINKS
+# These commands exist only on newer engines. A test skips only when the server version lacks the command, and
+# the skip message names the command, the version found and the version needed.
+
+
+def _version(client) -> tuple[str, tuple[int, ...]]:
+    info = client.info("server")
+    raw = str(info.get("valkey_version") or info.get("redis_version") or "0")
+    engine = "valkey" if info.get("valkey_version") or info.get("server_name") == "valkey" else "redis"
+    return engine, tuple(int(p) for p in raw.split(".")[:3] if p.isdigit())
+
+
+def _require(client, command: str, *, engine: str | None, minimum: tuple[int, ...]) -> None:
+    found_engine, found = _version(client)
+    ok = found >= minimum and (engine is None or found_engine == engine)
+    if not ok:
+        need = f"{engine or 'Redis/Valkey'} {'.'.join(map(str, minimum))}+"
+        pytest.skip(f"{command} needs {need}; server is {found_engine} {'.'.join(map(str, found))}")
+
+
+@pytest.fixture()
+def big_payloads(seeded):
+    """Lower the COMMANDLOG size thresholds, produce one large request and one large reply, then restore them."""
+    admin = redis.Redis.from_url(seeded, decode_responses=True)  # test-only writer; product code never writes
+    names = ("commandlog-request-larger-than", "commandlog-reply-larger-than")
+    try:
+        saved = {n: admin.config_get(n).get(n) for n in names}
+    except redis.ResponseError:
+        admin.close()
+        pytest.skip("COMMANDLOG size thresholds are not configurable on this server")
+    for n in names:
+        admin.config_set(n, "10000")
+    admin.set("commandlog:payload", "z" * 200_000)
+    admin.get("commandlog:payload")
+    yield
+    admin.delete("commandlog:payload")
+    for n, v in saved.items():
+        admin.config_set(n, v)
+    admin.close()
+
+
+def test_commandlog_integration(safe, big_payloads):
+    _require(safe, "COMMANDLOG", engine="valkey", minimum=(8, 0))
+    out = dataplane.commandlog(safe, count=20)
+    assert out["supported"] is True
+    assert {"slow", "large-request", "large-reply"} <= set(out)
+    big_req = out["large-request"]["top_commands"]
+    assert big_req and big_req[0]["max_size_bytes"] >= 200_000
+    big_rep = out["large-reply"]["top_commands"]
+    assert big_rep and big_rep[0]["command"].upper() == "GET"
+    assert "z" * 50 not in repr(out)  # values are never returned
+
+
+def test_latency_histogram_integration(safe):
+    _require(safe, "LATENCY HISTOGRAM", engine=None, minimum=(7, 0))
+    tail = command_tail(safe)
+    assert "notes" not in tail
+    assert tail["rows"], "seeded traffic should give at least one command with a histogram"
+    row = tail["rows"][0]
+    assert row["calls"] > 0 and row["p50_usec"] > 0 and row["p99_9_usec"] >= row["p50_usec"]
+
+
+def test_cluster_links_on_a_standalone_node_is_a_note(safe):
+    out = cluster_links(safe)
+    assert out["supported"] is False and out["findings"] == [] and out["notes"]
+
+
+@needs_cluster
+def test_cluster_links_integration(cluster_seed):
+    _require(cluster_seed, "CLUSTER LINKS", engine=None, minimum=(7, 0))
+    out = cluster_links(cluster_seed)
+    assert out["supported"] is True
+    assert out["links"] >= 4  # a 3-primary cluster: two peers, inbound and outbound links
+    assert len(out["peers"]) == 2
+    assert out["max_send_buffer_bytes"] >= 0 and not out["findings"]
+
+
+@needs_cluster
+def test_cluster_triage_reaches_every_node_for_commandlog_and_links(cluster_seed, cluster_factory):
+    _require(cluster_seed, "COMMANDLOG", engine="valkey", minimum=(8, 0))
+    out = dataplane.cluster_triage(cluster_seed, cluster_factory)
+    assert out["cluster_links"]["reached"].startswith("reached 3/3")
+    assert out["commandlog"]["reached"].startswith("reached 3/3")

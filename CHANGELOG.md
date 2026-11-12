@@ -19,6 +19,14 @@ Round 24. 61 tools.
   `DescribeCacheEngineVersions` (already in the policy).
 - `node_cluster_triage`: explicit "reached N/M nodes" for the COMMANDLOG and CLUSTER LINKS fan-out, with failure-mode
   tests (aggregation, hanging node, shard down, pre-Valkey-8 node).
+- Real Valkey 8 integration tests for COMMANDLOG (large-request and large-reply with the size thresholds lowered,
+  restored afterwards), LATENCY HISTOGRAM and CLUSTER LINKS (standalone note, 3-primary cluster links, cluster triage
+  "reached 3/3"). A test skips only when the server version lacks the command, and the skip message names the
+  command, the version found and the version needed. Result: `scripts/integration.sh` 1830 passed, 7 skipped
+  (the skips are the cluster-only tests, run by the cluster stage: 6 passed there); free disk on `C:` was 5.2G before
+  and after; no `prova-*` containers left, no dangling volumes. `fstrim` is not installed in the WSL distro, so it
+  was not run. Offline suite: 1813 passed; `tests/pass_floor.txt` set to 1813.
+- 0.4.0 is not cut: rounds 21-24 stay under "additions to 0.3.0" until a release is decided.
 - `tools/list` byte budget raised from 50_500 to 51_200 for the 61st tool (docstring already trimmed).
 
 ## Round 23 additions to 0.3.0
