@@ -602,11 +602,14 @@ def test_every_tool_only_calls_describe_list_or_get_metric_data():
     cp.user_groups()
     cp.global_replication_groups()
     cp.reserved_nodes()
+    cp.reserved_offerings("cache.r6g.large", "redis")
+    cp.serverless_snapshots()
     cp.service_updates()
     cp.subnet_groups()
     cp.metrics("a", minutes=5)
     cp.metrics(replication_group_id="rg", minutes=5)
     assert len(set(rec.calls)) >= 12
+    assert {"describe_serverless_cache_snapshots", "describe_reserved_cache_nodes_offerings"} <= set(rec.calls)
     assert rec.calls, "recorder saw no calls"
     for op in rec.calls:
         assert op.startswith(("describe_", "list_", "get_metric_data")), op
@@ -1210,3 +1213,300 @@ def test_reserved_nodes_cluster_listing_denied_keeps_the_reservations(aws):
     assert out["coverage"] == []
     assert any("reservation r1 ends" in f["message"] for f in out["findings"])
     assert not any("on-demand" in f["message"] or "no running match" in f["message"] for f in out["findings"])
+
+
+# ------------------------------------------------------- serverless snapshots
+
+
+def _ssnap(name, cache, hours, status="available", kms="arn:aws:kms:us-east-1:1:key/k", expires_in=None):
+    snap = {
+        "ServerlessCacheSnapshotName": name,
+        "SnapshotType": "automatic",
+        "Status": status,
+        "CreateTime": _hours_ago(hours),
+        "BytesUsedForCache": "1048576",
+        "ServerlessCacheConfiguration": {"ServerlessCacheName": cache, "Engine": "valkey"},
+    }
+    if kms:
+        snap["KmsKeyId"] = kms
+    if expires_in is not None:
+        snap["ExpiryTime"] = NOW + dt.timedelta(hours=expires_in)
+    return snap
+
+
+def _scache(name, retention=7):
+    c = {"ServerlessCacheName": name, "Engine": "valkey"}
+    if retention:
+        c["SnapshotRetentionLimit"] = retention
+    return c
+
+
+def test_serverless_snap_findings(aws):
+    cp, ec, _ = aws
+    ec.add_response(
+        "describe_serverless_cache_snapshots",
+        {
+            "ServerlessCacheSnapshots": [
+                _ssnap("old", "stale", 30, expires_in=100),
+                _ssnap("bad", "failing", 2, status="failed"),
+                _ssnap("soon", "expiring", 3, expires_in=5),
+                _ssnap("nokms", "healthy", 1, kms=None, expires_in=100),
+            ]
+        },
+        {},
+    )
+    ec.add_response(
+        "describe_serverless_caches",
+        {
+            "ServerlessCaches": [
+                _scache("stale"),
+                _scache("failing"),
+                _scache("expiring"),
+                _scache("healthy"),
+                _scache("empty"),
+                _scache("noretention", retention=0),
+            ]
+        },
+        {},
+    )
+    out = cp.serverless_snapshots()
+    found = {(f["severity"], f.get("resource"), f["message"]) for f in out["findings"]}
+    assert any(r == "stale" and "no recent snapshot" in m and "30h" in m for _, r, m in found)
+    assert ("warning", "failing", "snapshot bad failed") in found
+    assert ("warning", "failing", "no available snapshot") in found
+    assert any(r == "expiring" and "expires in 5h" in m for _, r, m in found)
+    assert any(sev == "info" and "no customer KMS key" in m and m.startswith("1 ") for sev, _, m in found)
+    assert ("warning", "empty", "no available snapshot") in found
+    assert any(r == "noretention" and "SnapshotRetentionLimit is unset" in m for _, r, m in found)
+    assert not any(r == "healthy" and sev == "warning" for sev, r, _ in found)
+    assert out["count"] == 4 and out["serverless_snapshots"][0]["size_bytes"] == 1048576
+
+
+def test_serverless_snap_healthy_has_no_findings_and_filters_pass_through(aws):
+    cp, ec, _ = aws
+    ec.add_response(
+        "describe_serverless_cache_snapshots",
+        {"ServerlessCacheSnapshots": [_ssnap("s", "c1", 3, expires_in=200)], "NextToken": "t"},
+        {"ServerlessCacheName": "c1", "SnapshotType": "automatic"},
+    )
+    ec.add_response(
+        "describe_serverless_cache_snapshots",
+        {"ServerlessCacheSnapshots": [_ssnap("s2", "c1", 20, expires_in=200)]},
+        {"ServerlessCacheName": "c1", "SnapshotType": "automatic", "NextToken": "t"},
+    )
+    ec.add_response("describe_serverless_caches", {"ServerlessCaches": [_scache("c1")]}, {"ServerlessCacheName": "c1"})
+    out = cp.serverless_snapshots("c1", "automatic")
+    assert out["count"] == 2 and out["findings"] == []
+    assert out["cache_retention"] == [{"cache": "c1", "retention_limit_days": 7, "daily_snapshot_time": None}]
+
+
+def test_serverless_snap_cache_listing_denied_degrades_to_partial(aws):
+    cp, ec, _ = aws
+    ec.add_response("describe_serverless_cache_snapshots", {"ServerlessCacheSnapshots": [_ssnap("s", "c1", 50)]}, {})
+    ec.add_client_error("describe_serverless_caches", service_error_code="AccessDenied", http_status_code=403)
+    out = cp.serverless_snapshots()
+    assert out["partial"] is True and "AccessDenied" in out["notes"][0]
+    assert any("no recent snapshot" in f["message"] for f in out["findings"])
+
+
+def test_serverless_snap_access_denied_is_structured(aws):
+    cp, ec, _ = aws
+    ec.add_client_error("describe_serverless_cache_snapshots", service_error_code="AccessDenied", http_status_code=403)
+    out = cp.serverless_snapshots()
+    assert out["error"] == "AccessDenied" and out["hint"]
+
+
+def test_serverless_snap_iam_policy_lists_new_describe_actions():
+    import json
+    import re
+    from pathlib import Path
+
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    block = re.search(r"```json\n(\{\s*\"Version\".*?\})\n```", readme, flags=re.S)
+    actions = {a for st in json.loads(block.group(1))["Statement"] for a in st["Action"]}
+    assert "elasticache:DescribeServerlessCacheSnapshots" in actions
+    assert "elasticache:DescribeReservedCacheNodesOfferings" in actions
+
+
+# ------------------------------------------------------- reserved offerings
+
+YEAR = 365 * 24 * 3600
+OFFER_ARGS = {"CacheNodeType": "cache.r6g.large", "ProductDescription": "redis"}
+
+
+def _offer(oid, years, fixed, usage, kind="Partial Upfront", recurring=0.0):
+    return {
+        "ReservedCacheNodesOfferingId": oid,
+        "CacheNodeType": "cache.r6g.large",
+        "Duration": years * YEAR,
+        "FixedPrice": fixed,
+        "UsagePrice": usage,
+        "ProductDescription": "redis",
+        "OfferingType": kind,
+        "RecurringCharges": [{"RecurringChargeAmount": recurring, "RecurringChargeFrequency": "Hourly"}],
+    }
+
+
+def test_reserved_offerings_uncovered_finding_and_cheapest_per_term(aws):
+    cp, ec, _ = aws
+    ec.add_response(
+        "describe_reserved_cache_nodes_offerings",
+        {
+            "ReservedCacheNodesOfferings": [
+                _offer("y1-no", 1, 0, 0.0, "No Upfront", recurring=0.12),
+                _offer("y1-all", 1, 800, 0.0, "All Upfront"),
+                _offer("y3-all", 3, 1500, 0.0, "All Upfront"),
+                _offer("y3-part", 3, 700, 0.03, "Partial Upfront"),
+                _offer("y2", 2, 1, 0.0),
+            ]
+        },
+        OFFER_ARGS,
+    )
+    ec.add_response("describe_cache_clusters", {"CacheClusters": [_cc("c1", "cache.r6g.large", "redis", 5)]}, {})
+    ec.add_response(
+        "describe_reserved_cache_nodes",
+        {"ReservedCacheNodes": [_reservation("r1", "cache.r6g.large", "redis", 2)]},
+        {},
+    )
+    out = cp.reserved_offerings("cache.r6g.large", "redis")
+    assert out["uncovered_nodes"] == 3
+    assert out["cheapest_per_term"]["1y"]["id"] == "y1-all"  # 800/8760 = 0.0913 < 0.12
+    assert out["cheapest_per_term"]["3y"]["id"] == "y3-part"  # 0.03 + 700/26280 = 0.0566 < 0.0571
+    assert out["offerings_total"] == 4  # the 2y offering is dropped
+    msgs = [f["message"] for f in out["findings"]]
+    assert len(msgs) == 2 and all(m.startswith("3 uncovered cache.r6g.large redis node(s)") for m in msgs)
+    assert any("y1-all" in m and "$800.00 upfront" in m for m in msgs)
+
+
+def test_reserved_offerings_fully_covered_no_finding_and_output_capped(aws):
+    cp, ec, _ = aws
+    many = [_offer(f"o{i}", 1, 100 + i, 0.01) for i in range(30)]
+    ec.add_response("describe_reserved_cache_nodes_offerings", {"ReservedCacheNodesOfferings": many}, OFFER_ARGS)
+    ec.add_response("describe_cache_clusters", {"CacheClusters": [_cc("c1", "cache.r6g.large", "redis", 2)]}, {})
+    ec.add_response(
+        "describe_reserved_cache_nodes",
+        {"ReservedCacheNodes": [_reservation("r1", "cache.r6g.large", "redis", 2)]},
+        {},
+    )
+    out = cp.reserved_offerings("cache.r6g.large", "redis")
+    assert out["uncovered_nodes"] == 0 and out["findings"] == []
+    assert len(out["offerings"]) == 20 and out["offerings_total"] == 30
+
+
+def test_reserved_offerings_fleet_listing_denied_still_lists_offerings(aws):
+    cp, ec, _ = aws
+    ec.add_response(
+        "describe_reserved_cache_nodes_offerings",
+        {"ReservedCacheNodesOfferings": [_offer("a", 1, 10, 0.1)]},
+        OFFER_ARGS,
+    )
+    ec.add_client_error("describe_cache_clusters", service_error_code="AccessDenied", http_status_code=403)
+    out = cp.reserved_offerings("cache.r6g.large", "redis")
+    assert out["partial"] is True and out["uncovered_nodes"] is None and out["findings"] == []
+    assert out["offerings"][0]["id"] == "a"
+
+
+# --------------------------------------------------------- AZ placement
+
+
+def _member(cid, role, az):
+    return {"CacheClusterId": cid, "CurrentRole": role, "PreferredAvailabilityZone": az}
+
+
+def _placed_rg(members, multi_az="enabled"):
+    return {
+        "ReplicationGroupId": "rg1",
+        "Status": "available",
+        "MultiAZ": multi_az,
+        "AutomaticFailover": "enabled",
+        "NodeGroups": [{"NodeGroupId": "0001", "NodeGroupMembers": members, "ReaderEndpoint": {"Address": "r"}}],
+    }
+
+
+def _subnet_group(*azs):
+    return {
+        "CacheSubnetGroupName": "sg",
+        "VpcId": "vpc-1",
+        "Subnets": [{"SubnetIdentifier": f"s{i}", "SubnetAvailabilityZone": {"Name": az}} for i, az in enumerate(azs)],
+    }
+
+
+def _overview_stub(ec, cw, rg, subnet_azs):
+    ec.add_response("describe_replication_groups", {"ReplicationGroups": [rg]}, {"ReplicationGroupId": "rg1"})
+    ec.add_response(
+        "describe_cache_clusters",
+        {"CacheClusters": [{"CacheClusterId": "rg1-001", "ReplicationGroupId": "rg1", "CacheSubnetGroupName": "sg"}]},
+        {},
+    )
+    ec.add_response(
+        "describe_cache_subnet_groups",
+        {"CacheSubnetGroups": [_subnet_group(*subnet_azs)]},
+        {"CacheSubnetGroupName": "sg"},
+    )
+    cw.add_response("get_metric_data", {"MetricDataResults": []}, None)
+
+
+def test_overview_flags_single_az_placement_az_placement(aws):
+    cp, ec, cw = aws
+    rg = _placed_rg([_member("rg1-001", "primary", "us-east-1a"), _member("rg1-002", "replica", "us-east-1a")])
+    _overview_stub(ec, cw, rg, ["us-east-1a"])
+    out = cp.cluster_overview("rg1", minutes=60)
+    msgs = [f["message"] for f in out["findings"]]
+    assert any("subnet group sg spans 1 AZ(s)" in m for m in msgs)
+    assert any("Multi-AZ is enabled but all 2 nodes sit in us-east-1a" in m for m in msgs)
+
+
+def test_overview_flags_replica_sharing_primary_az_placement(aws):
+    cp, ec, cw = aws
+    rg = _placed_rg(
+        [
+            _member("rg1-001", "primary", "us-east-1a"),
+            _member("rg1-002", "replica", "us-east-1a"),
+            _member("rg1-003", "replica", "us-east-1b"),
+        ]
+    )
+    _overview_stub(ec, cw, rg, ["us-east-1a", "us-east-1b", "us-east-1c"])
+    out = cp.cluster_overview("rg1", minutes=60)
+    assert any("replica(s) rg1-002 share the primary's AZ us-east-1a" in f["message"] for f in out["findings"])
+
+
+def test_overview_healthy_multi_az_has_no_az_findings_placement(aws):
+    cp, ec, cw = aws
+    rg = _placed_rg([_member("rg1-001", "primary", "us-east-1a"), _member("rg1-002", "replica", "us-east-1b")])
+    _overview_stub(ec, cw, rg, ["us-east-1a", "us-east-1b"])
+    out = cp.cluster_overview("rg1", minutes=60)
+    assert not any("AZ" in f["message"] for f in out["findings"])
+
+
+def test_az_placement_without_subnet_data_two_nodes_two_azs_is_quiet_placement():
+    from mcp_elasticache_ops.controlplane import _az_placement_findings
+
+    rg = _placed_rg([_member("a", "primary", "x"), _member("b", "replica", "y")])
+    assert _az_placement_findings(rg, None) == []
+
+
+def test_serverless_snap_and_offerings_only_call_describe_apis():
+    rec = Recorder()
+
+    class Session:
+        def client(self, service, region_name=None, config=None):
+            return rec
+
+    cp = ControlPlane(ControlPlaneConfig(region=REGION), session_factory=Session, clock=lambda: NOW)
+    cp.serverless_snapshots("c1", "manual")
+    assert set(rec.calls) == {"describe_serverless_cache_snapshots", "describe_serverless_caches"}
+    assert all(op.startswith("describe_") for op in rec.calls)
+
+
+async def test_serverless_snap_tool_access_denied_is_a_structured_failure(monkeypatch):
+    class Session:
+        def client(self, service, region_name=None, config=None):
+            return _AlwaysFails(_boto_failures()["AccessDenied"])
+
+    plane = ControlPlane(ControlPlaneConfig(region=REGION), session_factory=Session, clock=lambda: NOW)
+    monkeypatch.setattr(server, "control_plane", lambda: plane)
+    async with Client(server.mcp) as client:
+        result = await client.call_tool("aws_serverless_snapshots", {}, raise_on_error=False)
+    assert not result.is_error
+    data = result.structured_content.get("result", result.structured_content)
+    assert data["error"] == "AccessDenied" and "IAM" in data["hint"]

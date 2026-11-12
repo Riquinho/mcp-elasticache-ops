@@ -135,6 +135,12 @@ NOEVICTION_USAGE_RATIO = 0.85  # noeviction at this fill level means OOM errors 
 FRAGMENTATION_HIGH = 1.5
 FRAGMENTATION_LOW = 1.0
 CLIENT_BUFFER_WARN_BYTES = 16 * 1024 * 1024  # client_recent_max_output_buffer / input buffer
+CONNECTIONS_WARN_RATIO = 0.80  # connected_clients / maxclients above this is a warning
+CONNECTIONS_CRIT_RATIO = 0.95  # ... and above this a critical
+CLIENT_MEMORY_SHARE = 0.10  # mem_clients_normal / used_memory above this is a warning
+CLIENT_MEMORY_FLOOR_BYTES = 8 * 1024 * 1024  # ... but only when client buffers hold at least this much
+CHURN_MIN_UPTIME_SECONDS = 600  # too early to average the connection rate before this
+CHURN_PER_SECOND = 20.0  # average new connections per second that hints at a missing connection pool
 
 
 def _persistence_findings(info: dict) -> list[str]:
@@ -158,6 +164,30 @@ def _buffer_findings(info: dict) -> list[str]:
                 f"client {label} buffer peaked at {int(size) // (1024 * 1024)} MiB ({key}); "
                 "slow consumers or huge replies, see node_clients"
             )
+    return out
+
+
+def _connection_findings(info: dict, maxclients: float) -> list[str]:
+    out: list[str] = []
+    clients = _num(info.get("connected_clients"))
+    if maxclients > 0 and clients / maxclients > CONNECTIONS_WARN_RATIO:
+        ratio = clients / maxclients
+        tail = "new clients are about to be refused" if ratio > CONNECTIONS_CRIT_RATIO else "headroom is shrinking"
+        out.append(f"connections at {ratio:.0%} of maxclients ({int(clients)}/{int(maxclients)}): {tail}")
+    used = _num(info.get("used_memory"))
+    buffers = _num(info.get("mem_clients_normal"))
+    if used > 0 and buffers >= CLIENT_MEMORY_FLOOR_BYTES and buffers / used > CLIENT_MEMORY_SHARE:
+        out.append(
+            f"client buffers hold {buffers / used:.0%} of used_memory ({int(buffers) // (1024 * 1024)} MiB "
+            "in mem_clients_normal); look for slow consumers, see node_clients"
+        )
+    uptime = _num(info.get("uptime_in_seconds"))
+    received = _num(info.get("total_connections_received"))
+    if uptime >= CHURN_MIN_UPTIME_SECONDS and received / uptime >= CHURN_PER_SECOND:
+        out.append(
+            f"connection churn: {received / uptime:.0f} new connections/s on average since start "
+            f"(total_connections_received={int(received)}); clients are probably not pooling connections"
+        )
     return out
 
 
@@ -215,11 +245,17 @@ def health_summary(r: redis.Redis, serverless: bool = False) -> dict:
         findings.append(f"replica link is {info.get('master_link_status')}")
     findings += _persistence_findings(info)
     findings += _buffer_findings(info)
+    maxclients = _num(info.get("maxclients"))
+    if not maxclients and _num(info.get("connected_clients")) > 0:
+        cfg, _ = _try(r.config_get, "maxclients")
+        maxclients = _num((cfg or {}).get("maxclients"))
+    findings += _connection_findings(info, maxclients)
     return {
         **engine_of(info),
         "role": info.get("role"),
         "uptime_seconds": info.get("uptime_in_seconds"),
         "connected_clients": info.get("connected_clients"),
+        "maxclients": int(maxclients) or None,
         "blocked_clients": info.get("blocked_clients"),
         "ops_per_sec": info.get("instantaneous_ops_per_sec"),
         "hit_ratio": round(hits / (hits + misses), 4) if hits + misses else None,
@@ -1289,12 +1325,59 @@ def _node_snapshot(info: dict) -> dict:
         "evicted_keys": int(_num(info.get("evicted_keys"))),
         "master_link_status": info.get("master_link_status"),
         "master_repl_offset": int(_num(info.get("master_repl_offset"))),
+        "slave_repl_offset": int(_num(info["slave_repl_offset"])) if "slave_repl_offset" in info else None,
         "replicas": [
             {"addr": f"{v.get('ip')}:{v.get('port')}", "offset": int(_num(v.get("offset"))), "lag": _num(v.get("lag"))}
             for k, v in info.items()
             if k.startswith("slave") and isinstance(v, dict)
         ],
     }
+
+
+def _shard_replication_check(
+    shards: list[dict], results: dict[str, dict], lag_bytes_threshold: int, reported: list[str]
+) -> tuple[list[dict], list[str]]:
+    """Per shard: replica offset lag, nodes whose INFO role contradicts CLUSTER NODES, and replica count.
+
+    Works on the INFO already fetched for every node; a node that errored is skipped (it is listed in
+    ``partial_nodes``), so one dead node never hides the verdict on the rest of its shard. Shards without a
+    replica are reported with ``replicas: 0`` (the topology findings carry the warning).
+    """
+    rows: list[dict] = []
+    findings: list[str] = []
+    for shard in shards:
+        primary = shard["primary"]
+        pres = results.get(primary, {})
+        if pres.get("role") == "slave":
+            findings.append(
+                f"shard primary {primary} reports role:slave although CLUSTER NODES lists it as primary "
+                "(failover in progress or stale topology)"
+            )
+        master_offset = pres["master_repl_offset"] if pres.get("role") == "master" else None
+        lags: dict[str, int] = {}
+        for ep in shard["replicas"]:
+            rres = results.get(ep, {})
+            if rres.get("role") == "master":
+                findings.append(f"replica {ep} of {primary} reports role:master (split or failover in progress)")
+                continue
+            offset = rres.get("slave_repl_offset")
+            if master_offset is None or offset is None:
+                continue
+            lags[ep] = master_offset - offset
+            if lags[ep] > lag_bytes_threshold and not any(f"replica {ep} of {primary} lags" in f for f in reported):
+                findings.append(
+                    f"replica {ep} of {primary} lags {lags[ep]} bytes (master_repl_offset {master_offset} "
+                    f"vs slave_repl_offset {offset})"
+                )
+        rows.append(
+            {
+                "primary": primary,
+                "replicas": len(shard["replicas"]),
+                "lag_bytes": lags,
+                "max_lag_bytes": max(lags.values(), default=None),
+            }
+        )
+    return rows, findings
 
 
 def cluster_health(
@@ -1354,9 +1437,19 @@ def cluster_health(
     for ep, res in results.items():
         if res.get("role") == "slave" and res.get("master_link_status") not in (None, "up"):
             findings.append(f"replica {ep} link is {res['master_link_status']}")
+    shard_rows, shard_findings = _shard_replication_check(topo["shards"], results, lag_bytes_threshold, findings)
+    findings += shard_findings
+    partial_nodes = [
+        {"node": ep, "status": "unreachable", "reason": res["error"]} for ep, res in results.items() if "error" in res
+    ] + [
+        {"node": ep, "status": "unreachable", "reason": "flagged as failing in CLUSTER NODES; not contacted"}
+        for ep in (_endpoint(n) for n in nodes if n["failing"])
+    ]
     return {
         "cluster_enabled": True,
         "nodes_probed": len(results),
+        "partial_nodes": partial_nodes,
+        "shard_replication": shard_rows,
         "slots_covered": topo["slots_covered"],
         "shards": topo["shards"],
         "topology_findings": topo["topology_findings"],
@@ -1858,8 +1951,14 @@ def _safe(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> tuple[Any, str |
         return None, f"{type(exc).__name__}: {exc}"
 
 
+_CONNECTIONS_PCT = re.compile(r"connections at (\d+)%")
+
+
 def _health_severity(message: str) -> str:
     if message.startswith(("replica link", "memory at", "noeviction at")):
+        return "critical"
+    match = _CONNECTIONS_PCT.match(message)
+    if match and int(match.group(1)) > CONNECTIONS_CRIT_RATIO * 100:
         return "critical"
     return "warning"
 

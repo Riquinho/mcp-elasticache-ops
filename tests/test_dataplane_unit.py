@@ -1155,3 +1155,149 @@ def test_cluster_slowlog_and_memory_report_partial_nodes_for_dead_shards():
     factory, _ = _fan_factory(clients)
     for out in (dataplane.cluster_slowlog(_seed(), factory), dataplane.cluster_memory(_seed(), factory)):
         assert [n["node"] for n in out["partial_nodes"]] == ["10.0.0.2:6379"]
+
+
+# ------------------------------------------------- round 07: connection pressure, client buffers, churn
+
+
+def test_triage_connections_near_maxclients_warning_and_critical():
+    _, msgs = _triage_messages(clients={"connected_clients": 850, "maxclients": 1000})
+    assert _find(msgs, "connections at 85% of maxclients (850/1000)")["severity"] == "warning"
+    _, crit = _triage_messages(clients={"connected_clients": 970, "maxclients": 1000})
+    assert _find(crit, "connections at 97% of maxclients")["severity"] == "critical"
+    _, ok = _triage_messages(clients={"connected_clients": 800, "maxclients": 1000})
+    assert not any("connections at" in m for m in ok)
+
+
+def test_connections_pressure_reads_maxclients_from_config_get_when_info_lacks_it():
+    class WithConfig(FakeRedis):
+        def config_get(self, pattern):
+            return {"maxclients": "100"} if pattern == "maxclients" else {}
+
+    r = WithConfig(infos=_risk_infos(clients={"connected_clients": 96}))
+    out = dataplane.health_summary(r)
+    assert any(f.startswith("connections at 96% of maxclients (96/100)") for f in out["findings"])
+    assert out["maxclients"] == 100
+    quiet = dataplane.health_summary(FakeRedis(infos=_risk_infos(clients={"connected_clients": 96})))
+    assert not any("maxclients" in f for f in quiet["findings"])
+
+
+def test_triage_blocked_clients_are_reported_and_silent_at_zero():
+    _, msgs = _triage_messages(clients={"blocked_clients": 4})
+    assert _find(msgs, "4 blocked clients")
+    _, none = _triage_messages(clients={"blocked_clients": 0})
+    assert not any("blocked clients" in m for m in none)
+
+
+def test_triage_client_buffers_share_of_used_memory():
+    mib = 1024 * 1024
+    _, msgs = _triage_messages(memory={"used_memory": 100 * mib, "mem_clients_normal": 30 * mib})
+    assert _find(msgs, "client buffers hold 30% of used_memory (30 MiB")["severity"] == "warning"
+    _, small_share = _triage_messages(memory={"used_memory": 1000 * mib, "mem_clients_normal": 30 * mib})
+    assert not any("client buffers hold" in m for m in small_share)
+    _, tiny = _triage_messages(memory={"used_memory": 10 * mib, "mem_clients_normal": 4 * mib})
+    assert not any("client buffers hold" in m for m in tiny)
+
+
+def test_triage_connection_churn_hints_at_missing_pooling():
+    # uptime is 6000 s in the healthy fixture: 300_000 connections = 50/s
+    _, msgs = _triage_messages(stats={"total_connections_received": 300_000})
+    assert _find(msgs, "connection churn: 50 new connections/s")["severity"] == "warning"
+    _, calm = _triage_messages(stats={"total_connections_received": 6_000})
+    assert not any("connection churn" in m for m in calm)
+    young = _risk_infos(stats={"total_connections_received": 5_000})
+    young["server"]["uptime_in_seconds"] = 60  # too early to average
+    assert not any("connection churn" in f for f in dataplane.health_summary(FakeRedis(infos=young))["findings"])
+
+
+# ------------------------------------------------- round 07: cluster replica lag and role mismatch
+
+
+def _two_shard_topology():
+    return (
+        "p1 10.0.0.1:6379@1 master - 0 0 1 connected 0-8191\n"
+        "p2 10.0.0.2:6379@1 master - 0 0 2 connected 8192-16383\n"
+        "r1 10.0.0.3:6379@1 slave p1 0 0 1 connected\n"
+        "r2 10.0.0.4:6379@1 slave p2 0 0 2 connected\n"
+    )
+
+
+def _repl_infos(**over):
+    infos = {
+        "10.0.0.1:6379": {"role": "master", "master_repl_offset": 9_000_000},
+        "10.0.0.2:6379": {"role": "master", "master_repl_offset": 4_000_000},
+        "10.0.0.3:6379": {"role": "slave", "master_link_status": "up", "slave_repl_offset": 9_000_000},
+        "10.0.0.4:6379": {"role": "slave", "master_link_status": "up", "slave_repl_offset": 4_000_000},
+    }
+    infos.update(over)
+    return infos
+
+
+def test_cluster_health_replica_offset_lag_per_shard():
+    infos = _repl_infos(
+        **{"10.0.0.3:6379": {"role": "slave", "master_link_status": "up", "slave_repl_offset": 6_000_000}}
+    )
+    seed, factory, _ = _fleet(_two_shard_topology(), infos)
+    out = dataplane.cluster_health(seed, factory)
+    lag = [f for f in out["findings"] if "lags" in f]
+    assert lag == [
+        "replica 10.0.0.3:6379 of 10.0.0.1:6379 lags 3000000 bytes "
+        "(master_repl_offset 9000000 vs slave_repl_offset 6000000)"
+    ]
+    row = next(r for r in out["shard_replication"] if r["primary"] == "10.0.0.1:6379")
+    assert row["max_lag_bytes"] == 3_000_000 and row["replicas"] == 1
+    assert out["partial_nodes"] == []
+
+
+def test_cluster_health_caught_up_replicas_are_silent():
+    seed, factory, _ = _fleet(_two_shard_topology(), _repl_infos())
+    out = dataplane.cluster_health(seed, factory)
+    assert out["findings"] == ["no skew, lag or coverage problems detected"]
+    assert [r["max_lag_bytes"] for r in out["shard_replication"]] == [0, 0]
+
+
+def test_cluster_health_replica_reporting_master_is_a_role_mismatch():
+    infos = _repl_infos(**{"10.0.0.4:6379": {"role": "master", "master_repl_offset": 4_000_100}})
+    seed, factory, _ = _fleet(_two_shard_topology(), infos)
+    out = dataplane.cluster_health(seed, factory)
+    assert (
+        "replica 10.0.0.4:6379 of 10.0.0.2:6379 reports role:master (split or failover in progress)" in out["findings"]
+    )
+    infos = _repl_infos(**{"10.0.0.1:6379": {"role": "slave", "master_link_status": "up"}})
+    seed, factory, _ = _fleet(_two_shard_topology(), infos)
+    out = dataplane.cluster_health(seed, factory)
+    assert any("shard primary 10.0.0.1:6379 reports role:slave" in f for f in out["findings"])
+
+
+def test_cluster_health_shard_without_replica_is_reported_with_zero_replicas():
+    topo = "p1 10.0.0.1:6379@1 master - 0 0 1 connected 0-16383\n"
+    seed, factory, _ = _fleet(topo, {"10.0.0.1:6379": {"role": "master", "master_repl_offset": 5}})
+    out = dataplane.cluster_health(seed, factory)
+    assert out["shard_replication"] == [
+        {"primary": "10.0.0.1:6379", "replicas": 0, "lag_bytes": {}, "max_lag_bytes": None}
+    ]
+    assert any("no shard has a replica" in f["message"] for f in out["topology_findings"])
+
+
+def test_cluster_health_timed_out_replica_is_isolated_in_partial_nodes():
+    class SlowOnReplica(FakeRedis):
+        def info(self, section=None):
+            if self.infos["all"].get("role") == "slave" and self.infos["all"].get("slow"):
+                time.sleep(0.5)
+            return super().info(section)
+
+    infos = _repl_infos(**{"10.0.0.3:6379": {"role": "slave", "slow": True, "slave_repl_offset": 1}})
+    seed = FakeRedis(infos={"cluster": {"cluster_enabled": 1}})
+    seed.commands["CLUSTER NODES"] = _two_shard_topology()
+
+    def factory(host, port):
+        return SlowOnReplica(infos={"all": infos[f"{host}:{port}"]})
+
+    t0 = time.monotonic()
+    out = dataplane.cluster_health(seed, factory, per_node_timeout=0.05)
+    assert time.monotonic() - t0 < 0.4
+    assert out["partial_nodes"][0]["node"] == "10.0.0.3:6379"
+    assert "timeout" in out["partial_nodes"][0]["reason"]
+    assert out["nodes_probed"] == 4
+    assert not any("lags" in f for f in out["findings"])  # the healthy shard still gets its verdict
+    assert any("10.0.0.3:6379 unreachable" in f for f in out["findings"])

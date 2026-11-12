@@ -68,6 +68,8 @@ SUM_STAT_METRICS = {
 SWAP_WARN_BYTES = 50 * 1024 * 1024
 MAXCLIENTS_DEFAULT = 65_000  # ElastiCache default maxclients
 MAX_QUERIES_PER_CALL = 500  # GetMetricData limit
+OFFERING_TERMS = frozenset({1, 3})
+MAX_OFFERINGS = 20
 ALLOWED_PREFIXES = ("describe_", "list_", "get_metric_data")
 
 OVERVIEW_WINDOW_MINUTES = 360
@@ -273,18 +275,45 @@ class ControlPlane:
 
         return self._guard(run)
 
-    def _member_engine_versions(self) -> dict[str, tuple[str, str]]:
-        """Replication group id -> (engine, engine version); best effort, never fails the tool."""
+    def _member_clusters(self) -> list[dict]:
+        """All cache clusters; best effort, never fails the tool."""
         try:
-            clusters = self._paginate("describe_cache_clusters", "CacheClusters")
+            return self._paginate("describe_cache_clusters", "CacheClusters")
         except (BotoCoreError, ClientError):
-            return {}
+            return []
+
+    def _member_engine_versions(self, clusters: list[dict] | None = None) -> dict[str, tuple[str, str]]:
+        """Replication group id -> (engine, engine version); best effort, never fails the tool."""
         out: dict[str, tuple[str, str]] = {}
-        for c in clusters:
+        for c in self._member_clusters() if clusters is None else clusters:
             rg = c.get("ReplicationGroupId")
             if rg and c.get("EngineVersion"):
                 out.setdefault(rg, (str(c.get("Engine", "")), str(c["EngineVersion"])))
         return out
+
+    def _subnet_group_azs(self, clusters: list[dict], replication_group_id: str) -> tuple[str, set[str]] | None:
+        """Subnet group name and AZs of a replication group, from the member data already fetched.
+
+        Makes one extra DescribeCacheSubnetGroups call only when a member names its subnet group; best effort."""
+        name = next(
+            (
+                c["CacheSubnetGroupName"]
+                for c in clusters
+                if c.get("ReplicationGroupId") == replication_group_id and c.get("CacheSubnetGroupName")
+            ),
+            None,
+        )
+        if not name:
+            return None
+        try:
+            groups = self._paginate("describe_cache_subnet_groups", "CacheSubnetGroups", CacheSubnetGroupName=name)
+        except (BotoCoreError, ClientError):
+            return None
+        if not groups:
+            return None
+        return name, {
+            az for sn in groups[0].get("Subnets", []) if (az := (sn.get("SubnetAvailabilityZone") or {}).get("Name"))
+        }
 
     def cache_clusters(self, cache_cluster_id: str | None = None, show_nodes: bool = True) -> dict:
         def run() -> dict:
@@ -299,18 +328,73 @@ class ControlPlane:
 
         return self._guard(run)
 
+    def _paginate_token(self, op: str, key: str, **kwargs) -> list[dict]:
+        """Like _paginate, for the serverless operations that page with NextToken."""
+        if not op.startswith(ALLOWED_PREFIXES):
+            raise ValueError(f"refusing non-read-only API call {op!r}")
+        ec = self.client("elasticache")
+        items: list[dict] = []
+        token = None
+        while True:
+            page = getattr(ec, op)(**({**kwargs, "NextToken": token} if token else kwargs))
+            items.extend(page.get(key, []))
+            token = page.get("NextToken")
+            if not token:
+                return items
+
     def serverless_caches(self) -> dict:
         def run() -> dict:
-            ec = self.client("elasticache")
-            items, token = [], None
-            while True:
-                page = ec.describe_serverless_caches(**({"NextToken": token} if token else {}))
-                items.extend(page.get("ServerlessCaches", []))
-                token = page.get("NextToken")
-                if not token:
-                    break
+            items = self._paginate_token("describe_serverless_caches", "ServerlessCaches")
             findings = [f for c in items for f in _serverless_cache_findings(c)]
             return {"count": len(items), "findings": _sorted_findings(findings), "serverless_caches": _jsonable(items)}
+
+        return self._guard(run)
+
+    def serverless_snapshots(
+        self,
+        serverless_cache_name: str | None = None,
+        snapshot_type: str | None = None,
+        stale_hours: int = 24,
+    ) -> dict:
+        def run() -> dict:
+            kwargs: dict[str, Any] = {}
+            if serverless_cache_name:
+                kwargs["ServerlessCacheName"] = serverless_cache_name
+            if snapshot_type:
+                kwargs["SnapshotType"] = snapshot_type
+            snaps = self._paginate_token("describe_serverless_cache_snapshots", "ServerlessCacheSnapshots", **kwargs)
+            notes: list[str] = []
+            caches: list[dict] | None
+            try:
+                caches = self._paginate_token(
+                    "describe_serverless_caches",
+                    "ServerlessCaches",
+                    **({"ServerlessCacheName": serverless_cache_name} if serverless_cache_name else {}),
+                )
+            except (BotoCoreError, ClientError) as exc:
+                caches = None
+                notes.append(
+                    f"per-cache retention skipped: DescribeServerlessCaches failed ({_error_code(exc)}); "
+                    "only the snapshot list is checked"
+                )
+            now = self._clock()
+            views = [_serverless_snapshot_view(s, now) for s in snaps]
+            findings = _serverless_snapshot_findings(views, caches, now, stale_hours)
+            retention = [
+                {
+                    "cache": c.get("ServerlessCacheName"),
+                    "retention_limit_days": c.get("SnapshotRetentionLimit"),
+                    "daily_snapshot_time": c.get("DailySnapshotTime"),
+                }
+                for c in caches or []
+            ]
+            return {
+                "count": len(views),
+                "findings": _sorted_findings(findings),
+                "serverless_snapshots": views,
+                "cache_retention": retention,
+                **({"partial": True, "notes": notes} if caches is None else {}),
+            }
 
         return self._guard(run)
 
@@ -706,6 +790,75 @@ class ControlPlane:
                 "reserved_cache_nodes": views,
                 "note": notes[0],
                 **({"partial": True, "notes": notes[1:]} if clusters is None else {}),
+            }
+
+        return self._guard(run)
+
+    def reserved_offerings(self, node_type: str, engine: str) -> dict:
+        """Matching 1y/3y offerings plus the number of running nodes no reservation covers. Never purchases."""
+
+        def run() -> dict:
+            engine_key = engine.lower()
+            raw = self._paginate(
+                "describe_reserved_cache_nodes_offerings",
+                "ReservedCacheNodesOfferings",
+                CacheNodeType=node_type,
+                ProductDescription=engine_key,
+            )
+            offerings = [o for o in (_offering_view(r) for r in raw) if o["term_years"] in OFFERING_TERMS]
+            notes: list[str] = []
+            uncovered: int | None = None
+            try:
+                clusters = self._paginate("describe_cache_clusters", "CacheClusters")
+                reserved = self._paginate("describe_reserved_cache_nodes", "ReservedCacheNodes")
+            except (BotoCoreError, ClientError) as exc:
+                notes.append(f"uncovered-node count skipped: listing failed ({_error_code(exc)})")
+            else:
+                running = sum(
+                    int(c.get("NumCacheNodes") or 1)
+                    for c in clusters
+                    if c.get("CacheNodeType") == node_type
+                    and str(c.get("Engine", "")).lower() == engine_key
+                    and str(c.get("CacheClusterStatus", "")).lower() not in {"deleting", "deleted"}
+                )
+                held = sum(
+                    int(r.get("CacheNodeCount") or 0)
+                    for r in reserved
+                    if r.get("State") == "active"
+                    and r.get("CacheNodeType") == node_type
+                    and str(r.get("ProductDescription", "")).lower() == engine_key
+                )
+                uncovered = max(0, running - held)
+            cheapest = {
+                term: min(group, key=lambda o: o["effective_hourly"])
+                for term in sorted(OFFERING_TERMS)
+                if (group := [o for o in offerings if o["term_years"] == term])
+            }
+            findings: list[dict] = []
+            if not offerings:
+                findings.append(finding("info", f"no 1y/3y offerings for {node_type} {engine_key}"))
+            elif uncovered:
+                for term, o in cheapest.items():
+                    findings.append(
+                        finding(
+                            "info",
+                            f"{uncovered} uncovered {node_type} {engine_key} node(s); cheapest {term}y offering "
+                            f"{o['id']} ({o['offering_type']}): ${o['fixed_price']:.2f} upfront + "
+                            f"${o['hourly_price']:.4f}/h per node",
+                            resource=o["id"],
+                        )
+                    )
+            offerings.sort(key=lambda o: (o["term_years"], o["effective_hourly"]))
+            return {
+                "node_type": node_type,
+                "engine": engine_key,
+                "uncovered_nodes": uncovered,
+                "findings": _sorted_findings(findings),
+                "cheapest_per_term": {f"{t}y": o for t, o in cheapest.items()},
+                "offerings": offerings[:MAX_OFFERINGS],
+                "offerings_total": len(offerings),
+                "note": "Prices are per node. This tool never purchases anything.",
+                **({"partial": True, "notes": notes} if notes else {}),
             }
 
         return self._guard(run)
@@ -1219,10 +1372,11 @@ class ControlPlane:
             if not groups:
                 return {"error": "NotFound", "message": f"replication group {replication_group_id} not found"}
             g = groups[0]
-            versions = self._member_engine_versions()
-            engine_version = versions.get(replication_group_id)
+            member_clusters = self._member_clusters()
+            engine_version = self._member_engine_versions(member_clusters).get(replication_group_id)
             topology = _overview_topology(g, engine_version)
-            findings = _rg_findings(g, engine_version) + _reader_findings(g)
+            subnet = self._subnet_group_azs(member_clusters, replication_group_id)
+            findings = _rg_findings(g, engine_version) + _reader_findings(g) + _az_placement_findings(g, subnet)
             nodes = {n["cluster_id"]: n for s in topology["shards"] for n in s["nodes"]}
             status, summary, series = "ok", {}, {}
             if nodes:
@@ -1521,6 +1675,56 @@ def _worst_status(findings: list[dict]) -> str:
     return "ok"
 
 
+def _az_placement_findings(g: dict, subnet: tuple[str, set[str]] | None) -> list[dict]:
+    """Cross-check node AZ placement against Multi-AZ and the subnet group; uses data already fetched."""
+    out: list[dict] = []
+    multi_az = g.get("MultiAZ") == "enabled"
+    all_azs: set[str] = set()
+    node_count = 0
+    for ng in g.get("NodeGroups", []):
+        members = ng.get("NodeGroupMembers", [])
+        node_count += len(members)
+        all_azs |= {m["PreferredAvailabilityZone"] for m in members if m.get("PreferredAvailabilityZone")}
+    if subnet is not None and len(subnet[1]) < 2:
+        name, azs = subnet
+        out.append(
+            finding(
+                "warning",
+                f"subnet group {name} spans {len(azs)} AZ(s); replicas cannot be placed across AZs",
+                resource=name,
+            )
+        )
+    if multi_az and node_count > 1 and len(all_azs) == 1:
+        out.append(finding("warning", f"Multi-AZ is enabled but all {node_count} nodes sit in {next(iter(all_azs))}"))
+        return out  # per-shard detail would only repeat this
+    available = len(subnet[1]) if subnet is not None else len(all_azs)
+    for ng in g.get("NodeGroups", []):
+        members = ng.get("NodeGroupMembers", [])
+        primary = next((m for m in members if m.get("CurrentRole") == "primary"), None)
+        shard_azs = {m["PreferredAvailabilityZone"] for m in members if m.get("PreferredAvailabilityZone")}
+        if (
+            primary is None
+            or not primary.get("PreferredAvailabilityZone")
+            or len(shard_azs) >= min(len(members), available)
+        ):
+            continue
+        sharing = [
+            m.get("CacheClusterId")
+            for m in members
+            if m is not primary and m.get("PreferredAvailabilityZone") == primary["PreferredAvailabilityZone"]
+        ]
+        if sharing:
+            out.append(
+                finding(
+                    "warning" if multi_az else "info",
+                    f"node group {ng.get('NodeGroupId')}: replica(s) {', '.join(map(str, sharing))} share the "
+                    f"primary's AZ {primary['PreferredAvailabilityZone']} although {available} AZ(s) are available",
+                    resource=ng.get("NodeGroupId"),
+                )
+            )
+    return out
+
+
 def _triage_rg_findings(g: dict) -> list[dict]:
     out: list[dict] = []
     status = g.get("Status")
@@ -1532,6 +1736,7 @@ def _triage_rg_findings(g: dict) -> list[dict]:
         out.append(finding("warning", "automatic failover is not enabled: a primary failure needs manual action"))
     if g.get("MultiAZ") not in (None, "enabled"):
         out.append(finding("warning", "Multi-AZ is not enabled"))
+    out += _az_placement_findings(g, None)
     for ng in g.get("NodeGroups", []):
         members = ng.get("NodeGroupMembers", [])
         if ng.get("Status") not in (None, "available"):
@@ -1881,6 +2086,104 @@ def _snapshot_findings(views: list[dict], now: dt.datetime, stale_hours: int) ->
     old_manual = [v for v in views if not v["automatic"] and (v["age_hours"] or 0) > 90 * 24]
     if old_manual:
         findings.append(finding("info", f"{len(old_manual)} manual snapshot(s) older than 90 days (storage cost)"))
+    return findings
+
+
+def _offering_view(r: dict) -> dict:
+    seconds = int(r.get("Duration") or 0)
+    years = round(seconds / (365 * 24 * 3600))
+    hourly = float(r.get("UsagePrice") or 0.0) + sum(
+        float(c.get("RecurringChargeAmount") or 0.0)
+        for c in r.get("RecurringCharges") or []
+        if str(c.get("RecurringChargeFrequency", "")).lower() == "hourly"
+    )
+    fixed = float(r.get("FixedPrice") or 0.0)
+    return {
+        "id": r.get("ReservedCacheNodesOfferingId"),
+        "term_years": years,
+        "offering_type": r.get("OfferingType"),
+        "fixed_price": fixed,
+        "hourly_price": round(hourly, 6),
+        "effective_hourly": round(hourly + fixed / (seconds / 3600), 6) if seconds else hourly,
+    }
+
+
+def _bytes_used(text: str | None) -> int | None:
+    value = (text or "").strip()
+    return int(value) if value.isdigit() else _size_bytes(value)
+
+
+def _serverless_snapshot_view(s: dict, now: dt.datetime) -> dict:
+    created = s.get("CreateTime")
+    expiry = s.get("ExpiryTime")
+    config = s.get("ServerlessCacheConfiguration") or {}
+    return {
+        "name": s.get("ServerlessCacheSnapshotName"),
+        "cache": config.get("ServerlessCacheName"),
+        "engine": config.get("Engine"),
+        "type": s.get("SnapshotType"),
+        "status": s.get("Status"),
+        "created_at": created.isoformat() if created else None,
+        "age_hours": round((now - created).total_seconds() / 3600, 1) if created else None,
+        "expires_at": expiry.isoformat() if expiry else None,
+        "expires_in_hours": round((expiry - now).total_seconds() / 3600, 1) if expiry else None,
+        "size_bytes": _bytes_used(s.get("BytesUsedForCache")),
+        "kms_key_id": s.get("KmsKeyId"),
+    }
+
+
+def _serverless_snapshot_findings(
+    views: list[dict], caches: list[dict] | None, now: dt.datetime, stale_hours: int
+) -> list[dict]:
+    findings: list[dict] = []
+    by_cache: dict[str, list[dict]] = defaultdict(list)
+    for v in views:
+        by_cache[str(v["cache"])].append(v)
+        if str(v["status"]).lower() == "failed":
+            findings.append(finding("warning", f"snapshot {v['name']} failed", resource=v["cache"]))
+    names = sorted(by_cache) if caches is None else sorted(str(c.get("ServerlessCacheName")) for c in caches)
+    expiring_limit = 24.0
+    for name in names:
+        items = by_cache.get(name, [])
+        ok = [v for v in items if str(v["status"]).lower() == "available" and v["age_hours"] is not None]
+        if not ok:
+            findings.append(finding("warning", "no available snapshot", resource=name))
+            continue
+        newest = min(ok, key=lambda v: v["age_hours"])
+        if newest["age_hours"] > stale_hours:
+            findings.append(
+                finding(
+                    "warning",
+                    f"no recent snapshot: newest available one is {newest['age_hours']:.0f}h old (limit {stale_hours}h)",
+                    resource=name,
+                )
+            )
+        exp = newest["expires_in_hours"]
+        if exp is not None and exp < expiring_limit:
+            findings.append(
+                finding(
+                    "warning",
+                    f"newest snapshot {newest['name']} expires in {max(exp, 0):.0f}h and no later one exists",
+                    resource=name,
+                )
+            )
+    missing_kms = [v for v in views if not v["kms_key_id"]]
+    if missing_kms:
+        findings.append(
+            finding(
+                "info",
+                f"{len(missing_kms)} snapshot(s) have no customer KMS key (service-owned key encryption)",
+            )
+        )
+    for c in caches or []:
+        if str(c.get("Engine") or "").lower() != "memcached" and not c.get("SnapshotRetentionLimit"):
+            findings.append(
+                finding(
+                    "warning",
+                    "SnapshotRetentionLimit is unset: automatic snapshots are not retained",
+                    resource=c.get("ServerlessCacheName"),
+                )
+            )
     return findings
 
 

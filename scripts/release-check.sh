@@ -3,7 +3,8 @@
 #   1. CHANGELOG.md has a section for the version in pyproject.toml (or an "Unreleased" section);
 #   2. the tool count in README.md equals the number of tools the server registers;
 #   3. every registered tool has a row in the README tool table;
-#   4. every environment variable named in config.py is documented in README.md.
+#   4. every registered tool name appears somewhere in README.md (derived from the server registry);
+#   5. every environment variable named in config.py is documented in README.md.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -31,6 +32,11 @@ if not claimed or int(claimed.group(1)) != len(registered):
 config_src = Path("src/mcp_elasticache_ops/config.py").read_text(encoding="utf-8")
 env_vars = set(re.findall(r'"((?:ELASTICACHE|MEMCACHED|MCP|AWS)_[A-Z0-9_]+)"', config_src))
 problems += [f"environment variable {n} (config.py) is not documented in README.md" for n in sorted(env_vars) if not re.search(rf"(?<![A-Z0-9_]){n}(?![A-Z0-9_])", readme)]
+problems += [
+    f"tool {n} is registered but its name does not appear in README.md"
+    for n in sorted(registered)
+    if not re.search(rf"(?<![a-z_]){n}(?![a-z_])", readme)
+]
 problems += [f"tool {n} missing from the README table" for n in sorted(registered - documented)]
 problems += [f"README table lists unknown tool {n}" for n in sorted(documented - registered)]
 if problems:

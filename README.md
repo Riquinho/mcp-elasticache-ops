@@ -10,7 +10,7 @@ written from scratch for ElastiCache.
 
 ## Tools
 
-All 39 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
+All 41 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 
 **Data plane** (redis-py, talks to the node endpoint)
 
@@ -29,7 +29,7 @@ All 39 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `node_replication` | Role, replicas with byte lag, link status, backlog; findings for lagging or link-down replicas, offset gap vs the primary, `replica-read-only`, `min-replicas-to-write`, `cluster-allow-reads-when-down`. Engine-version quirks (no `CLUSTER SHARDS` before 7.0, ...) come back as `notes`, not errors |
 | `node_cluster` | Cluster mode: `CLUSTER INFO`, slots per primary, `CLUSTER SHARDS` |
 | `node_cluster_nodes` | `CLUSTER NODES` parsed into shards (primary, replicas, slots, failing nodes) and per-shard endpoints |
-| `node_cluster_health` | Fan-out `INFO` to every node (bounded concurrency, per-node timeout): memory/ops skew, replica lag, link status, uncovered slots |
+| `node_cluster_health` | Fan-out `INFO` to every node (bounded concurrency, per-node timeout): memory/ops skew, replica lag per shard (`master_repl_offset` vs `slave_repl_offset`), replicas reporting `role:master`, link status, uncovered slots; nodes that time out are listed in `partial_nodes` |
 | `node_cluster_keyspace_sample` | Cluster-wide `node_keyspace_sample`: fans out to every primary (bounded concurrency, `max_seconds` split across primaries) and merges big/hot/cold keys with a `shard` label; per-shard `ok`/`partial`/`unreachable`, a dead shard never fails the call |
 | `node_cluster_slowlog` | Same fan-out for `SLOWLOG GET`: merged slowest commands labelled by shard |
 | `node_cluster_memory` | Same fan-out for memory: per-shard used/maxmemory/fragmentation/evictions, skew and >90% findings |
@@ -48,10 +48,12 @@ All 39 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `aws_parameters` | `DescribeCacheParameters` (user-modified by default) |
 | `aws_metrics` | CloudWatch `AWS/ElastiCache` metrics: findings first, then min/avg/max/latest; series only with `include_series`; `replication_group_id` queries every member node |
 | `aws_snapshots` | `DescribeSnapshots`: retention gaps, failed and missing automatic backups, old manual snapshots |
+| `aws_serverless_snapshots` | `DescribeServerlessCacheSnapshots` + `DescribeServerlessCaches`: caches with no available snapshot in `stale_hours` (default 24), failed snapshots, newest snapshot about to expire, snapshots without a customer KMS key, unset per-cache retention; a failing cache listing degrades to `partial` |
 | `aws_users` | `DescribeUsers` (RBAC): `~* +@all` access strings and users without a password; no secret material is returned |
 | `aws_user_groups` | `DescribeUserGroups`: unattached groups, non-active status |
 | `aws_global_replication_groups` | `DescribeGlobalReplicationGroups`: members per region, status, missing secondary |
 | `aws_reserved_nodes` | `DescribeReservedCacheNodes` vs running nodes: coverage by exact node type and engine, unused reservations, reservations expiring with nodes still running; a failing cluster listing degrades to `partial` with the reservation list intact |
+| `aws_reserved_offerings` | `DescribeReservedCacheNodesOfferings` for a `node_type` and `engine` (opt-in, capped at 20): 1y/3y offerings, uncovered running nodes and the cheapest offering per term (upfront + hourly). Never purchases |
 | `aws_service_updates` | `DescribeServiceUpdates`: pending updates, past or near apply-by dates |
 | `aws_subnet_groups` | `DescribeCacheSubnetGroups`: AZ spread (Multi-AZ needs 2+) |
 | `aws_triage` | One call per replication group: status/Multi-AZ/failover, last 6h events, CloudWatch peaks per member (EngineCPU, memory %, Evictions, ReplicationLag, CurrConnections), pending service updates, newest snapshot. Worst-first findings (max 30); a failing section is reported `unavailable` |
@@ -88,6 +90,9 @@ and `node_memory` emit:
 | Failed persistence | `rdb_last_bgsave_status` or `aof_last_write_status` not `ok` | warning |
 | Replica link down | `master_link_status` not `up` on a replica | critical |
 | Large client buffers | `client_recent_max_output_buffer` or `..._input_buffer` >= 16 MiB; per client `omem + qbuf` >= 10 MiB in `node_triage` | warning |
+| Connection pressure | `connected_clients / maxclients` > 80% (warning), > 95% (critical); `maxclients` from INFO or `CONFIG GET` | warning / critical |
+| Client buffer memory | `mem_clients_normal` >= 8 MiB and > 10% of `used_memory` | warning |
+| Connection churn | `total_connections_received / uptime` >= 20 per second after 10 minutes of uptime (missing pooling) | warning |
 | Memcached evictions, low hit ratio | evictions > 0, hit ratio < 80% over at least 100 gets | warning |
 | Memcached evictions below limit | evictions > 0 while `bytes` < 70% of `limit_maxbytes` | warning |
 | Memcached huge items | node >= 90% full with an average item of 256 KiB or more | info |
@@ -146,10 +151,12 @@ Generated from `safe_client.py`; the tests fail if this drifts from the code.
         "elasticache:DescribeCacheParameterGroups",
         "elasticache:DescribeCacheEngineVersions",
         "elasticache:DescribeSnapshots",
+        "elasticache:DescribeServerlessCacheSnapshots",
         "elasticache:DescribeUsers",
         "elasticache:DescribeUserGroups",
         "elasticache:DescribeGlobalReplicationGroups",
         "elasticache:DescribeReservedCacheNodes",
+        "elasticache:DescribeReservedCacheNodesOfferings",
         "elasticache:DescribeServiceUpdates",
         "elasticache:DescribeUpdateActions",
         "elasticache:DescribeCacheSubnetGroups",

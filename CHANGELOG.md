@@ -1,8 +1,24 @@
 # Changelog
 
-## Unreleased (round 05)
+## Unreleased
 
 ### Added
+- `aws_serverless_snapshots` (`DescribeServerlessCacheSnapshots` + `DescribeServerlessCaches`): caches without an
+  available snapshot in `stale_hours` (default 24), failed snapshots, a newest snapshot expiring within 24h, snapshots
+  without a customer KMS key and unset per-cache retention; a failing cache listing degrades to `partial`.
+- `aws_reserved_offerings` (opt-in, `DescribeReservedCacheNodesOfferings`): capped 1y/3y offerings for a node type and
+  engine, the number of running nodes no reservation covers and the cheapest offering per term (upfront + hourly).
+  Never purchases. Tool count is now 41; the IAM policy gains both Describe actions.
+- `aws_cluster_overview` and `aws_triage` cross-check node AZ placement: Multi-AZ enabled with every node in one AZ,
+  replicas sharing the primary's AZ while more AZs exist, subnet groups with fewer than 2 AZs (one
+  `DescribeCacheSubnetGroups` call, only when a member names its subnet group).
+- `node_health` / `node_triage` findings: connections vs `maxclients` (warning > 80%, critical > 95%; `CONFIG GET
+  maxclients` when INFO lacks it), `mem_clients_normal` share of `used_memory`, connection churn from
+  `total_connections_received` over uptime. `node_health` gains `maxclients`.
+- `node_cluster_health`: per-shard replica offset lag (`master_repl_offset` vs `slave_repl_offset`), nodes whose INFO
+  role contradicts `CLUSTER NODES`, a `shard_replication` summary (replica count per shard), and a top-level
+  `partial_nodes` list for nodes that timed out or were not contacted.
+- `scripts/release-check.sh` fails when a registered MCP tool name does not appear in the README text.
 - `aws_reserved_nodes`: expiring reservations report how many matching nodes still run; a failing
   `DescribeCacheClusters` degrades to `partial` with a note instead of dropping the reservation list.
 - `release-check.sh` also fails when an environment variable read in `config.py` is missing from the README; CI fails when
@@ -29,7 +45,7 @@
   cluster-health integration test. `scripts/release-check.sh` (CHANGELOG entry for the pyproject version, README tool
   count) runs in CI.
 
-## Unreleased (round 04)
+## Earlier work: round 04
 
 ### Added
 - `node_triage`: one-call snapshot (health, memory, replication, clients, failed commandstats, slowlog, latency),
@@ -45,7 +61,7 @@
 ### Changed
 - Tool count is now 37 (was 34).
 
-## Unreleased (round 01)
+## Earlier work: round 01
 
 ### Security
 - `SafeRedis`: strict command parsing (no whitespace, newlines or extra tokens in command names) and a

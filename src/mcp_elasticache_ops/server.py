@@ -476,6 +476,19 @@ def aws_snapshots(
 
 
 @read_tool
+def aws_serverless_snapshots(
+    serverless_cache_name: str | None = None,
+    snapshot_type: Annotated[
+        Literal["automatic", "manual"] | None, Field(description="Filter by snapshot type")
+    ] = None,
+    stale_hours: Annotated[int, Field(ge=1, le=8760, description="Flag caches whose newest snapshot is older")] = 24,
+) -> dict:
+    """DescribeServerlessCacheSnapshots plus DescribeServerlessCaches: findings for caches without a
+    recent snapshot, failed snapshots, snapshots about to expire, missing KMS key and unset retention."""
+    return control_plane().serverless_snapshots(serverless_cache_name, snapshot_type, stale_hours)
+
+
+@read_tool
 def aws_users(engine: Annotated[Literal["redis", "valkey"] | None, Field(description="Engine filter")] = None) -> dict:
     """DescribeUsers (RBAC): authentication type and access strings, never passwords.
     Flags users with '~* +@all' access and users without a password."""
@@ -499,6 +512,16 @@ def aws_reserved_nodes() -> dict:
     """DescribeReservedCacheNodes plus running nodes: reservation coverage per node type and
     engine, on-demand nodes not covered, unused or soon-expiring reservations."""
     return control_plane().reserved_nodes()
+
+
+@read_tool
+def aws_reserved_offerings(
+    node_type: Annotated[str, Field(description="Node type, e.g. cache.r6g.large", min_length=1, max_length=64)],
+    engine: Annotated[Literal["redis", "valkey", "memcached"], Field(description="Cache engine")],
+) -> dict:
+    """DescribeReservedCacheNodesOfferings: 1y/3y offerings for a node type and engine (capped), the number of
+    running nodes no reservation covers and the cheapest offering per term. Never purchases anything."""
+    return control_plane().reserved_offerings(node_type, engine)
 
 
 @read_tool
