@@ -12,6 +12,7 @@ from botocore.exceptions import (
     ClientError,
 )
 
+from ..quirks import drift_quirks
 from ._shared import (
     _SEVERITY_ORDER,
     FLEET_DEADLINE_SECONDS,
@@ -71,6 +72,16 @@ def _drift_findings(group_a: str, group_b: str, diffs: list[dict], families: dic
                     resource=d["parameter"],
                 )
             )
+    for q, why, param in drift_quirks(fa, fb, [d["parameter"] for d in diffs]):
+        out.append(
+            finding(
+                "info",
+                f"{why}: {q.quirk}; {q.remediation}",
+                category="engine-quirk",
+                quirk=q.key,
+                **({"resource": param} if param else {}),
+            )
+        )
     if diffs:
         out.append(finding("info", f"{len(diffs)} modified parameter(s) differ between {group_a} and {group_b}"))
     else:

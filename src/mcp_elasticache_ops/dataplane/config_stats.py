@@ -6,6 +6,7 @@ from typing import Any
 
 import redis
 
+from .. import quirks
 from ..safe_client import CONFIG_GET_EXACT, CONFIG_GET_PREFIXES
 from ._core import (
     _SEVERITY_RANK,
@@ -144,8 +145,7 @@ def _valkey_config_findings(cfg: dict[str, str], server: dict) -> list[dict]:
         out.append(
             _cfg_finding(
                 "info",
-                "io-threads is 1 on Valkey 8+: all socket I/O shares the main thread. If EngineCPUUtilization is "
-                "high with many clients, raise io-threads in the parameter group (needs a node type with spare vCPUs).",
+                f"io-threads is 1 on Valkey 8+: {quirks.text('valkey-io-threads')}",
                 "io-threads",
             )
         )
@@ -154,8 +154,7 @@ def _valkey_config_findings(cfg: dict[str, str], server: dict) -> list[dict]:
         out.append(
             _cfg_finding(
                 "info",
-                f"{', '.join(off)} is off: large key deletes, expiry and eviction free memory on the main thread "
-                "and can stall it. Valkey 8 defaults these to yes.",
+                f"{', '.join(off)} is off: {quirks.text('valkey-lazyfree')}",
                 off[0],
             )
         )

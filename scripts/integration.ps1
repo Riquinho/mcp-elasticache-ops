@@ -25,6 +25,13 @@ function Invoke-Docker {
     if ($Wsl) { & wsl -d $Distro -e docker @args } else { & docker @args }
 }
 
+if ($Wsl) { & wsl -d $Distro -e docker info *> $null } else { & docker info *> $null }
+if ($LASTEXITCODE -ne 0) {
+    $via = if ($Wsl) { "wsl -d $Distro -e docker" } else { 'docker' }
+    Write-Host "INTEGRATION SKIPPED: '$via info' failed (docker missing or daemon down). Try the other -Wsl value or start Docker in the distro."
+    exit 0
+}
+
 $free = [math]::Round((Get-PSDrive -Name $Drive).Free / 1GB, 1)
 $reduced = $false
 if ($free -lt $MinFreeGB) {

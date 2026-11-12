@@ -206,6 +206,36 @@ def _finding(severity: str, message: str, **extra: Any) -> dict:
     return {"severity": severity, "message": message, **extra}
 
 
+# Cluster-mode replies a node can give while slots move or a failover is under way. They are a state of that node
+# right now, not a reason to abort a fan-out: each one becomes a per-node finding with what it means.
+_CLUSTER_REPLIES: dict[str, tuple[str, str]] = {
+    "MOVED": ("warning", "slot ownership changed (failover or resharding); the seed's topology view is stale, re-run"),
+    "ASK": ("warning", "a slot is migrating and this node redirected the request; resharding in progress, re-run"),
+    "CLUSTERDOWN": ("critical", "the cluster reports itself down (uncovered slots or no quorum)"),
+    "LOADING": ("warning", "the node is loading its dataset (restart or full resync after a failover); retry shortly"),
+    "TRYAGAIN": ("warning", "multi-key operation hit a slot that is mid-migration or mid-failover; retry shortly"),
+}
+
+
+def _node_error(exc: BaseException) -> tuple[str, str, str]:
+    """``(kind, severity, text)`` for an exception raised by one node of a fan-out.
+
+    ``kind`` is MOVED, ASK, CLUSTERDOWN, LOADING or TRYAGAIN for those replies and ``error`` for anything else."""
+    head = str(exc).strip().split(" ", 1)[0].upper() if str(exc).strip() else ""
+    by_type = {
+        redis.exceptions.MovedError: "MOVED",
+        redis.exceptions.AskError: "ASK",
+        redis.exceptions.ClusterDownError: "CLUSTERDOWN",
+        redis.exceptions.BusyLoadingError: "LOADING",
+        redis.exceptions.TryAgainError: "TRYAGAIN",
+    }
+    kind = next((name for cls, name in by_type.items() if isinstance(exc, cls)), head)
+    if kind in _CLUSTER_REPLIES:
+        severity, meaning = _CLUSTER_REPLIES[kind]
+        return kind, severity, f"{kind} reply ({meaning}): {exc}"
+    return "error", "critical", f"{type(exc).__name__}: {exc}"
+
+
 def _pairs(raw: Any) -> dict[str, Any]:
     """CLUSTER SHARDS entries arrive as dicts (RESP3, newer redis-py) or flat key/value lists (RESP2)."""
     if isinstance(raw, dict):

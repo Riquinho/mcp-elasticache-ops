@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import datetime as dt
-import re
-from collections import defaultdict
 from collections.abc import Callable
 from typing import Any
 
@@ -16,9 +13,7 @@ from botocore.exceptions import (
 )
 
 from ._shared import (
-    _CRITICAL_EVENT_WORDS,
     _PENDING_ACTION_STATUSES,
-    _SEVERITY_ORDER,
     FLEET_DEADLINE_SECONDS,
     MAX_FLEET_FINDINGS,
     SERVERLESS_METRICS,
@@ -41,118 +36,64 @@ from ._shared import (
     finding,
     is_burstable,
 )
+from .failover import failover_readiness_findings
 from .security import _SecurityMixin
+from .triage_events import (  # noqa: F401
+    _FAILOVER_EVENT,
+    _WARNING_EVENT_WORDS,
+    CORRELATION_CONN_DROP,
+    CORRELATION_HOURS,
+    CORRELATION_LAG_SECONDS,
+    CORRELATION_MINUTES,
+    MAX_CORRELATED_EVENTS,
+    TRIAGE_METRICS,
+    _as_utc,
+    _failover_findings,
+    _series_points,
+    _triage_event_findings,
+    _triage_peaks,
+    _triage_update_findings,
+)
+from .triage_overview import (  # noqa: F401
+    MAX_FLEET_GROUPS_PER_REGION,
+    MAX_OVERVIEW_FINDINGS,
+    MAX_OVERVIEW_SHARDS,
+    OUTLIER_FLOORS,
+    OUTLIER_RATIO,
+    OVERVIEW_METRICS,
+    OVERVIEW_P95,
+    OVERVIEW_WINDOW_MINUTES,
+    RIGHTSIZE_CPU_P95,
+    RIGHTSIZE_MEMORY_P95,
+    _median,
+    _overview_outliers,
+    _overview_rightsizing,
+    _overview_topology,
+    _prod_like,
+    _reader_findings,
+    _signal,
+)
+from .triage_shards import (  # noqa: F401
+    MAX_HOT_SHARD_FINDINGS,
+    MAX_SHARD_MEMBERS,
+    SHARD_HOT_CPU,
+    SHARD_HOT_RATIO,
+    SHARD_IDLE_CPU,
+    SHARD_ITEMS_RATIO,
+    SHARD_MEMORY_POINTS,
+    SHARD_MEMORY_RATIO,
+    SHARD_METRICS,
+    SHARD_PINNED_CPU,
+    SHARD_TRAFFIC_RATIO,
+    SHARD_WINDOW_MINUTES,
+    _shard_balance_findings,
+    _shard_layout,
+    _shard_stats,
+)
 
 # Burstable (cache.t*) nodes throttle to baseline CPU when the credit balance hits zero; only these
 # node types report the credit metrics, so they are requested for them alone.
 BURSTABLE_METRICS = ["CPUCreditBalance", "CPUCreditUsage"]
-
-
-OVERVIEW_WINDOW_MINUTES = 360
-
-
-OVERVIEW_METRICS = [
-    "EngineCPUUtilization",
-    "DatabaseMemoryUsagePercentage",
-    "ReplicationLag",
-    "Evictions",
-    "CurrConnections",
-    "NewConnections",
-]
-
-
-OVERVIEW_P95 = ("EngineCPUUtilization", "DatabaseMemoryUsagePercentage")
-
-
-MAX_OVERVIEW_FINDINGS = 30
-
-
-MAX_FLEET_GROUPS_PER_REGION = 20
-
-
-MAX_OVERVIEW_SHARDS = 50
-
-
-# aws_shard_balance: one GetMetricData call per node-group member, nothing from the data plane.
-SHARD_METRICS = [
-    "EngineCPUUtilization",
-    "DatabaseMemoryUsagePercentage",
-    "NetworkBytesIn",
-    "NetworkBytesOut",
-    "CurrItems",
-]
-
-
-SHARD_WINDOW_MINUTES = 60
-
-
-MAX_SHARD_MEMBERS = 100  # members queried (one call each); primaries first
-
-
-MAX_HOT_SHARD_FINDINGS = 5
-
-
-SHARD_HOT_RATIO = 2.0  # hot shard: CPU above this multiple of the median shard ...
-
-
-SHARD_HOT_CPU = 50.0  # ... and above this absolute EngineCPUUtilization (percent)
-
-
-SHARD_PINNED_CPU = 90.0  # a primary at or above this ...
-
-
-SHARD_IDLE_CPU = 20.0  # ... while every other shard stays under this is a hot-key signature
-
-
-SHARD_MEMORY_RATIO = 1.5
-
-
-SHARD_MEMORY_POINTS = 20.0  # memory skew needs this many percentage points over the median shard
-
-
-SHARD_ITEMS_RATIO = 2.0
-
-
-SHARD_TRAFFIC_RATIO = 3.0
-
-
-# Failover/maintenance events matched against the metric window in the triage tools.
-CORRELATION_HOURS = 24
-
-
-CORRELATION_MINUTES = 30  # metrics are compared this long before and after an event
-
-
-CORRELATION_LAG_SECONDS = 1.0
-
-
-CORRELATION_CONN_DROP = 0.5  # CurrConnections falling by this fraction counts as a drop
-
-
-MAX_CORRELATED_EVENTS = 3
-
-
-_FAILOVER_EVENT = re.compile(r"failover.*complet|primary.*changed|node.*replaced|replaced.*node", re.IGNORECASE)
-
-
-OUTLIER_RATIO = 1.5
-
-
-# Ignore outliers below these floors: 3x of almost nothing is still almost nothing.
-OUTLIER_FLOORS = {
-    "EngineCPUUtilization": 10.0,
-    "DatabaseMemoryUsagePercentage": 20.0,
-    "Evictions": 1.0,
-    "CurrConnections": 50.0,
-    "NewConnections": 50.0,
-    "ReplicationLag": 1.0,
-}
-
-
-RIGHTSIZE_MEMORY_P95 = 30.0
-
-
-RIGHTSIZE_CPU_P95 = 20.0
 
 
 TRIAGE_WINDOW_HOURS = 6
@@ -161,161 +102,10 @@ TRIAGE_WINDOW_HOURS = 6
 MAX_TRIAGE_FINDINGS = 30
 
 
-TRIAGE_METRICS = [
-    "EngineCPUUtilization",
-    "DatabaseMemoryUsagePercentage",
-    "Evictions",
-    "ReplicationLag",
-    "GlobalDatastoreReplicationLag",
-    "CurrConnections",
-]
-
-
 _TRIAGE_FATAL = {"ReplicationGroupNotFoundFault"}  # nothing useful to report: surface it as the tool error
 
 
 SERVERLESS_TRIAGE_FATAL = frozenset({"ServerlessCacheNotFoundFault"})
-
-
-def _signal(s: dict | None) -> dict:
-    if not s or not s.get("points"):
-        return {}
-    return {"avg": s["avg"], "max": s["max"], "latest": s["latest"], "sum": s["sum"]}
-
-
-def _median(values: list[float]) -> float:
-    ordered = sorted(values)
-    mid = len(ordered) // 2
-    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
-
-
-def _overview_topology(g: dict, engine_version: tuple[str, str] | None) -> dict:
-    shards = []
-    for ng in g.get("NodeGroups", []):
-        nodes = [
-            {
-                "cluster_id": m.get("CacheClusterId"),
-                "role": m.get("CurrentRole") or "unknown",
-                "az": m.get("PreferredAvailabilityZone"),
-            }
-            for m in ng.get("NodeGroupMembers", [])
-        ]
-        shards.append(
-            {
-                "shard": ng.get("NodeGroupId"),
-                "replicas": sum(1 for n in nodes if n["role"] != "primary"),
-                "azs": sorted({n["az"] for n in nodes if n["az"]}),
-                "reader_endpoint": bool(ng.get("ReaderEndpoint")),
-                "nodes": nodes,
-            }
-        )
-    return {
-        "shard_count": len(shards),
-        "replicas_per_shard": sorted({s["replicas"] for s in shards}),
-        "node_type": g.get("CacheNodeType"),
-        "automatic_failover": g.get("AutomaticFailover"),
-        "multi_az": g.get("MultiAZ"),
-        "cluster_mode": g.get("ClusterMode") or ("enabled" if g.get("ClusterEnabled") else "disabled"),
-        "engine": engine_version[0] if engine_version else g.get("Engine"),
-        "engine_version": engine_version[1] if engine_version else None,
-        "az_spread": sorted({a for s in shards for a in s["azs"]}),
-        "shards": shards,
-    }
-
-
-def _prod_like(g: dict) -> bool:
-    text = f"{g.get('ReplicationGroupId', '')} {g.get('Description', '')}".lower()
-    return bool(re.search(r"prod|prd|live", text)) or g.get("MultiAZ") == "enabled"
-
-
-def _reader_findings(g: dict) -> list[dict]:
-    """Missing reader endpoint or no replica in a prod-like group (a single node has no failover target)."""
-    out: list[dict] = []
-    if not _prod_like(g):
-        return out
-    cluster_mode = bool(g.get("ClusterEnabled")) or g.get("ClusterMode") == "enabled"
-    for ng in g.get("NodeGroups", []):
-        members = ng.get("NodeGroupMembers", [])
-        replicas = sum(1 for m in members if m.get("CurrentRole") != "primary")
-        shard = ng.get("NodeGroupId")
-        if replicas < 1:
-            out.append(
-                finding(
-                    "critical",
-                    f"shard {shard}: no replicas in a prod-like group; no failover target and no read scaling",
-                    resource=shard,
-                )
-            )
-        elif not ng.get("ReaderEndpoint") and not cluster_mode:
-            out.append(
-                finding(
-                    "warning",
-                    f"shard {shard}: replicas exist but no reader endpoint is exposed; reads cannot be balanced",
-                    resource=shard,
-                )
-            )
-    return out
-
-
-def _overview_outliers(shards: list[dict]) -> list[dict]:
-    """Nodes whose signal is above 1.5x the median of their peers (same role), worst ratio first."""
-    out: list[dict] = []
-    for role in ("primary", "replica"):
-        peers = [(n, s["shard"]) for s in shards for n in s["nodes"] if (n["role"] == "primary") == (role == "primary")]
-        for metric in OVERVIEW_METRICS:
-            if metric == "ReplicationLag" and role == "primary":
-                continue
-            vals = [(n["signals"].get(metric, {}).get("avg"), n["cluster_id"], shard) for n, shard in peers]
-            vals = [v for v in vals if v[0] is not None]
-            if len(vals) < 3:
-                continue
-            median = _median([v[0] for v in vals])
-            if median <= 0:
-                continue
-            for value, cid, shard in vals:
-                if value > OUTLIER_RATIO * median and value >= OUTLIER_FLOORS[metric]:
-                    out.append(
-                        finding(
-                            "warning",
-                            f"{role} {cid} (shard {shard}): {metric} avg {value:.4g} is {value / median:.1f}x the "
-                            f"{role} median {median:.4g}; skewed keys or traffic",
-                            resource=cid,
-                            shard=shard,
-                            metric=metric,
-                            ratio=round(value / median, 2),
-                        )
-                    )
-    return sorted(out, key=lambda f: -f["ratio"])
-
-
-def _overview_rightsizing(shards: list[dict], node_type: str | None, minutes: int) -> list[dict]:
-    primaries = [n for s in shards for n in s["nodes"] if n["role"] == "primary" and n.get("p95")]
-    mem = [n["p95"].get("DatabaseMemoryUsagePercentage") for n in primaries]
-    cpu = [n["p95"].get("EngineCPUUtilization") for n in primaries]
-    if not primaries or any(v is None for v in mem + cpu):
-        return []
-    mem_p95, cpu_p95 = max(mem), max(cpu)
-    window = f"over {minutes} minutes"
-    tiered = bool(node_type and re.match(r"cache\.r\dgd\.", node_type))
-    out: list[dict] = []
-    if mem_p95 < RIGHTSIZE_MEMORY_P95 and cpu_p95 < RIGHTSIZE_CPU_P95:
-        msg = (
-            f"right-sizing: worst primary memory p95 {mem_p95:.0f}% and CPU p95 {cpu_p95:.0f}% {window}; "
-            "a smaller node type (or fewer shards) would likely carry this load"
-        )
-        if tiered:
-            msg += "; data tiering (r6gd) is already in use, check whether the SSD tier is needed at all"
-        out.append(finding("info", msg, category="right-sizing"))
-    elif mem_p95 >= 70 and cpu_p95 < RIGHTSIZE_CPU_P95 and not tiered:
-        out.append(
-            finding(
-                "info",
-                f"right-sizing: memory-bound (p95 {mem_p95:.0f}%) with idle CPU (p95 {cpu_p95:.0f}%) {window}; "
-                "consider data tiering (cache.r6gd) to trade cold-key RAM for SSD instead of more shards",
-                category="right-sizing",
-            )
-        )
-    return out
 
 
 class _TriageEmpty(BotoCoreError):
@@ -406,297 +196,6 @@ def _triage_rg_findings(g: dict) -> list[dict]:
             out.append(finding("warning", f"node group {ng.get('NodeGroupId')} has no replica: failover is impossible"))
     if g.get("PendingModifiedValues"):
         out.append(finding("info", "has pending modified values"))
-    return out
-
-
-_WARNING_EVENT_WORDS = ("failover", "replac", "reboot", "restart", "removed", "recover")
-
-
-def _triage_event_findings(events: list[dict]) -> tuple[list[dict], int]:
-    ranked: list[tuple[int, dt.datetime | None, dict]] = []
-    for e in events:
-        msg = str(e.get("Message", ""))
-        low = msg.lower()
-        if any(w in low for w in _CRITICAL_EVENT_WORDS):
-            sev = "critical"
-        elif any(w in low for w in _WARNING_EVENT_WORDS):
-            sev = "warning"
-        else:
-            continue
-        when = e.get("Date")
-        stamp = when.isoformat() if isinstance(when, dt.datetime) else when
-        ranked.append(
-            (
-                _SEVERITY_ORDER[sev],
-                when if isinstance(when, dt.datetime) else None,
-                finding(sev, f"event {stamp}: {msg}", resource=e.get("SourceIdentifier")),
-            )
-        )
-    # worst first, newest first within a severity; keep the section bounded
-    ranked.sort(key=lambda t: (t[0], -(t[1].timestamp() if t[1] else 0)))
-    return [f for _, _, f in ranked[:5]], len(ranked)
-
-
-def _triage_peaks(summary: dict[str, dict[str, dict]]) -> dict[str, dict]:
-    peaks: dict[str, dict] = {}
-    for member, metrics in summary.items():
-        for name in TRIAGE_METRICS:
-            s = metrics.get(name) or {}
-            if not s.get("points"):
-                continue
-            value = s["sum"] if name == "Evictions" else s["max"]
-            if name not in peaks or value > peaks[name]["value"]:
-                peaks[name] = {"member": member, "value": value}
-    return peaks
-
-
-def _triage_update_findings(actions: list[dict], now: dt.datetime) -> list[dict]:
-    out: list[dict] = []
-    for a in actions:
-        name = a.get("ServiceUpdateName")
-        sev = str(a.get("ServiceUpdateSeverity") or "low")
-        apply_by = a.get("ServiceUpdateRecommendedApplyByDate")
-        if apply_by and apply_by < now:
-            out.append(finding("critical", f"{name} ({sev}) is past its recommended apply-by date", resource=name))
-        elif sev in {"critical", "important"}:
-            out.append(finding("warning", f"{sev} service update {name} is pending", resource=name))
-        else:
-            out.append(finding("info", f"{sev} service update {name} is pending", resource=name))
-    return out
-
-
-# ------------------------------------------------------------------ shard balance
-
-
-def _shard_layout(g: dict) -> list[dict]:
-    """Shards of a replication group as shard/members dicts, the primary first in each member list."""
-    out = []
-    for ng in g.get("NodeGroups", []):
-        found = [(m.get("CacheClusterId"), m.get("CurrentRole")) for m in ng.get("NodeGroupMembers", [])]
-        ids = [str(cid) for cid, _ in found if cid]
-        primary = next((str(cid) for cid, role in found if cid and role == "primary"), None)
-        ordered = ([primary] if primary else []) + [cid for cid in ids if cid != primary]
-        out.append({"shard": str(ng.get("NodeGroupId", "")), "members": ordered, "has_primary": primary is not None})
-    return out
-
-
-def _shard_stats(shard: dict, summary: dict[str, dict[str, dict]]) -> dict:
-    """One shard's signals, read from its primary (the first member); replicas add the read-side CPU peak."""
-    members = shard["members"]
-    primary = members[0] if members else None
-
-    def pick(member: str | None, name: str, key: str) -> float | None:
-        s = (summary.get(member or "") or {}).get(name) or {}
-        return s.get(key) if s.get("points") else None
-
-    replica_cpu = [pick(m, "EngineCPUUtilization", "max") for m in members[1:]]
-    return {
-        "shard": shard["shard"],
-        "primary": primary if shard["has_primary"] else None,
-        "members": members,
-        "cpu_avg": pick(primary, "EngineCPUUtilization", "avg"),
-        "cpu_p95": pick(primary, "EngineCPUUtilization", "p95"),
-        "cpu_max": pick(primary, "EngineCPUUtilization", "max"),
-        "memory_avg": pick(primary, "DatabaseMemoryUsagePercentage", "avg"),
-        "memory_max": pick(primary, "DatabaseMemoryUsagePercentage", "max"),
-        "network_in_avg_bytes": pick(primary, "NetworkBytesIn", "avg"),
-        "network_out_avg_bytes": pick(primary, "NetworkBytesOut", "avg"),
-        "curr_items": pick(primary, "CurrItems", "latest"),
-        "replica_cpu_max": max((v for v in replica_cpu if v is not None), default=None),
-    }
-
-
-def _shard_balance_findings(stats: list[dict]) -> list[dict]:
-    out: list[dict] = []
-    label = {x["shard"]: x["primary"] or (x["members"][0] if x["members"] else "?") for x in stats}
-    if len(stats) < 2:
-        out.append(
-            finding(
-                "info",
-                "single-shard group: skew between shards cannot be assessed; for a hot key on one primary use "
-                "node_clients, node_commandstats and node_keyspace_sample",
-                category="shard-balance",
-            )
-        )
-        return out
-    for x in stats:
-        if x["cpu_avg"] is None and x["memory_avg"] is None:
-            out.append(finding("info", f"shard {x['shard']}: no datapoints returned for {label[x['shard']]}"))
-    cpu = [x for x in stats if x["cpu_avg"] is not None]
-    pinned: str | None = None
-    if len(cpu) >= 2:
-        median = _median([x["cpu_avg"] for x in cpu])
-        hottest = max(cpu, key=lambda x: x["cpu_avg"])
-        others = [x["cpu_avg"] for x in cpu if x is not hottest]
-        if hottest["cpu_avg"] >= SHARD_PINNED_CPU and all(v < SHARD_IDLE_CPU for v in others):
-            pinned = hottest["shard"]
-            out.append(
-                finding(
-                    "critical",
-                    f"shard {pinned} primary {label[pinned]} is pinned at {hottest['cpu_avg']:.0f}% "
-                    f"EngineCPUUtilization (p95 {hottest['cpu_p95']:.0f}%) while the other {len(others)} shard(s) "
-                    f"stay under {max(others):.0f}%: the hot-key signature (one key or hash slot), not a capacity "
-                    "problem, so more shards will not help. Find the key with node_clients, node_commandstats and "
-                    "node_keyspace_sample, then split it or cache it in the client",
-                    category="hot-key",
-                    shard=pinned,
-                )
-            )
-        hot = [x for x in cpu if x["cpu_avg"] > SHARD_HOT_RATIO * median and x["cpu_avg"] > SHARD_HOT_CPU]
-        for x in sorted(hot, key=lambda x: -x["cpu_avg"])[:MAX_HOT_SHARD_FINDINGS]:
-            if x["shard"] == pinned:
-                continue
-            ratio = f"{x['cpu_avg'] / median:.1f}x" if median > 0 else "far above"
-            out.append(
-                finding(
-                    "warning",
-                    f"hot shard {x['shard']} ({label[x['shard']]}): EngineCPUUtilization avg {x['cpu_avg']:.0f}% is "
-                    f"{ratio} the median shard ({median:.0f}%) and above {SHARD_HOT_CPU:.0f}%",
-                    category="hot-shard",
-                    shard=x["shard"],
-                )
-            )
-    memory = [x for x in stats if x["memory_avg"] is not None]
-    if len(memory) >= 2:
-        median = _median([x["memory_avg"] for x in memory])
-        for x in sorted(memory, key=lambda x: -x["memory_avg"]):
-            value = x["memory_avg"]
-            if value >= SHARD_MEMORY_RATIO * median and value - median >= SHARD_MEMORY_POINTS:
-                out.append(
-                    finding(
-                        "critical" if value >= 90 else "warning",
-                        f"memory skew: shard {x['shard']} ({label[x['shard']]}) uses {value:.0f}% against a median "
-                        f"of {median:.0f}%: uneven key distribution (large keys or hash tags); rebalance slots or "
-                        "review the key design before this shard starts evicting",
-                        category="memory-skew",
-                        shard=x["shard"],
-                    )
-                )
-    items = [x for x in stats if x["curr_items"] is not None]
-    if len(items) >= 2:
-        median = _median([x["curr_items"] for x in items])
-        for x in items:
-            if median > 0 and x["curr_items"] > SHARD_ITEMS_RATIO * median:
-                out.append(
-                    finding(
-                        "info",
-                        f"shard {x['shard']} holds {x['curr_items']:.0f} items, {x['curr_items'] / median:.1f}x the "
-                        f"median shard ({median:.0f}): uneven key counts per shard",
-                        category="item-skew",
-                        shard=x["shard"],
-                    )
-                )
-    traffic = [
-        (x, (x["network_in_avg_bytes"] or 0) + (x["network_out_avg_bytes"] or 0))
-        for x in stats
-        if x["network_in_avg_bytes"] is not None or x["network_out_avg_bytes"] is not None
-    ]
-    if len(traffic) >= 2:
-        median = _median([t for _, t in traffic])
-        for x, total in traffic:
-            if median > 0 and total > SHARD_TRAFFIC_RATIO * median:
-                out.append(
-                    finding(
-                        "info",
-                        f"shard {x['shard']} moves {total / median:.1f}x the median shard's network bytes: "
-                        "traffic is concentrated on one shard",
-                        category="traffic-skew",
-                        shard=x["shard"],
-                    )
-                )
-    return out
-
-
-# ------------------------------------------------------------------ failover correlation
-
-
-def _as_utc(value: Any) -> dt.datetime | None:
-    if isinstance(value, str):
-        try:
-            value = dt.datetime.fromisoformat(value)
-        except ValueError:
-            return None
-    if not isinstance(value, dt.datetime):
-        return None
-    return value if value.tzinfo else value.replace(tzinfo=dt.UTC)
-
-
-def _series_points(series: dict[str, dict[str, dict]], metric: str) -> dict[dt.datetime, list[float]]:
-    """Datapoints of one metric across every member, grouped by timestamp."""
-    out: dict[dt.datetime, list[float]] = defaultdict(list)
-    for per_member in series.values():
-        data = per_member.get(metric) or {}
-        for ts, value in zip(data.get("timestamps", []), data.get("values", []), strict=False):
-            when = _as_utc(ts)
-            if when is not None and isinstance(value, (int, float)):
-                out[when].append(float(value))
-    return out
-
-
-def _failover_findings(
-    events: list[dict],
-    now: dt.datetime,
-    series: dict[str, dict[str, dict]],
-    resource: str,
-    metric_hours: int,
-) -> list[dict]:
-    """Recent failover/maintenance events (last 24h) lined up against ReplicationLag and CurrConnections."""
-    horizon = now - dt.timedelta(hours=CORRELATION_HOURS)
-    recent: list[tuple[dt.datetime, dict]] = []
-    for e in events:
-        when = _as_utc(e.get("Date"))
-        if when is None or when < horizon or when > now + dt.timedelta(minutes=5):
-            continue
-        if _FAILOVER_EVENT.search(str(e.get("Message", ""))):
-            recent.append((when, e))
-    recent.sort(key=lambda t: t[0], reverse=True)
-    lag = _series_points(series, "ReplicationLag")
-    conns = _series_points(series, "CurrConnections")
-    covered_from = now - dt.timedelta(hours=metric_hours)
-    after = dt.timedelta(minutes=CORRELATION_MINUTES)
-    out: list[dict] = []
-    for when, e in recent[:MAX_CORRELATED_EVENTS]:
-        age_min = max(0.0, (now - when).total_seconds() / 60)
-        stamp = when.isoformat()
-        parts: list[str] = []
-        lag_peak = max(
-            ((max(v), t) for t, v in lag.items() if when <= t <= when + after and max(v) >= CORRELATION_LAG_SECONDS),
-            default=None,
-        )
-        if lag_peak:
-            parts.append(
-                f"ReplicationLag peaked at {lag_peak[0]:.1f}s {(lag_peak[1] - when).total_seconds() / 60:.0f} min "
-                "after the event"
-            )
-        before = [sum(v) for t, v in conns.items() if when - after <= t < when]
-        later = [(sum(v), t) for t, v in conns.items() if when <= t <= when + after]
-        if before and later:
-            baseline = sum(before) / len(before)
-            trough = min(later, key=lambda x: x[0])
-            if baseline > 0 and trough[0] <= baseline * (1 - CORRELATION_CONN_DROP):
-                parts.append(
-                    f"CurrConnections dropped {100 * (1 - trough[0] / baseline):.0f}% (from about {baseline:.0f} to "
-                    f"{trough[0]:.0f}) {(trough[1] - when).total_seconds() / 60:.0f} min after the event: "
-                    "clients lost their connections and had to reconnect"
-                )
-        if parts:
-            impact = "; ".join(parts)
-        elif when < covered_from:
-            impact = f"the event predates the {metric_hours}h metric window, so impact cannot be checked here"
-        else:
-            impact = "no ReplicationLag or CurrConnections impact visible in the metrics"
-        recent_window = age_min <= metric_hours * 60
-        out.append(
-            finding(
-                "warning" if recent_window else "info",
-                f"recent failover/maintenance: '{str(e.get('Message', '')).strip()}' at {stamp} "
-                f"({age_min:.0f} min ago): {impact}",
-                resource=e.get("SourceIdentifier") or resource,
-                section="events",
-                category="failover-correlation",
-                event_time=stamp,
-            )
-        )
     return out
 
 
@@ -1185,6 +684,44 @@ class _TriageMixin(_SecurityMixin):
                 },
                 "shards": ranked[:MAX_OVERVIEW_SHARDS],
                 "shards_total": len(ranked),
+                **({"notes": notes} if notes else {}),
+            }
+
+        return self._guard(run)
+
+    def failover_readiness(self, replication_group_id: str) -> dict:
+        """Would a primary failure be survived? Multi-AZ, replica count and placement per shard, findings first.
+
+        DescribeReplicationGroups and DescribeCacheClusters only; no metrics and no data-plane connection."""
+
+        def run() -> dict:
+            groups = self._paginate(
+                "describe_replication_groups", "ReplicationGroups", ReplicationGroupId=replication_group_id
+            )
+            if not groups:
+                return {"error": "NotFound", "message": f"replication group {replication_group_id} not found"}
+            g = groups[0]
+            notes: list[str] = []
+            statuses: dict[str, str] = {}
+            try:
+                for c in self._paginate("describe_cache_clusters", "CacheClusters"):
+                    if c.get("ReplicationGroupId") == replication_group_id and c.get("CacheClusterId"):
+                        statuses[str(c["CacheClusterId"])] = str(c.get("CacheClusterStatus"))
+            except (BotoCoreError, ClientError) as exc:
+                notes.append(f"node states skipped: DescribeCacheClusters failed ({_error_code(exc)})")
+            findings, shards, risk = failover_readiness_findings(g, statuses, _prod_like(g))
+            ordered = _sorted_findings(findings)
+            return {
+                "replication_group_id": replication_group_id,
+                "status": "partial" if notes else "ok",
+                "overall": _worst_status(ordered) if ordered else "ok",
+                "recovery_risk": risk,
+                "findings": ordered[:MAX_OVERVIEW_FINDINGS],
+                "findings_total": len(ordered),
+                "multi_az": g.get("MultiAZ"),
+                "automatic_failover": g.get("AutomaticFailover"),
+                "shards": shards[:MAX_OVERVIEW_SHARDS],
+                "shards_total": len(shards),
                 **({"notes": notes} if notes else {}),
             }
 

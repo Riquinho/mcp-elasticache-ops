@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from .triage import _TriageMixin
+from .scale_view import _ScaleMixin
 
 
-class ControlPlane(_TriageMixin):
+class ControlPlane(_ScaleMixin):
     """Read-only ElastiCache and CloudWatch views; see the mixins for the individual tools."""

@@ -1,0 +1,1521 @@
+{
+ "aws_alarms": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "replication_group_id": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "Limit to one replication group; omit to check every group, cluster and serverless cache"
+   }
+  },
+  "type": "object"
+ },
+ "aws_cache_clusters": {
+  "additionalProperties": false,
+  "properties": {
+   "cache_cluster_id": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null
+   },
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "show_nodes": {
+    "default": true,
+    "type": "boolean"
+   }
+  },
+  "type": "object"
+ },
+ "aws_capacity_forecast": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   }
+  },
+  "type": "object"
+ },
+ "aws_cluster_overview": {
+  "additionalProperties": false,
+  "properties": {
+   "minutes": {
+    "default": 360,
+    "description": "CloudWatch window (multiple of 5 min is fine)",
+    "maximum": 20160,
+    "minimum": 5,
+    "type": "integer"
+   },
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "replication_group_id": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "ReplicationGroupId to summarise; omit for a fleet pass over every configured region"
+   }
+  },
+  "type": "object"
+ },
+ "aws_cost_overview": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   }
+  },
+  "type": "object"
+ },
+ "aws_engine_versions": {
+  "additionalProperties": false,
+  "properties": {
+   "engine": {
+    "description": "Cache engine",
+    "enum": [
+     "redis",
+     "valkey",
+     "memcached"
+    ],
+    "type": "string"
+   },
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "version_prefix": {
+    "anyOf": [
+     {
+      "maxLength": 16,
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "Only versions starting with this, e.g. '7.')"
+   }
+  },
+  "required": [
+   "engine"
+  ],
+  "type": "object"
+ },
+ "aws_events": {
+  "additionalProperties": false,
+  "properties": {
+   "hours": {
+    "default": 24,
+    "maximum": 336,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "source_identifier": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null
+   },
+   "source_type": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "cache-cluster, cache-parameter-group, cache-security-group, cache-subnet-group, replication-group, serverless-cache, user, user-group"
+   }
+  },
+  "type": "object"
+ },
+ "aws_failover_readiness": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "replication_group_id": {
+    "description": "ReplicationGroupId to check",
+    "type": "string"
+   }
+  },
+  "required": [
+   "replication_group_id"
+  ],
+  "type": "object"
+ },
+ "aws_global_replication_groups": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   }
+  },
+  "type": "object"
+ },
+ "aws_maintenance": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "replication_group_id": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "Limit to one replication group; omit to check every cluster of every configured region"
+   }
+  },
+  "type": "object"
+ },
+ "aws_metrics": {
+  "additionalProperties": false,
+  "properties": {
+   "cache_cluster_id": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "CacheClusterId (node cluster, e.g. 'my-rg-0001-001') or serverless cache name"
+   },
+   "include_series": {
+    "default": false,
+    "description": "Return the full time series (token heavy)",
+    "type": "boolean"
+   },
+   "metrics": {
+    "anyOf": [
+     {
+      "items": {
+       "type": "string"
+      },
+      "type": "array"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "CloudWatch metric names; default set if omitted"
+   },
+   "minutes": {
+    "default": 60,
+    "maximum": 20160,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "node_id": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null
+   },
+   "period_seconds": {
+    "default": 60,
+    "maximum": 86400,
+    "minimum": 60,
+    "multipleOf": 60,
+    "type": "integer"
+   },
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "replication_group_id": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "Query every member node of this replication group (cluster mode aware)"
+   },
+   "serverless": {
+    "default": false,
+    "type": "boolean"
+   }
+  },
+  "type": "object"
+ },
+ "aws_parameter_drift": {
+  "additionalProperties": false,
+  "properties": {
+   "group_a": {
+    "description": "First cache parameter group name (e.g. production)",
+    "type": "string"
+   },
+   "group_b": {
+    "description": "Second cache parameter group name (e.g. staging)",
+    "type": "string"
+   },
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   }
+  },
+  "required": [
+   "group_a",
+   "group_b"
+  ],
+  "type": "object"
+ },
+ "aws_parameter_groups": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   }
+  },
+  "type": "object"
+ },
+ "aws_parameters": {
+  "additionalProperties": false,
+  "properties": {
+   "diff_engine_defaults": {
+    "default": false,
+    "description": "Compare with DescribeEngineDefaultParameters and list only non-default values",
+    "type": "boolean"
+   },
+   "only_modified": {
+    "default": true,
+    "type": "boolean"
+   },
+   "parameter_group": {
+    "type": "string"
+   },
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   }
+  },
+  "required": [
+   "parameter_group"
+  ],
+  "type": "object"
+ },
+ "aws_replication_groups": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "replication_group_id": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null
+   }
+  },
+  "type": "object"
+ },
+ "aws_reserved_nodes": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   }
+  },
+  "type": "object"
+ },
+ "aws_reserved_offerings": {
+  "additionalProperties": false,
+  "properties": {
+   "engine": {
+    "description": "Cache engine",
+    "enum": [
+     "redis",
+     "valkey",
+     "memcached"
+    ],
+    "type": "string"
+   },
+   "node_type": {
+    "description": "Node type, e.g. cache.r6g.large",
+    "maxLength": 64,
+    "minLength": 1,
+    "type": "string"
+   },
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   }
+  },
+  "required": [
+   "node_type",
+   "engine"
+  ],
+  "type": "object"
+ },
+ "aws_scale_readiness": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "replication_group_id": {
+    "description": "ReplicationGroupId to check",
+    "type": "string"
+   }
+  },
+  "required": [
+   "replication_group_id"
+  ],
+  "type": "object"
+ },
+ "aws_security_audit": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "top": {
+    "default": 25,
+    "description": "Rows of the per-resource pass/fail matrix",
+    "maximum": 200,
+    "minimum": 1,
+    "type": "integer"
+   }
+  },
+  "type": "object"
+ },
+ "aws_serverless_caches": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   }
+  },
+  "type": "object"
+ },
+ "aws_serverless_snapshots": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "serverless_cache_name": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null
+   },
+   "snapshot_type": {
+    "anyOf": [
+     {
+      "enum": [
+       "automatic",
+       "manual"
+      ],
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "Filter by snapshot type"
+   },
+   "stale_hours": {
+    "default": 24,
+    "description": "Flag caches whose newest snapshot is older",
+    "maximum": 8760,
+    "minimum": 1,
+    "type": "integer"
+   }
+  },
+  "type": "object"
+ },
+ "aws_serverless_triage": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "serverless_cache_name": {
+    "description": "ServerlessCacheName to triage",
+    "type": "string"
+   }
+  },
+  "required": [
+   "serverless_cache_name"
+  ],
+  "type": "object"
+ },
+ "aws_service_updates": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "status": {
+    "default": "available",
+    "description": "Update status",
+    "enum": [
+     "available",
+     "cancelled",
+     "expired"
+    ],
+    "type": "string"
+   }
+  },
+  "type": "object"
+ },
+ "aws_shard_balance": {
+  "additionalProperties": false,
+  "properties": {
+   "minutes": {
+    "default": 60,
+    "description": "CloudWatch window in minutes",
+    "maximum": 20160,
+    "minimum": 5,
+    "type": "integer"
+   },
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "replication_group_id": {
+    "description": "ReplicationGroupId to check for shard skew",
+    "type": "string"
+   }
+  },
+  "required": [
+   "replication_group_id"
+  ],
+  "type": "object"
+ },
+ "aws_snapshot_restore_readiness": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "replication_group_id": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "Replication group to check"
+   },
+   "serverless_cache_name": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "Serverless cache to check instead"
+   },
+   "stale_hours": {
+    "default": 24,
+    "description": "Flag when no automatic snapshot is newer",
+    "maximum": 720,
+    "minimum": 1,
+    "type": "integer"
+   }
+  },
+  "type": "object"
+ },
+ "aws_snapshots": {
+  "additionalProperties": false,
+  "properties": {
+   "cache_cluster_id": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null
+   },
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "replication_group_id": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null
+   },
+   "source": {
+    "anyOf": [
+     {
+      "enum": [
+       "automated",
+       "manual"
+      ],
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "Filter by snapshot source"
+   },
+   "stale_hours": {
+    "default": 36,
+    "description": "Flag automatic snapshots older than this",
+    "maximum": 8760,
+    "minimum": 1,
+    "type": "integer"
+   }
+  },
+  "type": "object"
+ },
+ "aws_subnet_groups": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   }
+  },
+  "type": "object"
+ },
+ "aws_triage": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "replication_group_id": {
+    "description": "ReplicationGroupId to triage",
+    "type": "string"
+   }
+  },
+  "required": [
+   "replication_group_id"
+  ],
+  "type": "object"
+ },
+ "aws_user_groups": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   }
+  },
+  "type": "object"
+ },
+ "aws_users": {
+  "additionalProperties": false,
+  "properties": {
+   "engine": {
+    "anyOf": [
+     {
+      "enum": [
+       "redis",
+       "valkey"
+      ],
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "Engine filter"
+   },
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   }
+  },
+  "type": "object"
+ },
+ "memcached_cluster_stats": {
+  "additionalProperties": false,
+  "properties": {},
+  "type": "object"
+ },
+ "memcached_discovery": {
+  "additionalProperties": false,
+  "properties": {
+   "cache_cluster_id": {
+    "description": "Memcached cache cluster id",
+    "maxLength": 50,
+    "minLength": 1,
+    "type": "string"
+   },
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   }
+  },
+  "required": [
+   "cache_cluster_id"
+  ],
+  "type": "object"
+ },
+ "memcached_stats": {
+  "additionalProperties": false,
+  "properties": {
+   "group": {
+    "default": "",
+    "description": "stats group; empty for general",
+    "enum": [
+     "",
+     "settings",
+     "slabs",
+     "items",
+     "conns"
+    ],
+    "type": "string"
+   }
+  },
+  "type": "object"
+ },
+ "node_acl_log": {
+  "additionalProperties": false,
+  "properties": {
+   "count": {
+    "default": 25,
+    "description": "ACL LOG entries to fetch",
+    "maximum": 128,
+    "minimum": 1,
+    "type": "integer"
+   }
+  },
+  "type": "object"
+ },
+ "node_clients": {
+  "additionalProperties": false,
+  "properties": {
+   "top": {
+    "default": 20,
+    "maximum": 500,
+    "minimum": 1,
+    "type": "integer"
+   }
+  },
+  "type": "object"
+ },
+ "node_clients_summary": {
+  "additionalProperties": false,
+  "properties": {
+   "near_maxclients_pct": {
+    "default": 80,
+    "maximum": 100,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "top": {
+    "default": 10,
+    "maximum": 50,
+    "minimum": 1,
+    "type": "integer"
+   }
+  },
+  "type": "object"
+ },
+ "node_cluster": {
+  "additionalProperties": false,
+  "properties": {},
+  "type": "object"
+ },
+ "node_cluster_health": {
+  "additionalProperties": false,
+  "properties": {
+   "max_workers": {
+    "default": 8,
+    "description": "Concurrent node probes",
+    "maximum": 32,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "per_node_timeout": {
+    "default": 5.0,
+    "description": "Seconds to wait per node",
+    "exclusiveMinimum": 0,
+    "maximum": 60,
+    "type": "number"
+   }
+  },
+  "type": "object"
+ },
+ "node_cluster_keyspace_sample": {
+  "additionalProperties": false,
+  "properties": {
+   "match": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "SCAN MATCH glob, e.g. 'session:*'"
+   },
+   "max_seconds": {
+    "default": 10.0,
+    "description": "Total wall-clock budget, split across primaries",
+    "exclusiveMinimum": 0,
+    "maximum": 60,
+    "type": "number"
+   },
+   "max_workers": {
+    "default": 8,
+    "description": "Concurrent shard samplers",
+    "maximum": 32,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "pause_ms": {
+    "default": 0,
+    "description": "Sleep between SCAN batches",
+    "maximum": 1000,
+    "minimum": 0,
+    "type": "integer"
+   },
+   "per_node_timeout": {
+    "default": 5.0,
+    "description": "Extra seconds to wait for a stuck shard",
+    "exclusiveMinimum": 0,
+    "maximum": 60,
+    "type": "number"
+   },
+   "sample_size": {
+    "default": 1000,
+    "description": "Max keys to inspect, split across primaries",
+    "maximum": 100000,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "scan_count": {
+    "default": 250,
+    "description": "SCAN COUNT hint",
+    "maximum": 1000,
+    "minimum": 10,
+    "type": "integer"
+   },
+   "top": {
+    "default": 20,
+    "maximum": 500,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "top_prefixes": {
+    "default": 10,
+    "description": "Key prefixes to report",
+    "maximum": 50,
+    "minimum": 1,
+    "type": "integer"
+   }
+  },
+  "type": "object"
+ },
+ "node_cluster_memory": {
+  "additionalProperties": false,
+  "properties": {
+   "max_workers": {
+    "default": 8,
+    "description": "Concurrent shard probes",
+    "maximum": 32,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "per_node_timeout": {
+    "default": 5.0,
+    "description": "Seconds to wait per node",
+    "exclusiveMinimum": 0,
+    "maximum": 60,
+    "type": "number"
+   }
+  },
+  "type": "object"
+ },
+ "node_cluster_nodes": {
+  "additionalProperties": false,
+  "properties": {},
+  "type": "object"
+ },
+ "node_cluster_slowlog": {
+  "additionalProperties": false,
+  "properties": {
+   "count": {
+    "default": 25,
+    "description": "Entries to return overall",
+    "maximum": 1024,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "include_args": {
+    "default": false,
+    "description": "Return full command arguments (may expose values)",
+    "type": "boolean"
+   },
+   "max_workers": {
+    "default": 8,
+    "description": "Concurrent shard probes",
+    "maximum": 32,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "per_node_timeout": {
+    "default": 5.0,
+    "description": "Seconds to wait per node",
+    "exclusiveMinimum": 0,
+    "maximum": 60,
+    "type": "number"
+   }
+  },
+  "type": "object"
+ },
+ "node_cluster_triage": {
+  "additionalProperties": false,
+  "properties": {
+   "max_seconds": {
+    "default": 20.0,
+    "description": "Total wall-clock budget, split across shards",
+    "exclusiveMinimum": 0,
+    "maximum": 60,
+    "type": "number"
+   },
+   "max_workers": {
+    "default": 8,
+    "description": "Concurrent shard probes",
+    "maximum": 32,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "per_node_timeout": {
+    "default": 5.0,
+    "description": "Extra seconds to wait for a stuck shard",
+    "exclusiveMinimum": 0,
+    "maximum": 60,
+    "type": "number"
+   }
+  },
+  "type": "object"
+ },
+ "node_commandstats": {
+  "additionalProperties": false,
+  "properties": {
+   "top": {
+    "default": 20,
+    "maximum": 500,
+    "minimum": 1,
+    "type": "integer"
+   }
+  },
+  "type": "object"
+ },
+ "node_config": {
+  "additionalProperties": false,
+  "properties": {},
+  "type": "object"
+ },
+ "node_connectivity": {
+  "additionalProperties": false,
+  "properties": {},
+  "type": "object"
+ },
+ "node_doctor": {
+  "additionalProperties": false,
+  "properties": {},
+  "type": "object"
+ },
+ "node_health": {
+  "additionalProperties": false,
+  "properties": {},
+  "type": "object"
+ },
+ "node_info": {
+  "additionalProperties": false,
+  "properties": {
+   "section": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "INFO section (server, memory, stats, replication, commandstats, keyspace...); omit for default"
+   }
+  },
+  "type": "object"
+ },
+ "node_keyspace_sample": {
+  "additionalProperties": false,
+  "properties": {
+   "include_access": {
+    "default": false,
+    "description": "Add an access block: share of sampled keys idle over 7 days (OBJECT IDLETIME) or with a cold LFU counter (OBJECT FREQ), with an eviction-risk hint",
+    "type": "boolean"
+   },
+   "include_sizes": {
+    "default": false,
+    "description": "Add a collections block: key prefixes whose collections exceed size_threshold elements",
+    "type": "boolean"
+   },
+   "match": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "SCAN MATCH glob, e.g. 'session:*'"
+   },
+   "max_seconds": {
+    "default": 10.0,
+    "description": "Wall-clock budget; returns partial=true when exceeded",
+    "exclusiveMinimum": 0,
+    "maximum": 60,
+    "type": "number"
+   },
+   "pause_ms": {
+    "default": 0,
+    "description": "Sleep between SCAN batches",
+    "maximum": 1000,
+    "minimum": 0,
+    "type": "integer"
+   },
+   "sample_size": {
+    "default": 1000,
+    "description": "Max keys to inspect",
+    "maximum": 100000,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "scan_count": {
+    "default": 250,
+    "description": "SCAN COUNT hint",
+    "maximum": 1000,
+    "minimum": 10,
+    "type": "integer"
+   },
+   "size_threshold": {
+    "default": 10000,
+    "description": "Element count above which a collection is flagged",
+    "maximum": 100000000,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "top": {
+    "default": 20,
+    "maximum": 500,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "top_prefixes": {
+    "default": 10,
+    "description": "Key prefixes to report",
+    "maximum": 50,
+    "minimum": 1,
+    "type": "integer"
+   }
+  },
+  "type": "object"
+ },
+ "node_latency": {
+  "additionalProperties": false,
+  "properties": {
+   "ping_samples": {
+    "default": 20,
+    "maximum": 500,
+    "minimum": 1,
+    "type": "integer"
+   }
+  },
+  "type": "object"
+ },
+ "node_latency_events": {
+  "additionalProperties": false,
+  "properties": {},
+  "type": "object"
+ },
+ "node_memory": {
+  "additionalProperties": false,
+  "properties": {},
+  "type": "object"
+ },
+ "node_pubsub": {
+  "additionalProperties": false,
+  "properties": {
+   "max_workers": {
+    "default": 8,
+    "description": "Concurrent shard probes (cluster mode)",
+    "maximum": 32,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "pattern": {
+    "anyOf": [
+     {
+      "maxLength": 128,
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "PUBSUB CHANNELS glob filter"
+   },
+   "per_node_timeout": {
+    "default": 5.0,
+    "description": "Seconds to wait per node",
+    "exclusiveMinimum": 0,
+    "maximum": 60,
+    "type": "number"
+   },
+   "top": {
+    "default": 10,
+    "description": "Channels to list by subscriber count",
+    "maximum": 100,
+    "minimum": 1,
+    "type": "integer"
+   }
+  },
+  "type": "object"
+ },
+ "node_replication": {
+  "additionalProperties": false,
+  "properties": {},
+  "type": "object"
+ },
+ "node_slowlog": {
+  "additionalProperties": false,
+  "properties": {
+   "count": {
+    "default": 25,
+    "description": "Entries to fetch",
+    "maximum": 1024,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "include_args": {
+    "default": false,
+    "description": "Return full command arguments (may expose values)",
+    "type": "boolean"
+   }
+  },
+  "type": "object"
+ },
+ "node_triage": {
+  "additionalProperties": false,
+  "properties": {},
+  "type": "object"
+ }
+}

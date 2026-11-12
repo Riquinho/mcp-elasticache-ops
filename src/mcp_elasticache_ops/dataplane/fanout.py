@@ -16,6 +16,7 @@ import redis
 from ._core import (
     _endpoint,
     _finding,
+    _node_error,
     _num,
     _sorted_findings,
 )
@@ -103,18 +104,23 @@ def _fan_out_primaries(
             except FutureTimeout:
                 outcomes[ep] = {"status": "unreachable", "error": "no answer within the time budget"}
             except Exception as exc:  # one dead shard must not hide the others
-                outcomes[ep] = {"status": "unreachable", "error": f"{type(exc).__name__}: {exc}"}
+                kind, severity, text = _node_error(exc)
+                outcomes[ep] = {"status": "unreachable", "error": text, "kind": kind, "severity": severity}
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
-    return topo, outcomes
+    return topo, {ep: outcomes[ep] for ep in sorted(outcomes)}
 
 
-def _shard_counts(outcomes: dict[str, dict]) -> dict[str, int]:
+def _shard_counts(outcomes: dict[str, dict]) -> dict[str, Any]:
+    total = len(outcomes)
+    ok = sum(1 for o in outcomes.values() if o["status"] == "ok")
+    partial = sum(1 for o in outcomes.values() if o["status"] == "partial")
     return {
-        "shards_total": len(outcomes),
-        "shards_ok": sum(1 for o in outcomes.values() if o["status"] == "ok"),
-        "shards_partial": sum(1 for o in outcomes.values() if o["status"] == "partial"),
+        "shards_total": total,
+        "shards_ok": ok,
+        "shards_partial": partial,
         "shards_unreachable": sum(1 for o in outcomes.values() if o["status"] == "unreachable"),
+        "reached": f"reached {ok + partial}/{total} shards" + (f" ({partial} partial)" if partial else ""),
     }
 
 
@@ -136,7 +142,7 @@ def _partial_nodes(outcomes: dict[str, dict]) -> list[dict]:
 
 def _unreachable_findings(outcomes: dict[str, dict]) -> list[dict]:
     return [
-        _finding("critical", f"shard {ep} unreachable: {o['error']}", shard=ep)
+        _finding(o.get("severity", "critical"), f"shard {ep} unreachable: {o['error']}", shard=ep)
         for ep, o in outcomes.items()
         if o["status"] == "unreachable"
     ]

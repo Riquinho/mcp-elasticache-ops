@@ -32,7 +32,7 @@ async def test_all_tools_read_only():
     async with Client(server.mcp) as c:
         tools = await c.list_tools()
     names = {t.name for t in tools}
-    assert len(tools) == 53
+    assert len(tools) == 57
     assert {
         "node_health",
         "node_info",
@@ -120,7 +120,7 @@ async def test_node_config_end_to_end(env):
 
 async def test_every_registered_tool_is_wrapped_with_the_output_cap():
     tools = await server.mcp.list_tools()
-    assert len(tools) == 53
+    assert len(tools) == 57
     unwrapped = [t.name for t in tools if not getattr(t.fn, "__capped__", False)]
     assert unwrapped == []
 
@@ -341,7 +341,7 @@ async def test_oncall_prompts_are_registered_and_do_not_change_the_tool_count():
     assert {p.name for p in prompts} == RUNBOOKS
     async with Client(server.mcp) as c:
         assert {p.name for p in await c.list_prompts()} == RUNBOOKS
-        assert len(await c.list_tools()) == 53  # prompts are not tools
+        assert len(await c.list_tools()) == 57  # prompts are not tools
 
 
 @pytest.mark.parametrize("name", sorted(RUNBOOKS))
@@ -382,11 +382,13 @@ AUDIT_CALLS: list[tuple[str, dict]] = [
     ("node_config", {}),
     ("node_slowlog", {}),
     ("node_clients", {}),
+    ("node_clients_summary", {}),
     ("node_latency", {}),
     ("node_commandstats", {}),
     ("node_latency_events", {}),
     ("node_keyspace_sample", {"sample_size": 10}),
     ("node_keyspace_sample", {"sample_size": 10, "include_access": True}),
+    ("node_keyspace_sample", {"sample_size": 10, "include_sizes": True, "size_threshold": 1}),
     ("node_doctor", {}),
     ("node_replication", {}),
     ("node_acl_log", {}),
@@ -423,6 +425,10 @@ AUDIT_CALLS: list[tuple[str, dict]] = [
     ("aws_triage", {"replication_group_id": "audit-rg"}),
     ("aws_serverless_triage", {"serverless_cache_name": "audit-sc"}),
     ("aws_shard_balance", {"replication_group_id": "audit-rg"}),
+    ("aws_snapshot_restore_readiness", {"replication_group_id": "audit-rg"}),
+    ("aws_snapshot_restore_readiness", {"serverless_cache_name": "audit-sc"}),
+    ("aws_failover_readiness", {"replication_group_id": "audit-rg"}),
+    ("aws_scale_readiness", {"replication_group_id": "audit-rg"}),
     ("aws_alarms", {}),  # fleet mode over both configured regions
     ("aws_alarms", {"replication_group_id": "audit-rg"}),
     ("aws_cluster_overview", {}),  # fleet mode

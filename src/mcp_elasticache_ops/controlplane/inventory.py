@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import re
 from collections import Counter, defaultdict
 from typing import Any
 
@@ -13,17 +12,15 @@ from botocore.exceptions import (
 )
 
 from .. import memcached
+from ..quirks import quirks_for
+from ..quirks import summary as quirk_summary
 from ._core import _CoreMixin
 from ._shared import (
-    _CRITICAL_EVENT_WORDS,
     _SEVERITY_ORDER,
     GLOBAL_LAG_METRIC,
-    _auth_token_age_days,
-    _cluster_findings,
     _error_code,
     _error_result,
     _jsonable,
-    _rg_findings,
     _serverless_cache_findings,
     _serverless_snapshot_findings,
     _serverless_snapshot_view,
@@ -32,183 +29,26 @@ from ._shared import (
     _sorted_findings,
     finding,
 )
-
-GLOBAL_LAG_WINDOW_MINUTES = 60
-
-
-MAX_GLOBAL_SECONDARIES = 6  # secondary regions inspected per global datastore (each costs 3 API calls)
-
-
-HEALTHY_GLOBAL_MEMBER_STATUSES = frozenset({"associated", "available"})
-
-
-EVENT_SOURCE_TYPES = frozenset(
-    {
-        "cache-cluster",
-        "cache-parameter-group",
-        "cache-security-group",
-        "cache-subnet-group",
-        "replication-group",
-        "serverless-cache",
-        "user",
-        "user-group",
-    }
+from .inventory_views import (  # noqa: F401
+    _EVENTS_CRITICAL_WORDS,
+    _EVENTS_WARNING_WORDS,
+    EVENT_SOURCE_TYPES,
+    GLOBAL_LAG_WINDOW_MINUTES,
+    HEALTHY_GLOBAL_MEMBER_STATUSES,
+    MAX_EVENT_FINDINGS,
+    MAX_EVENTS_RETURNED,
+    MAX_GLOBAL_SECONDARIES,
+    _cluster_view,
+    _engine_version_views,
+    _event_severity,
+    _event_stamp,
+    _event_time,
+    _latest_per_major,
+    _log_delivery_view,
+    _rg_view,
+    _version_key,
 )
-
-
-MAX_EVENTS_RETURNED = 100
-
-
-MAX_EVENT_FINDINGS = 50
-
-
-# aws_events treats a failover as critical (a primary was lost) and maintenance as a warning.
-_EVENTS_CRITICAL_WORDS = (*_CRITICAL_EVENT_WORDS, "not available", "failover")
-
-
-_EVENTS_WARNING_WORDS = ("replac", "reboot", "restart", "removed", "recover", "maintenance")
-
-
-def _event_severity(message: str) -> str:
-    low = message.lower()
-    if any(w in low for w in _EVENTS_CRITICAL_WORDS):
-        return "critical"
-    if any(w in low for w in _EVENTS_WARNING_WORDS):
-        return "warning"
-    return "info"
-
-
-def _event_time(event: dict) -> float:
-    when = event.get("Date")
-    return when.timestamp() if isinstance(when, dt.datetime) else 0.0
-
-
-def _event_stamp(event: dict) -> str:
-    when = event.get("Date")
-    return when.isoformat() if isinstance(when, dt.datetime) else str(when)
-
-
-def _version_key(version: str) -> tuple[int, ...]:
-    return tuple(int(x) for x in re.findall(r"\d+", version))
-
-
-def _engine_version_views(items: list[dict], prefix: str | None) -> list[dict]:
-    views = [
-        {
-            "version": str(i.get("EngineVersion", "")),
-            "family": i.get("CacheParameterGroupFamily"),
-            "description": i.get("CacheEngineVersionDescription"),
-        }
-        for i in items
-        if not prefix or str(i.get("EngineVersion", "")).startswith(prefix)
-    ]
-    return sorted(views, key=lambda v: _version_key(v["version"]), reverse=True)
-
-
-def _latest_per_major(views: list[dict], engine: str) -> list[dict]:
-    """Newest listed version of each major (views are sorted newest first)."""
-    seen: set[int] = set()
-    out: list[dict] = []
-    for v in views:
-        key = _version_key(v["version"])
-        major = key[0] if key else -1
-        if major not in seen:
-            seen.add(major)
-            out.append({**v, "engine": engine, "reason": f"latest minor in major {major}"})
-    return out
-
-
-def _log_delivery_view(obj: dict) -> list[dict]:
-    return [
-        {
-            "log_type": d.get("LogType"),
-            "destination_type": d.get("DestinationType"),
-            "log_format": d.get("LogFormat"),
-            "status": d.get("Status"),
-            "message": d.get("Message"),
-        }
-        for d in obj.get("LogDeliveryConfigurations") or []
-    ]
-
-
-def _rg_view(g: dict, engine_version: tuple[str, str] | None = None, ctx: dict[str, Any] | None = None) -> dict:
-    return {
-        "id": g.get("ReplicationGroupId"),
-        "description": g.get("Description"),
-        "status": g.get("Status"),
-        "engine": g.get("Engine") or (engine_version[0] if engine_version else None),
-        "engine_version": engine_version[1] if engine_version else None,
-        "cluster_mode": g.get("ClusterMode") or ("enabled" if g.get("ClusterEnabled") else "disabled"),
-        "node_type": g.get("CacheNodeType"),
-        "multi_az": g.get("MultiAZ"),
-        "automatic_failover": g.get("AutomaticFailover"),
-        "transit_encryption": g.get("TransitEncryptionEnabled"),
-        "at_rest_encryption": g.get("AtRestEncryptionEnabled"),
-        "transit_encryption_mode": g.get("TransitEncryptionMode"),
-        "auth_token_enabled": g.get("AuthTokenEnabled"),
-        "auth_token_age_days": _auth_token_age_days(g, ctx),
-        "data_tiering": g.get("DataTiering"),
-        "network_type": g.get("NetworkType"),
-        "ip_discovery": g.get("IpDiscovery"),
-        "log_delivery": _log_delivery_view(g),
-        "auto_minor_version_upgrade": g.get("AutoMinorVersionUpgrade"),
-        "member_clusters": g.get("MemberClusters", []),
-        "configuration_endpoint": _jsonable(g.get("ConfigurationEndpoint")),
-        "findings": _rg_findings(g, engine_version, ctx),
-        "node_groups": [
-            {
-                "id": ng.get("NodeGroupId"),
-                "status": ng.get("Status"),
-                "slots": ng.get("Slots"),
-                "primary_endpoint": _jsonable(ng.get("PrimaryEndpoint")),
-                "reader_endpoint": _jsonable(ng.get("ReaderEndpoint")),
-                "members": [
-                    {
-                        "cluster_id": m.get("CacheClusterId"),
-                        "role": m.get("CurrentRole"),
-                        "az": m.get("PreferredAvailabilityZone"),
-                    }
-                    for m in ng.get("NodeGroupMembers", [])
-                ],
-            }
-            for ng in g.get("NodeGroups", [])
-        ],
-        "pending_modified_values": _jsonable(g.get("PendingModifiedValues") or {}),
-        "snapshot_retention_limit": g.get("SnapshotRetentionLimit"),
-    }
-
-
-def _cluster_view(c: dict, ctx: dict[str, Any] | None = None) -> dict:
-    return {
-        "findings": _cluster_findings(c, ctx),
-        "id": c.get("CacheClusterId"),
-        "status": c.get("CacheClusterStatus"),
-        "engine": c.get("Engine"),
-        "engine_version": c.get("EngineVersion"),
-        "node_type": c.get("CacheNodeType"),
-        "num_nodes": c.get("NumCacheNodes"),
-        "replication_group_id": c.get("ReplicationGroupId"),
-        "az": c.get("PreferredAvailabilityZone"),
-        "parameter_group": (c.get("CacheParameterGroup") or {}).get("CacheParameterGroupName"),
-        "parameter_apply_status": (c.get("CacheParameterGroup") or {}).get("ParameterApplyStatus"),
-        "maintenance_window": c.get("PreferredMaintenanceWindow"),
-        "transit_encryption_mode": c.get("TransitEncryptionMode"),
-        "auth_token_age_days": _auth_token_age_days(c, ctx),
-        "network_type": c.get("NetworkType"),
-        "ip_discovery": c.get("IpDiscovery"),
-        "log_delivery": _log_delivery_view(c),
-        "auto_minor_version_upgrade": c.get("AutoMinorVersionUpgrade"),
-        "pending_modified_values": _jsonable(c.get("PendingModifiedValues") or {}),
-        "nodes": [
-            {
-                "id": n.get("CacheNodeId"),
-                "status": n.get("CacheNodeStatus"),
-                "endpoint": _jsonable(n.get("Endpoint")),
-                "az": n.get("CustomerAvailabilityZone"),
-            }
-            for n in c.get("CacheNodes", [])
-        ],
-    }
+from .restore import MAX_RESTORE_SNAPSHOTS, RESTORE_STALE_HOURS, group_restore_findings, serverless_restore_findings
 
 
 class _InventoryMixin(_CoreMixin):
@@ -461,6 +301,67 @@ class _InventoryMixin(_CoreMixin):
 
         return self._guard(run)
 
+    def snapshot_restore_readiness(
+        self,
+        replication_group_id: str | None = None,
+        serverless_cache_name: str | None = None,
+        stale_hours: int = RESTORE_STALE_HOURS,
+    ) -> dict:
+        """Can this group or serverless cache be restored from what exists today? Findings first.
+
+        DescribeSnapshots / DescribeServerlessCacheSnapshots plus the group (or cache) for retention, KMS key and
+        target node size. Read-only; exactly one of the two ids is required."""
+        if bool(replication_group_id) == bool(serverless_cache_name):
+            return {
+                "error": "InvalidArgument",
+                "message": "pass exactly one of replication_group_id or serverless_cache_name",
+            }
+        if not 1 <= int(stale_hours) <= 24 * 30:
+            return {"error": "InvalidArgument", "message": "stale_hours must be between 1 and 720"}
+
+        def run() -> dict:
+            now = self._clock()
+            if serverless_cache_name:
+                caches = self._paginate_token(
+                    "describe_serverless_caches", "ServerlessCaches", ServerlessCacheName=serverless_cache_name
+                )
+                if not caches:
+                    return {"error": "NotFound", "message": f"serverless cache {serverless_cache_name} not found"}
+                snaps = self._paginate_token(
+                    "describe_serverless_cache_snapshots",
+                    "ServerlessCacheSnapshots",
+                    ServerlessCacheName=serverless_cache_name,
+                )
+                views = [_serverless_snapshot_view(s, now) for s in snaps]
+                findings = serverless_restore_findings(caches[0], snaps, views, stale_hours)
+                resource, kind, retention = serverless_cache_name, "serverless", caches[0].get("SnapshotRetentionLimit")
+            else:
+                groups = self._paginate(
+                    "describe_replication_groups", "ReplicationGroups", ReplicationGroupId=replication_group_id
+                )
+                if not groups:
+                    return {"error": "NotFound", "message": f"replication group {replication_group_id} not found"}
+                snaps = self._paginate("describe_snapshots", "Snapshots", ReplicationGroupId=replication_group_id)
+                members = [c for c in self._member_clusters() if c.get("ReplicationGroupId") == replication_group_id]
+                views = [_snapshot_view(s, now) for s in snaps]
+                findings = group_restore_findings(groups[0], snaps, views, members, stale_hours)
+                resource, kind = str(replication_group_id), "replication-group"
+                retention = groups[0].get("SnapshotRetentionLimit")
+            ordered = _sorted_findings(findings)
+            newest = sorted(views, key=lambda v: v["age_hours"] if v["age_hours"] is not None else 1e9)
+            return {
+                "resource": resource,
+                "kind": kind,
+                "retention_limit_days": retention,
+                "overall": ordered[0]["severity"] if ordered else "ok",
+                "findings": ordered,
+                "snapshot_count": len(views),
+                "snapshots": newest[:MAX_RESTORE_SNAPSHOTS],
+                "snapshots_truncated": len(newest) > MAX_RESTORE_SNAPSHOTS,
+            }
+
+        return self._guard(run)
+
     # -------------------------------------------------------- global datastores
     def global_replication_groups(self) -> dict:
         def run() -> dict:
@@ -613,6 +514,10 @@ class _InventoryMixin(_CoreMixin):
                             f"Valkey {newest['version']} (family {newest['family']}) is available as an upgrade target",
                         )
                     )
+            for t in targets:
+                found = quirks_for(t.get("engine", engine), t.get("version"))
+                if found:
+                    t["quirks"] = [quirk_summary(q) for q in found]
             return {
                 "engine": engine,
                 "version_prefix": version_prefix,

@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 
 import redis
 
+from .. import quirks
 from ._core import (
     CHURN_MIN_UPTIME_SECONDS,
     CHURN_PER_SECOND,
@@ -267,7 +268,7 @@ def memory_report(r: redis.Redis, serverless: bool = False) -> dict:
             else {}
         ),
         "note": (
-            "On ElastiCache, maxmemory already excludes reserved-memory-percent; "
+            f"{quirks.get('reserved-memory-percent').remediation}; "
             "compare with the BytesUsedForCache and DatabaseMemoryUsagePercentage metrics."
         ),
     }

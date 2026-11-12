@@ -35,6 +35,7 @@ TOOL_ARGS: dict[str, dict[str, Any]] = {
             "node_config",
             "node_slowlog",
             "node_clients",
+            "node_clients_summary",
             "node_latency",
             "node_latency_events",
             "node_commandstats",
@@ -82,6 +83,9 @@ TOOL_ARGS: dict[str, dict[str, Any]] = {
     "aws_triage": {"replication_group_id": "rg-1"},
     "aws_serverless_triage": {"serverless_cache_name": "sc-1"},
     "aws_shard_balance": {"replication_group_id": "rg-1"},
+    "aws_snapshot_restore_readiness": {"replication_group_id": "rg-1"},
+    "aws_failover_readiness": {"replication_group_id": "rg-1"},
+    "aws_scale_readiness": {"replication_group_id": "rg-1"},
 }
 
 

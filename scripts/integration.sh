@@ -27,17 +27,39 @@ else
   exit 0
 fi
 
-DOCKER=${DOCKER:-docker}
+# Docker detection: honour $DOCKER; else `docker` on PATH; else the WSL distro's docker; else stop with a clear cause.
+if [ -z "${DOCKER:-}" ]; then
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    DOCKER=docker
+  elif command -v wsl >/dev/null 2>&1 && MSYS_NO_PATHCONV=1 wsl -d "${WSL_DISTRO:-Ubuntu}" -e docker info >/dev/null 2>&1; then
+    DOCKER="wsl -d ${WSL_DISTRO:-Ubuntu} -e docker"
+    export MSYS_NO_PATHCONV=1
+    echo "docker detection: 'docker' not usable in this shell, using: $DOCKER"
+  else
+    echo "INTEGRATION SKIPPED: no usable docker. 'docker' is not on PATH (or its daemon is down) and"
+    echo "'wsl -d ${WSL_DISTRO:-Ubuntu} -e docker info' failed (WSL distro missing or Docker not running in it)."
+    echo "Set DOCKER explicitly, e.g. DOCKER=\"wsl -d Ubuntu -e docker\" scripts/integration.sh"
+    exit 0
+  fi
+fi
+export DOCKER
 IMAGE=${IMAGE:-valkey/valkey:8-alpine}
 NAME=${NAME:-prova-elasticache-ops-redis}
 PORT=${PORT:-16379}
 
+KEEPALIVE_PID=
 cleanup() {
+  [ -n "$KEEPALIVE_PID" ] && kill "$KEEPALIVE_PID" >/dev/null 2>&1 || true
   $DOCKER rm -f "$NAME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 cleanup
+# With WSL docker, the localhost port forward is only dependable while a WSL session is alive (without one the
+# server-side tests saw ECONNREFUSED mid-run). Hold one open for the duration of the run.
+case "$DOCKER" in
+  wsl*) wsl -d "${WSL_DISTRO:-Ubuntu}" -e sleep 1800 >/dev/null 2>&1 & KEEPALIVE_PID=$! ;;
+esac
 $DOCKER run --rm -d --name "$NAME" -p "127.0.0.1:${PORT}:6379" "$IMAGE" >/dev/null
 
 for _ in $(seq 1 30); do
@@ -46,6 +68,23 @@ for _ in $(seq 1 30); do
   fi
   sleep 1
 done
+
+# The in-container ping can pass before the host port forward (WSL localhost relay) forwards to the server.
+# Wait for a real RESP PING answered through the published port, then let the relay settle.
+ping_host() {
+  uv run python -I -c "
+import socket, sys
+s = socket.create_connection(('127.0.0.1', int(sys.argv[1])), 2)
+s.settimeout(2)
+s.sendall(b'PING\r\n')
+sys.exit(0 if s.recv(16).startswith(b'+PONG') else 1)
+" "$PORT" >/dev/null 2>&1
+}
+for _ in $(seq 1 30); do
+  if ping_host; then break; fi
+  sleep 1
+done
+sleep "${SETTLE_SECONDS:-4}"
 
 REDIS_TEST_URL="redis://127.0.0.1:${PORT}/0" uv run pytest -q "$@"
 

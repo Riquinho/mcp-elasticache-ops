@@ -7,6 +7,7 @@ import statistics
 
 import redis
 
+from .. import quirks
 from ._core import (
     _finding,
     _num,
@@ -17,6 +18,7 @@ from ._core import (
     engine_of,
     version_tuple,
 )
+from .clients import client_findings_if_cheap
 
 LATENCY_EVENTS_HISTORY = 3  # events whose LATENCY HISTORY is fetched (highest max first)
 
@@ -237,8 +239,8 @@ def engine_quirk_findings(info: dict) -> list[dict]:
             findings.append(
                 _finding(
                     "info",
-                    f"io_threads_active=0 while the event loop averages {loop_us:.0f} us per cycle: the main thread "
-                    "does all I/O; if the parameter group sets io-threads > 1, check it took effect",
+                    f"io_threads_active=0 while the event loop averages {loop_us:.0f} us per cycle: "
+                    f"{quirks.text('valkey-io-threads')}",
                     source="io-threads",
                 )
             )
@@ -273,8 +275,7 @@ def engine_quirk_findings(info: dict) -> list[dict]:
         findings.append(
             _finding(
                 "warning",
-                f"replica link to the primary is down (for {since}s): with replica-serve-stale-data yes (default) "
-                "reads return stale data; fix the link or set it to no",
+                f"replica link to the primary is down (for {since}s): {quirks.text('replica-serve-stale-data')}",
                 source="replica-serve-stale-data",
             )
         )
@@ -287,8 +288,8 @@ def engine_quirk_findings(info: dict) -> list[dict]:
         findings.append(
             _finding(
                 "warning",
-                f"Lua/functions memory is {script_bytes / 1024 / 1024:.0f} MiB: scripts or loaded functions keep "
-                "large state (EVAL cache, global tables); check SCRIPT FLUSH policy and function libraries",
+                f"Lua/functions memory is {script_bytes / 1024 / 1024:.0f} MiB: "
+                f"{quirks.text('redis-functions-memory')}",
                 source="lua-functions",
             )
         )
@@ -309,6 +310,7 @@ def node_doctor(r: redis.Redis, serverless: bool = False) -> dict:
     full_info, _ = _try(r.info)
     if isinstance(full_info, dict):
         findings += engine_quirk_findings({**(info_server or {}), **full_info})
+        findings += client_findings_if_cheap(r, full_info)  # only up to CLIENT_DOCTOR_MAX connections
     for key, label, command in (
         ("memory_doctor", "MEMORY DOCTOR", ("MEMORY", "DOCTOR")),
         ("latency_doctor", "LATENCY DOCTOR", ("LATENCY", "DOCTOR")),

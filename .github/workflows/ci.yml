@@ -38,6 +38,11 @@ jobs:
         shell: bash
       - name: Release check (CHANGELOG entry for the version, README tool table matches the registry)
         run: bash scripts/release-check.sh
+      - name: Generated files are current (docs/iam-matrix.md, tests/tool_schemas.json)
+        run: |
+          uv run python -I scripts/regen.py
+          git diff --exit-code -- docs/iam-matrix.md tests/tool_schemas.json
+        shell: bash
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - name: Type check
@@ -80,7 +85,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: uv sync --locked
       # Runs unit and integration tests, including the live Memcached test (MEMCACHED_TEST_HOST is set).
-      - run: uv run pytest -q --cov=mcp_elasticache_ops --cov-fail-under=90
+      - run: uv run pytest -q --cov=mcp_elasticache_ops --cov-fail-under=93
 
   cluster:
     # always on push, schedule and dispatch; on a pull request only with the `integration` label

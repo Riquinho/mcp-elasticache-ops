@@ -78,7 +78,7 @@ source = ["mcp_elasticache_ops"]
 branch = true
 
 [tool.coverage.report]
-fail_under = 90
+fail_under = 93
 show_missing = true
 skip_covered = true
 exclude_lines = ["pragma: no cover", "if __name__ == .__main__.:"]

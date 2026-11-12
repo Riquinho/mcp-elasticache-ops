@@ -177,6 +177,7 @@ PRIVATE_NAMES = (
     "_memory_findings",
     "_merge_prefix_entries",
     "_names",
+    "_node_error",
     "_node_snapshot",
     "_node_triage_work",
     "_num",

@@ -15,6 +15,7 @@ import redis
 from ._core import (
     _endpoint,
     _finding,
+    _node_error,
     _num,
     _pairs,
     _s,
@@ -419,7 +420,8 @@ def cluster_health(
             except FutureTimeout:
                 results[ep] = {"error": f"timeout after {per_node_timeout:g}s"}
             except Exception as exc:  # one dead node must not hide the others
-                results[ep] = {"error": f"{type(exc).__name__}: {exc}"}
+                kind, _severity, text = _node_error(exc)
+                results[ep] = {"error": text, "kind": kind}
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
@@ -454,6 +456,7 @@ def cluster_health(
     return {
         "cluster_enabled": True,
         "nodes_probed": len(results),
+        "reached": f"reached {sum(1 for res in results.values() if 'error' not in res)}/{len(nodes)} nodes",
         "partial_nodes": partial_nodes,
         "shard_replication": shard_rows,
         "slots_covered": topo["slots_covered"],

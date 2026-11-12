@@ -829,6 +829,8 @@ def _example_args(tool) -> dict:
     args = {name: props.get(name, {}).get("enum", ["x"])[0] for name in tool.input_schema.get("required", [])}
     if tool.name == "aws_metrics":  # needs one of two optional ids
         args["cache_cluster_id"] = "x"
+    if tool.name == "aws_snapshot_restore_readiness":  # exactly one of two optional ids
+        args["replication_group_id"] = "x"
     return args
 
 

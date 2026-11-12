@@ -10,7 +10,7 @@ written from scratch for ElastiCache.
 
 ## Tools
 
-All 53 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
+All 57 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 
 **Data plane** (redis-py, talks to the node endpoint)
 
@@ -25,12 +25,13 @@ All 53 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `node_memory` | used/RSS/peak/dataset/overhead, maxmemory + policy, fragmentation verdict, `findings` (memory > 90%, `noeviction` near full, fragmentation, evictions), `MEMORY STATS/DOCTOR` |
 | `node_config` | Allowlisted `CONFIG GET` values (never secrets) with findings: `noeviction` with a maxmemory limit, `timeout 0` with idle clients, AOF, slowlog and latency monitor off, broad keyspace events. Points at `aws_parameters` when the endpoint refuses `CONFIG` |
 | `node_slowlog` | `SLOWLOG GET` with per-command totals; arguments beyond the key are hidden |
+| `node_clients_summary` | Bounded `CLIENT LIST` aggregate for a connection storm: top source IPs (with idle counts), client name or library, ACL user, flags (blocked, pubsub, multi, tracking), clients idle over an hour, clients with big buffers, and use against `maxclients`. Findings first. Never returns commands, arguments or key names; `top` is capped at 50. `node_doctor` adds its warnings only when the node has 500 connections or fewer |
 | `node_clients` | `CLIENT LIST` aggregated by IP, name, user and last command; idle and buffer outliers |
 | `node_doctor` | `MEMORY DOCTOR` and `LATENCY DOCTOR` as findings first: each advice line that is not the healthy answer becomes a finding (max 8, trimmed), plus the trimmed raw text. A node or Serverless endpoint that rejects the command gives a `not available` note, never an error. Also part of `node_triage` |
 | `node_latency` | Client-side PING RTT percentiles + `LATENCY LATEST` |
 | `node_latency_events` | `LATENCY LATEST` plus `LATENCY HISTORY` for the top 3 events (bounded samples), trimmed `LATENCY DOCTOR` / `MEMORY DOCTOR` text. Findings: fork or aof-fsync events over 100 ms, an expire-cycle spike, and an actionable finding when `latency-monitor-threshold` is 0 and nothing is recorded |
 | `node_commandstats` | Commands ranked by total CPU time (`INFO commandstats`) |
-| `node_keyspace_sample` | Bounded `SCAN` sample: big keys by bytes and by element count, hot keys (LFU) or coldest keys, TTL coverage, `ttl_histogram` (no TTL, < 1m, < 1h, < 1d, >= 1d; overall, per prefix and per type, from the same sample so no extra round trips) with `keyspace_hit_rate` from the one `INFO` reply, and `prefixes` (keys grouped by normalised prefix such as `user:*:cart`, with estimated bytes scaled to dbsize, % without TTL; large no-TTL prefixes are flagged under `noeviction` or memory pressure; `top_prefixes`, default 10, max 50). `include_access=true` (default off) adds an `access` summary from the sampled `OBJECT FREQ` (LFU policies) or `OBJECT IDLETIME` replies: cold keys, share idle over 7 days, an eviction-risk hint under memory pressure; capped and time-budgeted. Stops at `max_seconds` (default 10, hard cap 60) and returns `partial=true` |
+| `node_keyspace_sample` | Bounded `SCAN` sample: big keys by bytes and by element count, hot keys (LFU) or coldest keys, TTL coverage, `ttl_histogram` (no TTL, < 1m, < 1h, < 1d, >= 1d; overall, per prefix and per type, from the same sample so no extra round trips) with `keyspace_hit_rate` from the one `INFO` reply, and `prefixes` (keys grouped by normalised prefix such as `user:*:cart`, with estimated bytes scaled to dbsize, % without TTL; large no-TTL prefixes are flagged under `noeviction` or memory pressure; `top_prefixes`, default 10, max 50). `include_access=true` (default off) adds an `access` summary from the sampled `OBJECT FREQ` (LFU policies) or `OBJECT IDLETIME` replies: cold keys, share idle over 7 days, an eviction-risk hint under memory pressure; capped and time-budgeted. `include_sizes=true` (default off) adds a `collections` block: key prefixes whose lists, sets, hashes, zsets or streams exceed `size_threshold` elements (default 10000), from the same sample with the type-specific length command only, prefixes never full keys, flagged as unbounded-growth candidates. Stops at `max_seconds` (default 10, hard cap 60) and returns `partial=true` |
 | `node_replication` | Role, replicas with byte lag, link status, backlog; findings for lagging or link-down replicas, offset gap vs the primary, `replica-read-only`, `min-replicas-to-write`, `cluster-allow-reads-when-down`. Engine-version quirks (no `CLUSTER SHARDS` before 7.0, ...) come back as `notes`, not errors |
 | `node_cluster` | Cluster mode: `CLUSTER INFO`, slots per primary, `CLUSTER SHARDS` |
 | `node_cluster_nodes` | `CLUSTER NODES` parsed into shards (primary, replicas, slots, failing nodes) and per-shard endpoints |
@@ -53,6 +54,9 @@ All 53 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `aws_events` | `DescribeEvents`, findings-first: failover/failure events are critical, replacement/reboot/maintenance warning, the rest info. Newest first, grouped by severity and source; `source_type` is validated before any call; at most 100 raw events (`truncated` says when more exist) |
 | `aws_parameters` | `DescribeCacheParameters` (user-modified by default). `diff_engine_defaults=true` adds `DescribeEngineDefaultParameters` and lists only non-default values with their default. Findings flag risky settings: `maxmemory-policy noeviction`, tiny `client-output-buffer-limit-*`, `timeout 0`, lowered `maxmemory-samples` |
 | `aws_shard_balance` | Per-shard skew from CloudWatch only (one `GetMetricData` call per node-group member; no data-plane connection): EngineCPUUtilization, DatabaseMemoryUsagePercentage, NetworkBytesIn/Out, CurrItems. Findings first: hot shard (over 2x the median and above 50% CPU), memory skew, one primary pinned near 100% CPU while the others idle (hot-key signature) |
+| `aws_snapshot_restore_readiness` | `DescribeSnapshots` / `DescribeServerlessCacheSnapshots` (plus the group or cache for retention, KMS key and node type; pass exactly one id): can it be restored? Findings first: backups disabled, no automatic snapshot in `stale_hours` (default 24), automatic snapshots past the retention window, failed snapshot, no manual snapshot in the last 7 days before a pending engine upgrade, snapshot KMS key different from the group's, snapshot larger than the target node can hold |
+| `aws_scale_readiness` | Read-only headroom for online resharding and node-type change, from `DescribeReplicationGroups`, `DescribeCacheClusters` and one 7-day `GetMetricData` window (no new IAM actions). Findings first: would scale-in fit (projected memory and CPU on the surviving shards), is scale-out advised (memory, CPU, network allowance, shard skew), and node-type change risk `low`/`medium`/`high` (Multi-AZ off, no replicas, replica lag, pending modification, burstable credits, node not available) |
+| `aws_failover_readiness` | `DescribeReplicationGroups` + `DescribeCacheClusters` only: would a primary failure be survived? Findings first: automatic failover or Multi-AZ off, shards with zero replicas, all replicas in the primary's AZ, uneven replica counts across shards, replicas not `available`, single-node cluster-mode-disabled group; adds a `recovery_risk` level |
 | `aws_metrics` | CloudWatch `AWS/ElastiCache` metrics: findings first, then min/avg/max/latest; series only with `include_series`; `replication_group_id` queries every member node |
 | `aws_snapshots` | `DescribeSnapshots`: retention gaps, failed and missing automatic backups, old manual snapshots |
 | `aws_serverless_snapshots` | `DescribeServerlessCacheSnapshots` + `DescribeServerlessCaches`: caches with no available snapshot in `stale_hours` (default 24), failed snapshots, newest snapshot about to expire, snapshots without a customer KMS key, unset per-cache retention; a failing cache listing degrades to `partial` |
@@ -116,6 +120,8 @@ shorter breach is an info finding saying `transient spike`. Every metric summary
 `hours_to_full` when growth is gradual). The time-to-full hint is a linear estimate: below 24 h it is a warning, else info.
 
 ## On-call runbooks (MCP prompts)
+
+Five step-by-step playbooks (CPU, evictions, replication lag, connection storm, failover and restore readiness) are in [docs/runbooks.md](docs/runbooks.md).
 
 Four prompts (not tools, the read-only tool count is unchanged) return a step-by-step runbook that chains the tools
 and says what to conclude from each. Each takes `replication_group_id`.
@@ -204,6 +210,8 @@ Generated from `safe_client.py`; the tests fail if this drifts from the code.
 <!-- allowlist:end -->
 
 ### Minimal IAM policy
+
+Which tool needs which action (and which tools lose data if one action is withheld) is in [docs/iam-matrix.md](docs/iam-matrix.md), generated from the code and checked by `tests/test_iam_policy.py`; a new boto3 call missing from this policy or from the matrix fails CI.
 
 ```json
 {
@@ -323,6 +331,16 @@ The cluster test (`tests/test_dataplane_integration.py`, marker `integration`, n
 `CLUSTER_TEST_PORT`) runs `node_cluster_nodes` and the cluster fan-out against that cluster. CI runs it in the
 `cluster` job and removes the stack in an `always()` step; the `lint` job also builds the wheel and imports it in an
 isolated interpreter (`python -I`).
+
+### Generated files
+
+`docs/iam-matrix.md` and `tests/tool_schemas.json` are generated from the code. After adding or changing a tool run
+
+```bash
+uv run python -I scripts/regen.py
+```
+
+and commit the result. The `lint` job runs the same script and fails on `git diff --exit-code` when either file is stale. The README tool table and the "All N tools" line are checked by `scripts/release-check.sh`. Engine version quirks live only in `src/mcp_elasticache_ops/quirks.py`; every entry needs a remediation and a parseable version range (`tests/test_engine_quirks.py`).
 
 ## More
 

@@ -70,6 +70,10 @@ HIT_RATE_CRIT = 0.50  # ... and below this a critical
 HIT_RATE_MIN_LOOKUPS = 1000  # ignore the ratio on a barely used node
 
 
+DEFAULT_COLLECTION_THRESHOLD = 10_000  # elements (LLEN/HLEN/SCARD/ZCARD/XLEN) above which a key looks unbounded
+
+MAX_COLLECTION_PREFIXES = 20
+
 _KEY_SEPARATORS = re.compile(r"([:/.])")
 
 
@@ -306,6 +310,48 @@ def _access_report(rows: list[dict], lfu: bool, policy: str, usage: float | None
     return report, findings
 
 
+def _collection_report(rows: list[dict], threshold: int) -> tuple[dict, list[dict]]:
+    """Collections above ``threshold`` elements, grouped by normalised key prefix, from lengths already read.
+
+    Only the prefix pattern, type and counts are reported (never a full key or any value); the length probes are
+    the ones the sample issues anyway, so this adds no commands and no time."""
+    groups: dict[str, dict[str, Any]] = {}
+    probed = 0
+    for row in rows:
+        length = row.get("length")
+        if row["type"] not in LENGTH_COMMAND or row["type"] == "string" or not isinstance(length, int):
+            continue
+        probed += 1
+        if length <= threshold:
+            continue
+        entry = groups.setdefault(
+            normalize_key(row["key"]), {"prefix": normalize_key(row["key"]), "types": set(), "keys": 0, "max_length": 0}
+        )
+        entry["types"].add(row["type"])
+        entry["keys"] += 1
+        entry["max_length"] = max(entry["max_length"], length)
+    ranked = sorted(groups.values(), key=lambda e: (-e["max_length"], e["prefix"]))
+    prefixes = [{**e, "types": sorted(e["types"])} for e in ranked[:MAX_COLLECTION_PREFIXES]]
+    findings = [
+        _finding(
+            "warning" if e["max_length"] >= 10 * threshold else "info",
+            f"prefix {e['prefix']}: {e['keys']} {'/'.join(e['types'])} key(s) above {threshold} elements "
+            f"(largest {e['max_length']}): unbounded-growth candidate, cap it (LTRIM/XTRIM, a size limit in the "
+            "writer) or split it across keys",
+            section="collections",
+        )
+        for e in prefixes
+    ]
+    report = {
+        "threshold": threshold,
+        "collections_probed": probed,
+        "prefixes_over_threshold": len(groups),
+        "prefixes": prefixes,
+        "commands": sorted(set(LENGTH_COMMAND.values()) - {"STRLEN"}),
+    }
+    return report, findings
+
+
 def keyspace_sample(
     r: redis.Redis,
     sample_size: int = 1000,
@@ -317,6 +363,8 @@ def keyspace_sample(
     clock: Callable[[], float] = time.monotonic,
     top_prefixes: int = DEFAULT_TOP_PREFIXES,
     include_access: bool = False,
+    include_sizes: bool = False,
+    size_threshold: int = DEFAULT_COLLECTION_THRESHOLD,
 ) -> dict:
     """Big/hot key finder based on a bounded SCAN.
 
@@ -330,6 +378,9 @@ def keyspace_sample(
     normalised prefix (see ``normalize_key``) from data already fetched, so it costs no extra commands.
     ``include_access`` adds an ``access`` block (share of keys idle for over 7 days, or with a cold LFU counter)
     built from the same OBJECT replies and the same budget; it never issues extra commands.
+    ``include_sizes`` adds a ``collections`` block: prefixes whose lists, hashes, sets, sorted sets or streams hold
+    more than ``size_threshold`` elements (the LLEN/HLEN/SCARD/ZCARD/XLEN probes the sample already runs), flagged as
+    unbounded-growth candidates by key prefix only. No value-reading command is ever issued.
     """
     sample_size = max(1, min(int(sample_size), 100_000))
     scan_count = max(1, min(int(scan_count), MAX_SCAN_COUNT))
@@ -402,6 +453,10 @@ def keyspace_sample(
     ttl_histogram = _ttl_histograms(rows)
     rate = hit_rate(mem_info.get("keyspace_hits"), mem_info.get("keyspace_misses"))
     prefix_report["findings"] += _ttl_findings(ttl_histogram["overall"], policy, rate)
+    sizes: dict[str, Any] | None = None
+    if include_sizes:
+        sizes, size_findings = _collection_report(rows, max(1, int(size_threshold)))
+        prefix_report["findings"] += size_findings
     access: dict[str, Any] | None = None
     if include_access:
         access, access_findings = _access_report(rows, lfu, policy, usage)
@@ -432,6 +487,8 @@ def keyspace_sample(
     }
     if access is not None:
         result["access"] = {**access, "partial": partial}
+    if sizes is not None:
+        result["collections"] = {**sizes, "partial": partial}
     cluster_info, _ = _try(r.info, "cluster")
     if int(_num((cluster_info or {}).get("cluster_enabled"))):
         result["cluster_mode"] = True

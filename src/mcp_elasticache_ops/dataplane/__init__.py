@@ -45,6 +45,7 @@ from ._core import (  # noqa: F401
     _endpoint,
     _finding,
     _jsonable,
+    _node_error,
     _num,
     _pairs,
     _s,
@@ -76,6 +77,13 @@ from .acl_pubsub import (  # noqa: F401
     acl_log,
     cluster_pubsub,
     pubsub_report,
+)
+from .clients import (  # noqa: F401
+    CLIENT_BIG_BUFFER_BYTES,
+    CLIENT_DOCTOR_MAX,
+    CLIENT_SUMMARY_MAX_TOP,
+    client_findings_if_cheap,
+    client_summary,
 )
 from .config_stats import (  # noqa: F401
     _ERROR_CAUSES,
