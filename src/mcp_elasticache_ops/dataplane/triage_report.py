@@ -14,6 +14,7 @@ from ._core import (
     CONNECTIONS_CRIT_RATIO,
     FORK_CRIT_USEC,
     IDLE_CLIENTS_WARN,
+    _endpoint,
     _finding,
     _num,
     _safe,
@@ -41,10 +42,11 @@ from .health import (
     memory_report,
     slowlog,
 )
+from .hot_slots import offenders_text, top_offenders
 from .replication import (
     replication,
 )
-from .topology import consistency_findings, consistency_snapshot
+from .topology import cluster_links, consistency_findings, consistency_snapshot, missing_link_findings
 
 TRIAGE_MAX_FINDINGS = 30
 
@@ -190,6 +192,7 @@ def _triage_latency(d: dict) -> tuple[dict, list[dict]]:
         findings.append(
             _finding(severity, f"latency event {e['event']}: latest {e['latest_ms']} ms, max {e['max_ms']} ms")
         )
+    findings += d.get("findings", [])  # per-command slow tail from LATENCY HISTOGRAM
     return {"ping_p50_ms": rtt["p50"], "ping_p99_ms": rtt["p99"], "events": len(events)}, findings
 
 
@@ -217,7 +220,7 @@ def triage(
         ("clients", lambda: client_list(r, 5), _triage_clients),
         ("commandstats", lambda: commandstats(r, 500), _triage_commandstats),
         ("slowlog", lambda: slowlog(r, 5, False, serverless), _triage_slowlog),
-        ("latency", lambda: latency(r, 5), _triage_latency),
+        ("latency", lambda: latency(r, 5, serverless), _triage_latency),
         ("doctor", lambda: node_doctor(r, serverless), _triage_doctor),
     ]
     sections: dict[str, dict] = {}
@@ -258,7 +261,15 @@ def _node_triage_work(client: redis.Redis, budget: float, shards: int) -> dict:
     snapshot = triage(client, None)
     pubsub = pubsub_report(client, 5)
     consistency, _ = _safe(consistency_snapshot, client)
-    return {"triage": snapshot, "pubsub": pubsub, "consistency": consistency}
+    links, _ = _safe(cluster_links, client)
+    stats, _ = _safe(client.info, "commandstats")
+    return {
+        "triage": snapshot,
+        "pubsub": pubsub,
+        "consistency": consistency,
+        "links": links,
+        "offenders": top_offenders(stats),
+    }
 
 
 def cluster_triage(
@@ -288,6 +299,7 @@ def cluster_triage(
     per_node: dict[str, dict] = {}
     raw: list[dict] = []
     snapshots: dict[str, dict] = {}
+    link_notes: set[str] = set()
     for ep, o in outcomes.items():
         shard = shard_names.get(ep, "?")
         if o["status"] == "unreachable":
@@ -306,6 +318,15 @@ def cluster_triage(
             snapshots[ep] = data["consistency"]
         found = [{**f, "node": ep} for f in snapshot["findings"] if f.get("section") != "triage"]
         found += [{**f, "section": "pubsub", "node": ep} for f in pubsub["findings"]]
+        links = data.get("links") or {}
+        self_ids = {n["id"] for n in topo["nodes"] if _endpoint(n) == ep}
+        expected = {n["id"] for n in topo["nodes"] if not n["failing"]} - self_ids
+        found += [
+            {**f, "section": "cluster", "node": ep}
+            for f in links.get("findings", []) + missing_link_findings(links, expected, f"node {ep}")
+        ]
+        for note in links.get("notes", []):
+            link_notes.add(note)
         raw += [{**f, "shard": shard} for f in found]
         per_node[ep] = {
             "status": snapshot["status"],
@@ -344,6 +365,10 @@ def cluster_triage(
     consistency = consistency_findings(snapshots, {ep: p["shard"] for ep, p in per_node.items()}, len(outcomes))
     findings += consistency["findings"]
     findings.sort(key=severity_rank)
+    worst = node_order[0] if node_order and tally[node_order[0]] != (0, 0) else None
+    worst_offenders = (outcomes[worst].get("data") or {}).get("offenders") if worst else None
+    if worst and worst_offenders:
+        findings.append({**_finding("info", offenders_text(worst, worst_offenders), section="cluster"), "node": worst})
     total = len(findings)
     counts = _shard_counts(outcomes)
     if not findings:
@@ -355,7 +380,7 @@ def cluster_triage(
         "partial": counts["shards_total"] != counts["shards_ok"]
         or any(n["status"] not in ("ok", "unreachable") for n in per_node.values()),
         "partial_nodes": _partial_nodes(outcomes),
-        **({"notes": topo["notes"]} if topo.get("notes") else {}),
+        **({"notes": [*topo.get("notes", []), *sorted(link_notes)]} if topo.get("notes") or link_notes else {}),
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "consistency": {k: v for k, v in consistency.items() if k != "findings"},
         "worst_node": node_order[0] if node_order and tally[node_order[0]] != (0, 0) else None,

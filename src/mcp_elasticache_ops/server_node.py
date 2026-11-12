@@ -104,9 +104,18 @@ def node_clients_summary(
 
 @server.read_tool
 def node_latency(ping_samples: Annotated[int, Field(ge=1, le=500)] = 20) -> dict:
-    """Client-side PING RTT percentiles plus LATENCY LATEST events from the server
-    latency monitor (needs latency-monitor-threshold > 0)."""
-    return server.dataplane.latency(server.redis_client(), ping_samples)
+    """Client PING RTT percentiles, LATENCY LATEST events (needs latency-monitor-threshold > 0) and per-command
+    p50/p99/p99.9 from LATENCY HISTOGRAM (Redis 7+/Valkey) with findings for heavy tails."""
+    return server.dataplane.latency(server.redis_client(), ping_samples, server._serverless())
+
+
+@server.read_tool
+def node_commandlog(
+    count: Annotated[int, Field(ge=1, le=128, description="Entries per type")] = 10,
+) -> dict:
+    """Valkey 8 COMMANDLOG (slow, large-request, large-reply): oversized payloads SLOWLOG misses. Findings first,
+    top commands by size and client addresses; no arguments or values. Other engines get a note."""
+    return server.dataplane.commandlog(server.redis_client(), count, server._serverless())
 
 
 @server.read_tool

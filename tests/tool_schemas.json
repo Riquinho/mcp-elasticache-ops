@@ -1364,6 +1364,19 @@
   },
   "type": "object"
  },
+ "node_commandlog": {
+  "additionalProperties": false,
+  "properties": {
+   "count": {
+    "default": 10,
+    "description": "Entries per type",
+    "maximum": 128,
+    "minimum": 1,
+    "type": "integer"
+   }
+  },
+  "type": "object"
+ },
  "node_commandstats": {
   "additionalProperties": false,
   "properties": {

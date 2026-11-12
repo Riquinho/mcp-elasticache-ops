@@ -405,7 +405,9 @@ def cluster_health(
     def probe(n: dict) -> dict:
         client = client_factory(n.get("hostname") or n["ip"], n["port"])
         try:
-            return _node_snapshot(client.info())
+            snap = _node_snapshot(client.info())
+            snap["links"] = cluster_links(client)
+            return snap
         finally:
             close = getattr(client, "close", None)
             if close:
@@ -445,6 +447,12 @@ def cluster_health(
     for ep, res in results.items():
         if res.get("role") == "slave" and res.get("master_link_status") not in (None, "up"):
             findings.append(f"replica {ep} link is {res['master_link_status']}")
+    ids = {n["id"] for n in nodes if not n["failing"]}
+    for ep, res in results.items():
+        links = res.get("links") or {}
+        mine = {n["id"] for n in nodes if _endpoint(n) == ep}
+        for f in links.get("findings", []) + missing_link_findings(links, ids - mine, f"node {ep}"):
+            findings.append(f"node {ep}: {f['message']}")
     shard_rows, shard_findings = _shard_replication_check(topo["shards"], results, lag_bytes_threshold, findings)
     findings += shard_findings
     partial_nodes = [
@@ -465,6 +473,81 @@ def cluster_health(
         "per_node": results,
         "findings": findings or ["no skew, lag or coverage problems detected"],
     }
+
+
+# --------------------------------------------------------------------------- cluster bus links
+
+LINK_BUFFER_WARN_BYTES = 16 * 1024 * 1024  # a send buffer this big means a peer is not draining the cluster bus
+LINK_BUFFER_CRIT_BYTES = 128 * 1024 * 1024
+MAX_LINKS_KEPT = 256
+
+
+def cluster_links(r: redis.Redis, serverless: bool = False) -> dict:
+    """``CLUSTER LINKS`` (Redis 7+/Valkey): cluster bus send-buffer pressure per peer link.
+
+    Returns ``{"supported", "links", "peers", "max_send_buffer_bytes", "findings", "rows", "notes"}``. ``peers`` is
+    the set of node ids that have a link to this node, for the missing-link check (``missing_link_findings``).
+    An engine without the command (Redis 6, refused managed endpoint) gives a note, never an error."""
+    reply, err = _try(r.execute_command, "CLUSTER", "LINKS")
+    if err is not None:
+        server = None if serverless else _try(r.info, "server")[0]
+        note = (
+            _unsupported("CLUSTER LINKS", err, True)
+            if serverless
+            else command_support_note("CLUSTER LINKS", server, err)
+        )
+        return {"supported": False, "links": 0, "peers": [], "findings": [], "rows": [], "notes": [note]}
+    rows: list[dict] = []
+    for entry in reply if isinstance(reply, list | tuple) else []:
+        link = {_s(k): v for k, v in _pairs(entry).items()}
+        rows.append(
+            {
+                "node": _s(link.get("node")),
+                "direction": _s(link.get("direction")),
+                "send_buffer_allocated": int(_num(link.get("send-buffer-allocated"))),
+                "send_buffer_used": int(_num(link.get("send-buffer-used"))),
+            }
+        )
+    rows = rows[:MAX_LINKS_KEPT]
+    findings: list[dict] = []
+    worst = max(rows, key=lambda row: row["send_buffer_allocated"], default=None)
+    top = worst["send_buffer_allocated"] if worst else 0
+    if worst and top >= LINK_BUFFER_WARN_BYTES:
+        findings.append(
+            _finding(
+                "critical" if top >= LINK_BUFFER_CRIT_BYTES else "warning",
+                f"cluster bus send buffer to peer {worst['node'][:12]} ({worst['direction']}) "
+                f"holds {top / 1024 / 1024:.0f} MiB: the peer is slow to read gossip "
+                "(network stall, CPU-bound or blocked node); check that node first",
+                source="cluster links",
+            )
+        )
+    return {
+        "supported": True,
+        "links": len(rows),
+        "peers": sorted({row["node"] for row in rows}),
+        "max_send_buffer_bytes": top,
+        "findings": findings,
+        "rows": sorted(rows, key=lambda row: -row["send_buffer_allocated"])[:3],
+    }
+
+
+def missing_link_findings(links: dict, expected_ids: set[str], label: str) -> list[dict]:
+    """A node that has no link to a peer the topology lists means the cluster bus is split from that peer."""
+    if not links.get("supported"):
+        return []
+    missing = sorted(expected_ids - set(links["peers"]))
+    if not missing:
+        return []
+    shown = ", ".join(i[:12] for i in missing[:3]) + (f" and {len(missing) - 3} more" if len(missing) > 3 else "")
+    return [
+        _finding(
+            "warning",
+            f"{label} has no cluster bus link to {len(missing)} peer(s) ({shown}): gossip is split, expect failover "
+            "or slot-map disagreement; compare CLUSTER NODES on both sides",
+            source="cluster links",
+        )
+    ]
 
 
 # --------------------------------------------------------------------------- cross-node consistency

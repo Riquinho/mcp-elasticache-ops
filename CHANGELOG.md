@@ -1,5 +1,24 @@
 # Changelog
 
+## Round 23 additions to 0.3.0
+
+Round 23. 60 tools.
+
+### Added
+- `node_commandlog`: Valkey 8 `COMMANDLOG` (`slow`, `large-request`, `large-reply`) as findings first, with top
+  commands and client addresses. Arguments and values are never returned. Older engines get a note. Also a section of
+  `node_doctor`.
+- `node_latency` and `node_triage`: per-command p50/p99/p99.9 from `LATENCY HISTOGRAM` (busiest 8 commands, bucket
+  upper bounds) and a warning when p99.9 is 100x the p50 and at least 1 ms.
+- `node_cluster_health` and `node_cluster_triage`: `CLUSTER LINKS` send-buffer pressure (warning 16 MiB, critical
+  128 MiB) and a finding for a node with no link to a peer. Unsupported engines give a note.
+- Allowlist: `COMMANDLOG GET`, `COMMANDLOG LEN` (bounded count and type), `LATENCY HISTOGRAM` (up to 16 plain command
+  names), `CLUSTER LINKS`. `COMMANDLOG RESET` and `COMMANDLOG HELP` are self-tested as refused. 53 commands.
+- Runbook 8: large payload or tail latency.
+
+### Changed
+- tools/list byte budget 49_500 to 50_500: one new tool and longer `node_latency` text.
+
 ## Round 22 additions to 0.3.0
 
 Round 22. 59 tools.

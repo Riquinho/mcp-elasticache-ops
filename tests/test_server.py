@@ -32,7 +32,7 @@ async def test_all_tools_read_only():
     async with Client(server.mcp) as c:
         tools = await c.list_tools()
     names = {t.name for t in tools}
-    assert len(tools) == 59
+    assert len(tools) == 60
     assert {
         "node_health",
         "node_info",
@@ -120,7 +120,7 @@ async def test_node_config_end_to_end(env):
 
 async def test_every_registered_tool_is_wrapped_with_the_output_cap():
     tools = await server.mcp.list_tools()
-    assert len(tools) == 59
+    assert len(tools) == 60
     unwrapped = [t.name for t in tools if not getattr(t.fn, "__capped__", False)]
     assert unwrapped == []
 
@@ -341,7 +341,7 @@ async def test_oncall_prompts_are_registered_and_do_not_change_the_tool_count():
     assert {p.name for p in prompts} == RUNBOOKS
     async with Client(server.mcp) as c:
         assert {p.name for p in await c.list_prompts()} == RUNBOOKS
-        assert len(await c.list_tools()) == 59  # prompts are not tools
+        assert len(await c.list_tools()) == 60  # prompts are not tools
 
 
 @pytest.mark.parametrize("name", sorted(RUNBOOKS))
@@ -385,6 +385,7 @@ AUDIT_CALLS: list[tuple[str, dict]] = [
     ("node_clients", {}),
     ("node_clients_summary", {}),
     ("node_latency", {}),
+    ("node_commandlog", {}),
     ("node_commandstats", {}),
     ("node_latency_events", {}),
     ("node_keyspace_sample", {"sample_size": 10}),

@@ -124,3 +124,60 @@ def test_countkeysinslot_allowed_in_range(slot):
 def test_countkeysinslot_variants_refused(args):
     with pytest.raises((ReadOnlyViolation, ValueError)):
         check(args)
+
+
+# --------------------------------------------------------------------------- top offenders on the hottest shard
+
+STATS = {
+    "cmdstat_get": {"calls": 900, "usec": 7000.0},
+    "cmdstat_hgetall": {"calls": 10, "usec": 90000.0},
+    "cmdstat_set": {"calls": 50, "usec": 3000.0},
+    "cmdstat_ping": {"calls": 5, "usec": 10.0},
+}
+
+
+def test_top_offenders_ranks_by_command_time():
+    from mcp_elasticache_ops.dataplane.hot_slots import top_offenders
+
+    rows = top_offenders(STATS)
+    assert [r["command"] for r in rows] == ["hgetall", "get", "set"]
+    assert rows[0]["share_of_command_time"] == 0.9
+    assert top_offenders(None) == [] and top_offenders({"cmdstat_x": {"usec": 0}}) == []
+
+
+def test_hottest_shard_gets_an_offenders_line_and_others_do_not():
+    seed, factory, clients = _setup()
+    for fake in clients.values():
+        fake.infos["commandstats"] = STATS
+    out = dataplane.cluster_hot_slots(seed, factory, slots_per_shard=8, max_seconds=5)
+    lines = [f for f in out["findings"] if f["message"].startswith("top offenders")]
+    assert len(lines) == 1 and lines[0]["severity"] == "info" and "hgetall 90%" in lines[0]["message"]
+    assert "offenders" in out["per_shard"]["10.0.0.1:6379"] or "offenders" in out["per_shard"]["10.0.0.2:6379"]
+    assert sum("offenders" in row for row in out["per_shard"].values()) == 1
+
+
+def test_balanced_cluster_has_no_offenders_line():
+    a = _shard("a1 10.0.0.1:6379@16379 myself,master - 0 0 1 connected 0-3\n", 2000, {}, range(0, 4))
+    b = _shard("b1 10.0.0.2:6379@16379 myself,master - 0 0 2 connected 4-7\n", 2000, {}, range(4, 8))
+    for fake in (a, b):
+        fake.infos["commandstats"] = STATS
+    clients = {"10.0.0.1:6379": a, "10.0.0.2:6379": b}
+    seed = FakeRedis(infos={"cluster": {"cluster_enabled": 1}})
+    seed.commands["CLUSTER NODES"] = SEED_NODES
+    out = dataplane.cluster_hot_slots(seed, lambda h, p: clients[f"{h}:{p}"], max_seconds=5)
+    assert out["findings"] == []
+    assert all("offenders" not in row for row in out["per_shard"].values())
+
+
+def test_unreachable_shard_never_gets_an_offenders_probe():
+    seed, factory, clients = _setup()
+    clients["10.0.0.2:6379"].infos["commandstats"] = STATS
+
+    def boom(*_a, **_kw):
+        raise redis.ConnectionError("down")
+
+    clients["10.0.0.2:6379"].info = boom
+    clients["10.0.0.1:6379"].infos["commandstats"] = STATS
+    out = dataplane.cluster_hot_slots(seed, factory, slots_per_shard=8, max_seconds=5)
+    assert out["per_shard"]["10.0.0.2:6379"]["status"] == "unreachable"
+    assert "offenders" not in out["per_shard"]["10.0.0.2:6379"]

@@ -71,6 +71,8 @@ MIN_ENGINE_VERSION: dict[str, tuple[int, ...]] = {
     "LATENCY LATEST": (2, 8, 13),
     "INFO ERRORSTATS": (6, 2),
     "INFO LATENCYSTATS": (7, 0),
+    "LATENCY HISTOGRAM": (7, 0),
+    "CLUSTER LINKS": (7, 0),
 }
 
 

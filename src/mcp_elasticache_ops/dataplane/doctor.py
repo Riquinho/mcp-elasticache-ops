@@ -21,6 +21,7 @@ from ._core import (
     version_tuple,
 )
 from .clients import client_findings_if_cheap
+from .health import commandlog
 
 LATENCY_EVENTS_HISTORY = 3  # events whose LATENCY HISTORY is fetched (highest max first)
 
@@ -326,6 +327,17 @@ def _doctor_stages(r: redis.Redis, serverless: bool, findings: list, notes: list
             else raw[:LATENCY_DOCTOR_CHARS] + (f"... [trimmed, {len(raw) - LATENCY_DOCTOR_CHARS} more characters]")
         )
         report[key] = {"status": "findings" if found else "healthy", "advice": advice}
+    # Optional: Valkey 8 COMMANDLOG finds oversized payloads. Older engines report why it is skipped.
+    log = commandlog(r, DOCTOR_COMMANDLOG_COUNT, serverless, info_server or {})
+    findings += log["findings"]
+    report["commandlog"] = (
+        {"status": "findings" if log["findings"] else "healthy"}
+        if log["supported"]
+        else {"status": "not available", "reason": "; ".join(log.get("notes", []))}
+    )
+
+
+DOCTOR_COMMANDLOG_COUNT = 5  # entries per COMMANDLOG type in node_doctor
 
 
 DOCTOR_MAX_SECONDS = 10.0  # node_doctor tool budget; a node that stops answering must not hang the call

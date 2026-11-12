@@ -338,6 +338,12 @@ def test_fuzz_allowlisted_commands_are_case_and_bytes_insensitive(key):
         if key == "COMMAND DOCS"
         else ("5",)
         if key == "CLUSTER COUNTKEYSINSLOT"
+        else ("5", "slow")
+        if key == "COMMANDLOG GET"
+        else ("slow",)
+        if key == "COMMANDLOG LEN"
+        else ("set", "get")
+        if key == "LATENCY HISTOGRAM"
         else ()
     )
     for args in (

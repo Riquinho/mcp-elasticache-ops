@@ -108,3 +108,15 @@ Conclude: safe or not to scale in, whether to scale out, the risk of the node-ty
 
 Conclude: whether the spikes line up with the backup window, headroom for the copy-on-write memory, and the window
 or node to move the backup to.
+
+## 8. Large payload or tail latency (p50 fine, p99.9 bad)
+
+1. `node_latency`: the `command_tail` rows give per-command p50/p99/p99.9. A p99.9 of 100x the p50 names the command
+   with the heavy tail (needs Redis 7+/Valkey; values are bucket upper bounds, up to 2x high).
+2. `node_commandlog` (Valkey 8+): `large-request` and `large-reply` entries name the command, the client address and
+   the size. Redis and older Valkey answer with a note: use `node_slowlog` and `node_keyspace_sample` instead.
+3. `node_cluster_health` or `node_cluster_triage` on a cluster: a large `CLUSTER LINKS` send buffer points at a peer
+   that reads the cluster bus slowly; fix that node before blaming the clients.
+
+Conclude: which command and client produce the oversized payloads or the tail, and the fix (split writes, page reads,
+cap the collection, or move the slow peer).

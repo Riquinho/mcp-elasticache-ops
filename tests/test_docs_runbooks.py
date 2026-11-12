@@ -17,9 +17,9 @@ async def test_docs_runbooks_name_only_registered_tools():
     assert named <= registered, f"runbooks name tools that do not exist: {sorted(named - registered)}"
 
 
-def test_docs_runbooks_have_seven_playbooks():
+def test_docs_runbooks_have_eight_playbooks():
     headings = re.findall(r"^## \d+\. ", RUNBOOKS.read_text(encoding="utf-8"), re.M)
-    assert len(headings) == 7
+    assert len(headings) == 8
 
 
 def test_docs_runbooks_are_read_only_and_linked_from_the_readme():
@@ -35,7 +35,7 @@ async def test_docs_runbooks_cover_the_round_18_readiness_tools():
 
 def test_every_incident_class_lists_at_least_two_tools():
     sections = re.split(r"^## (?=\d+\. )", RUNBOOKS.read_text(encoding="utf-8"), flags=re.M)[1:]
-    assert len(sections) == 7
+    assert len(sections) == 8
     for section in sections:
         title = section.splitlines()[0]
         assert len(set(TOOL_NAME.findall(section))) >= 2, f"playbook {title!r} lists fewer than 2 tools"

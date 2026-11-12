@@ -14,7 +14,19 @@ import redis
 from redis.client import Pipeline
 
 # Commands that carry a subcommand we must inspect.
-_CONTAINERS = {"ACL", "CLIENT", "CLUSTER", "COMMAND", "CONFIG", "LATENCY", "MEMORY", "OBJECT", "PUBSUB", "SLOWLOG"}
+_CONTAINERS = {
+    "ACL",
+    "CLIENT",
+    "CLUSTER",
+    "COMMAND",
+    "COMMANDLOG",
+    "CONFIG",
+    "LATENCY",
+    "MEMORY",
+    "OBJECT",
+    "PUBSUB",
+    "SLOWLOG",
+}
 
 READ_ONLY_COMMANDS: frozenset[str] = frozenset(
     {
@@ -37,6 +49,7 @@ READ_ONLY_COMMANDS: frozenset[str] = frozenset(
         "SLOWLOG LEN",
         "LATENCY LATEST",
         "LATENCY HISTORY",
+        "LATENCY HISTOGRAM",
         "LATENCY DOCTOR",
         "MEMORY STATS",
         "MEMORY USAGE",
@@ -49,6 +62,7 @@ READ_ONLY_COMMANDS: frozenset[str] = frozenset(
         "CLUSTER SHARDS",
         "CLUSTER NODES",
         "CLUSTER MYID",
+        "CLUSTER LINKS",
         "CLUSTER COUNTKEYSINSLOT",
         "CONFIG GET",
         # pub/sub introspection: counts only, never message payloads
@@ -58,6 +72,9 @@ READ_ONLY_COMMANDS: frozenset[str] = frozenset(
         "PUBSUB SHARDCHANNELS",
         "COMMAND COUNT",
         "COMMAND DOCS",
+        # Valkey 8 COMMANDLOG: slow, large-request and large-reply entries (argument values are never asked for)
+        "COMMANDLOG GET",
+        "COMMANDLOG LEN",
         # keyspace sampling (metadata only, never values)
         "SCAN",
         "TYPE",
@@ -190,12 +207,17 @@ MAX_SCAN_COUNT = 1000
 MAX_MEMORY_USAGE_SAMPLES = 100
 MAX_CLIENT_LIST_IDS = 100
 MAX_ACL_LOG_COUNT = 128
+MAX_COMMANDLOG_COUNT = 128
+MAX_HISTOGRAM_COMMANDS = 16
+MAX_HISTOGRAM_NAME_LEN = 48
 MAX_PUBSUB_PATTERN_LEN = 128
 MAX_PUBSUB_NUMSUB_CHANNELS = 100
 LAST_CLUSTER_SLOT = 16383  # slots are 0..16383
 
 _CLIENT_LIST_TYPES = frozenset({"NORMAL", "MASTER", "REPLICA", "SLAVE", "PUBSUB"})
 _SCAN_OPTIONS = frozenset({"MATCH", "COUNT", "TYPE"})
+COMMANDLOG_TYPES = frozenset({"SLOW", "LARGE-REQUEST", "LARGE-REPLY"})
+_HISTOGRAM_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*(?:\|[A-Za-z][A-Za-z0-9_-]*)?")
 
 
 def _int_arg(value: object, what: str) -> int:
@@ -220,6 +242,36 @@ def _check_acl_log(rest: tuple) -> None:
         raise ReadOnlyViolation("ACL LOG accepts at most a count")
     if rest and _int_arg(rest[0], "ACL LOG count") > MAX_ACL_LOG_COUNT:
         raise ReadOnlyViolation(f"ACL LOG count is capped at {MAX_ACL_LOG_COUNT}")
+
+
+def _commandlog_type(value: object, what: str) -> None:
+    if _text(value, what).upper() not in COMMANDLOG_TYPES:
+        raise ReadOnlyViolation(f"{what} must be one of slow, large-request, large-reply")
+
+
+def _check_commandlog(sub: str, rest: tuple) -> None:
+    # COMMANDLOG GET <count> <type> and COMMANDLOG LEN <type>; RESET (clears server state) is not allowed.
+    if sub == "GET":
+        if len(rest) != 2:
+            raise ReadOnlyViolation("COMMANDLOG GET takes a count and a type")
+        count = _int_arg(rest[0], "COMMANDLOG GET count")
+        if not 1 <= count <= MAX_COMMANDLOG_COUNT:
+            raise ReadOnlyViolation(f"COMMANDLOG GET count must be between 1 and {MAX_COMMANDLOG_COUNT}")
+        _commandlog_type(rest[1], "COMMANDLOG GET type")
+    else:
+        if len(rest) != 1:
+            raise ReadOnlyViolation("COMMANDLOG LEN takes a type")
+        _commandlog_type(rest[0], "COMMANDLOG LEN type")
+
+
+def _check_latency_histogram(rest: tuple) -> None:
+    # Command names only (bounded), never the full dump.
+    if not 1 <= len(rest) <= MAX_HISTOGRAM_COMMANDS:
+        raise ReadOnlyViolation(f"LATENCY HISTOGRAM takes 1 to {MAX_HISTOGRAM_COMMANDS} command names")
+    for raw in rest:
+        name = _text(raw, "LATENCY HISTOGRAM command")
+        if len(name) > MAX_HISTOGRAM_NAME_LEN or not _HISTOGRAM_NAME_RE.fullmatch(name):
+            raise ReadOnlyViolation(f"LATENCY HISTOGRAM command name {name!r} is not a plain word")
 
 
 def _check_memory_usage(rest: tuple) -> None:
@@ -320,6 +372,12 @@ def check(args: tuple) -> None:
         raise ReadOnlyViolation("COMMAND DOCS needs at least one command name (the full dump is large)")
     elif key == "CLUSTER COUNTKEYSINSLOT":
         _check_countkeysinslot(rest)
+    elif key == "CLUSTER LINKS" and rest:
+        raise ReadOnlyViolation("CLUSTER LINKS takes no arguments")
+    elif name == "COMMANDLOG":
+        _check_commandlog(sub, rest)
+    elif key == "LATENCY HISTOGRAM":
+        _check_latency_histogram(rest)
     elif name == "PUBSUB":
         _check_pubsub(sub, rest)
     elif key.startswith("OBJECT "):
@@ -338,7 +396,8 @@ FORBIDDEN_COMMANDS: frozenset[str] = frozenset(
         "FLUSHALL", "FLUSHDB", "KEYS", "CONFIG SET", "CONFIG REWRITE", "CONFIG RESETSTAT", "CLIENT KILL",
         "CLIENT PAUSE", "CLIENT UNPAUSE", "CLIENT REPLY", "CLIENT TRACKING", "DEBUG", "EVAL", "EVALSHA",
         "FCALL", "SCRIPT", "SCRIPT LOAD", "SCRIPT FLUSH", "FUNCTION", "ACL", "ACL LIST", "ACL GETUSER",
-        "ACL SETUSER", "ACL DELUSER", "ACL LOG RESET", "MONITOR", "SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE",
+        "ACL SETUSER", "ACL DELUSER", "ACL LOG RESET",
+        "COMMANDLOG", "COMMANDLOG RESET", "COMMANDLOG HELP", "MONITOR", "SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE",
                 "PUBLISH", "PUBSUB", "PUBSUB HELP", "PUBSUB SHARDNUMSUB", "XREAD", "XREADGROUP",
         "XRANGE", "MULTI", "EXEC", "WATCH", "SHUTDOWN", "SLAVEOF", "REPLICAOF", "FAILOVER", "SAVE", "BGSAVE",
         "BGREWRITEAOF", "SLOWLOG RESET", "CLUSTER FAILOVER", "CLUSTER RESET", "MIGRATE", "RESTORE", "DUMP",

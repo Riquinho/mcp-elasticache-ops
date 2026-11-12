@@ -5,6 +5,7 @@ from __future__ import annotations
 import statistics
 import time
 from collections import Counter, defaultdict
+from typing import Any
 
 import redis
 
@@ -33,9 +34,12 @@ from ._core import (
     _finding,
     _num,
     _s,
+    _sorted_findings,
     _try,
     _unsupported,
+    command_support_note,
     engine_of,
+    version_tuple,
 )
 
 
@@ -396,8 +400,85 @@ def client_list(r: redis.Redis, top: int = 20) -> dict:
     }
 
 
-def latency(r: redis.Redis, ping_samples: int = 20) -> dict:
-    """Client-side PING round-trip plus the server latency monitor, if enabled."""
+HISTOGRAM_COMMANDS = 8  # busiest commands (by total time) whose LATENCY HISTOGRAM is fetched
+HISTOGRAM_TOP = 5  # rows returned in command_tail
+HISTOGRAM_MIN_CALLS = 100  # fewer calls than this make a percentile meaningless
+HISTOGRAM_TAIL_FACTOR = 100.0  # p99.9 this many times the p50 means a heavy tail
+HISTOGRAM_TAIL_FLOOR_US = 1_000  # ... and only when the tail itself is at least 1 ms
+_HISTOGRAM_QUANTILES = (("p50_usec", 0.5), ("p99_usec", 0.99), ("p99_9_usec", 0.999))
+
+
+def _flat_pairs(value: Any) -> list[tuple[Any, Any]]:
+    """A RESP3 map or a RESP2 flat ``[k1, v1, k2, v2]`` list as ``(key, value)`` pairs."""
+    if isinstance(value, dict):
+        return list(value.items())
+    if isinstance(value, list | tuple):
+        return list(zip(value[0::2], value[1::2], strict=False))
+    return []
+
+
+def _histogram_row(name: str, body: Any) -> dict | None:
+    """p50/p99/p99.9 from one command's cumulative ``histogram_usec`` buckets (bucket upper bounds, in microseconds)."""
+    fields = {str(_s(k)): v for k, v in _flat_pairs(body)}
+    calls = int(_num(fields.get("calls")))
+    buckets = sorted((_num(_s(k)), _num(v)) for k, v in _flat_pairs(fields.get("histogram_usec")))
+    if calls <= 0 or not buckets:
+        return None
+    row: dict[str, Any] = {"command": name, "calls": calls}
+    for label, quantile in _HISTOGRAM_QUANTILES:
+        row[label] = next((bound for bound, cumulative in buckets if cumulative >= quantile * calls), buckets[-1][0])
+    p50 = _num(row["p50_usec"])
+    row["tail_ratio"] = round(_num(row["p99_9_usec"]) / p50, 1) if p50 > 0 else None
+    return row
+
+
+def command_tail(r: redis.Redis, serverless: bool = False) -> dict:
+    """Per-command p50/p99/p99.9 from ``LATENCY HISTOGRAM`` for the busiest commands, widest tail first.
+
+    Needs Redis 7.0+/Valkey; an older engine or a managed endpoint that refuses it yields a note, not an error.
+    Percentiles are histogram bucket upper bounds (powers of two), so they overstate by up to 2x."""
+    stats, stats_err = _try(r.info, "commandstats")
+    if stats is None:
+        return {"findings": [], "rows": [], "notes": [_unsupported("INFO commandstats", stats_err, serverless)]}
+    busiest = sorted(
+        (
+            (str(k).removeprefix("cmdstat_"), _num((v or {}).get("usec")))
+            for k, v in stats.items()
+            if isinstance(v, dict)
+        ),
+        key=lambda item: -item[1],
+    )
+    names = [name for name, _ in busiest[:HISTOGRAM_COMMANDS]]
+    if not names:
+        return {"findings": [], "rows": []}
+    reply, err = _try(r.execute_command, "LATENCY", "HISTOGRAM", *names)
+    if err is not None:
+        if serverless:
+            return {"findings": [], "rows": [], "notes": [_unsupported("LATENCY HISTOGRAM", err, True)]}
+        server, _ = _try(r.info, "server")
+        return {"findings": [], "rows": [], "notes": [command_support_note("LATENCY HISTOGRAM", server, err)]}
+    rows = [
+        row
+        for key, body in _flat_pairs(reply)
+        if (row := _histogram_row(str(_s(key)), body)) is not None and row["calls"] >= HISTOGRAM_MIN_CALLS
+    ]
+    rows.sort(key=lambda row: -(row["tail_ratio"] or 0.0))
+    findings = [
+        _finding(
+            "warning",
+            f"{str(row['command']).upper()} p99.9 is {row['tail_ratio']:.0f}x its p50 "
+            f"({_num(row['p99_9_usec']) / 1000:.1f} ms vs {_num(row['p50_usec']) / 1000:.2f} ms over {row['calls']} "
+            "calls): suspect big keys or a blocking command; see node_commandlog and node_slowlog",
+            command=row["command"],
+        )
+        for row in rows[:HISTOGRAM_TOP]
+        if (row["tail_ratio"] or 0.0) >= HISTOGRAM_TAIL_FACTOR and _num(row["p99_9_usec"]) >= HISTOGRAM_TAIL_FLOOR_US
+    ]
+    return {"findings": findings, "rows": rows[:HISTOGRAM_TOP]}
+
+
+def latency(r: redis.Redis, ping_samples: int = 20, serverless: bool = False) -> dict:
+    """Client-side PING round-trip, the server latency monitor and the per-command slow tail (LATENCY HISTOGRAM)."""
     samples = []
     for _ in range(max(1, min(int(ping_samples), 500))):
         t0 = time.perf_counter()
@@ -411,7 +492,9 @@ def latency(r: redis.Redis, ping_samples: int = 20) -> dict:
     for row in latest or []:
         # [event, timestamp, latest_ms, max_ms]
         events.append({"event": _s(row[0]), "timestamp": row[1], "latest_ms": row[2], "max_ms": row[3]})
+    tail = command_tail(r, serverless)
     return {
+        "findings": tail["findings"],
         "ping_rtt_ms": {
             "samples": len(samples),
             "min": round(samples[0], 3),
@@ -423,5 +506,142 @@ def latency(r: redis.Redis, ping_samples: int = 20) -> dict:
         if threshold
         else "unavailable (CONFIG GET refused; see parameter group)",
         "latency_latest": events if latest is not None else {"unavailable": latest_err},
+        "command_tail": tail["rows"],
+        **({"notes": tail["notes"]} if tail.get("notes") else {}),
         "hint": "Empty latency_latest usually means latency-monitor-threshold is 0 in the parameter group.",
+    }
+
+
+COMMANDLOG_TYPES = ("slow", "large-request", "large-reply")
+COMMANDLOG_TOP = 5  # command and client rows returned per type
+COMMANDLOG_LARGE_WARN_BYTES = 1024 * 1024  # the server logs from 1 MiB by default
+COMMANDLOG_LARGE_CRIT_BYTES = 16 * 1024 * 1024
+COMMANDLOG_SLOW_WARN_US = 100_000
+_COMMANDLOG_MIN_VERSION = (8, 0)
+
+
+def _commandlog_entries(reply: Any) -> list[dict]:
+    """Entries as ``[id, time, value, args, client_addr, client_name]``; the arguments are dropped on purpose
+    (only the command name is kept), because a large request or reply is exactly where values live."""
+    out = []
+    for entry in reply if isinstance(reply, list | tuple) else []:
+        if not isinstance(entry, list | tuple) or len(entry) < 3:
+            continue
+        args = entry[3] if len(entry) > 3 and isinstance(entry[3], list | tuple) else []
+        out.append(
+            {
+                "id": entry[0],
+                "timestamp": entry[1],
+                "value": int(_num(entry[2])),
+                "command": str(_s(args[0])).upper()[:32] if args else "?",
+                "client_address": _s(entry[4]) if len(entry) > 4 else None,
+                "client_name": _s(entry[5]) if len(entry) > 5 else None,
+            }
+        )
+    return out
+
+
+def _commandlog_section(kind: str, entries: list[dict], total: Any) -> dict:
+    unit = "duration_us" if kind == "slow" else "size_bytes"
+    by_command: dict[str, dict[str, int]] = defaultdict(lambda: {"entries": 0, "max": 0})
+    by_client: Counter[str] = Counter()
+    for e in entries:
+        agg = by_command[e["command"]]
+        agg["entries"] += 1
+        agg["max"] = max(agg["max"], e["value"])
+        by_client[str(e["client_address"] or "?")] += 1
+    ranked = sorted(by_command.items(), key=lambda item: -item[1]["max"])
+    return {
+        "len": total,
+        "returned": len(entries),
+        "top_commands": [{"command": name, f"max_{unit}": a["max"], "entries": a["entries"]} for name, a in ranked][
+            :COMMANDLOG_TOP
+        ],
+        "top_clients": [{"client_address": addr, "entries": n} for addr, n in by_client.most_common(COMMANDLOG_TOP)],
+        "entries": [
+            {
+                "id": e["id"],
+                "timestamp": e["timestamp"],
+                unit: e["value"],
+                "command": e["command"],
+                "client_address": e["client_address"],
+                "client_name": e["client_name"],
+            }
+            for e in sorted(entries, key=lambda e: -e["value"])[:COMMANDLOG_TOP]
+        ],
+    }
+
+
+def _commandlog_findings(sections: dict[str, dict]) -> list[dict]:
+    out: list[dict] = []
+    for kind, section in sections.items():
+        if not section["entries"]:
+            continue
+        top = section["entries"][0]
+        who = f" from {top['client_address']}" if top["client_address"] else ""
+        if kind == "slow":
+            us = top["duration_us"]
+            out.append(
+                _finding(
+                    "warning" if us >= COMMANDLOG_SLOW_WARN_US else "info",
+                    f"slowest command in the commandlog is {top['command']} at {us / 1000:.1f} ms{who} "
+                    f"({section['len']} logged); node_slowlog has the same view on every engine",
+                    source="commandlog",
+                    kind=kind,
+                )
+            )
+            continue
+        size = top["size_bytes"]
+        if size >= COMMANDLOG_LARGE_CRIT_BYTES:
+            severity = "critical"
+        elif size >= COMMANDLOG_LARGE_WARN_BYTES:
+            severity = "warning"
+        else:
+            severity = "info"
+        if kind == "large-request":
+            what, fix = "request", "split the write (smaller pipeline batches or a smaller value)"
+        else:
+            what, fix = (
+                "reply",
+                "page the read (HSCAN/SSCAN/LRANGE ranges) or cap the collection; big replies fill buffers",
+            )
+        out.append(
+            _finding(
+                severity,
+                f"largest {what} is {size / 1024 / 1024:.1f} MiB ({top['command']}){who}, "
+                f"{section['len']} logged: {fix}",
+                source="commandlog",
+                kind=kind,
+            )
+        )
+    return out
+
+
+def commandlog(r: redis.Redis, count: int = 10, serverless: bool = False, info_server: dict | None = None) -> dict:
+    """Valkey 8 COMMANDLOG for ``slow``, ``large-request`` and ``large-reply``: the oversized payloads SLOWLOG misses.
+
+    Findings first, then top commands by size and client addresses. Arguments and values are never returned.
+    Redis and Valkey before 8.0 have no COMMANDLOG: that is a note naming the engine, never an error."""
+    count = max(1, min(int(count), 128))
+    server = info_server if info_server is not None else _try(r.info, "server")[0]
+    engine = engine_of(server or {})
+    if server and not (engine["engine"] == "valkey" and version_tuple(engine["version"]) >= _COMMANDLOG_MIN_VERSION):
+        reason = f"{engine['version_label']} has no COMMANDLOG; it needs Valkey 8.0+"
+        return {"findings": [], "supported": False, "notes": [_unsupported("COMMANDLOG GET", reason, serverless)]}
+    sections: dict[str, dict] = {}
+    notes: list[str] = []
+    for kind in COMMANDLOG_TYPES:
+        reply, err = _try(r.execute_command, "COMMANDLOG", "GET", count, kind)
+        if err is not None:
+            notes.append(_unsupported(f"COMMANDLOG GET {kind}", err, serverless))
+            if not sections:  # the first type failing means the command itself is missing or refused
+                break
+            continue
+        total, _ = _try(r.execute_command, "COMMANDLOG", "LEN", kind)
+        sections[kind] = _commandlog_section(kind, _commandlog_entries(reply), total)
+    return {
+        "findings": _sorted_findings(_commandlog_findings(sections)),
+        "supported": bool(sections),
+        **sections,
+        **({"notes": notes} if notes else {}),
     }

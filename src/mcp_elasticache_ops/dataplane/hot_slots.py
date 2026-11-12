@@ -8,7 +8,7 @@ from typing import Any
 
 import redis
 
-from ._core import _finding, _num, _s, _sorted_findings
+from ._core import _finding, _num, _s, _safe, _sorted_findings
 from .fanout import (
     ClientFactory,
     _fan_out_primaries,
@@ -17,6 +17,31 @@ from .fanout import (
     _unreachable_findings,
 )
 from .topology import TOTAL_SLOTS, parse_cluster_nodes
+
+OFFENDERS_TOP = 3  # commands named in the "top offenders" line
+
+
+def top_offenders(stats: Any) -> list[dict]:
+    """The commands that eat most of a node's command time, from ``INFO commandstats`` (no extra command)."""
+    rows = [
+        (str(k).removeprefix("cmdstat_"), _num(v.get("usec")), int(_num(v.get("calls"))))
+        for k, v in (stats if isinstance(stats, dict) else {}).items()
+        if isinstance(v, dict)
+    ]
+    total = sum(usec for _, usec, _ in rows)
+    if total <= 0:
+        return []
+    rows.sort(key=lambda row: -row[1])
+    return [
+        {"command": name, "share_of_command_time": round(usec / total, 2), "calls": calls}
+        for name, usec, calls in rows[:OFFENDERS_TOP]
+    ]
+
+
+def offenders_text(node: str, offenders: list[dict]) -> str:
+    named = ", ".join(f"{o['command']} {o['share_of_command_time']:.0%}" for o in offenders)
+    return f"top offenders on {node} by command time: {named}; node_commandlog and node_slowlog name the clients"
+
 
 DEFAULT_SLOTS_PER_SHARD = 64
 MAX_SLOTS_PER_SHARD = 256  # each sampled slot is one CLUSTER COUNTKEYSINSLOT, O(1) on the node
@@ -59,6 +84,8 @@ def _shard_probe(slots_per_shard: int):
             "slot_counts": {},
             "partial": False,
         }
+        stats, _ = _safe(client.info, "commandstats")  # for the hottest-shard offenders line
+        row["offenders"] = top_offenders(stats) if time.monotonic() < deadline else []
         raw = client.execute_command("CLUSTER", "NODES")
         nodes = parse_cluster_nodes(_s(raw)) if raw else []
         me = next((n for n in nodes if n.get("myself")), None)
@@ -160,7 +187,13 @@ def cluster_hot_slots(
             )
         per_shard[ep] = {"status": o["status"], **data}
     live = {ep: row for ep, row in per_shard.items() if row["status"] != "unreachable"}
-    findings += _shard_skew_findings(live)
+    skew = _shard_skew_findings(live)
+    findings += skew
+    hottest = max(live, key=lambda ep: (live[ep].get("ops_per_sec", 0), live[ep].get("used_memory", 0)), default=None)
+    if skew and hottest and live[hottest].get("offenders"):
+        findings.append(
+            _finding("info", offenders_text(hottest, live[hottest]["offenders"]), shard=hottest, category="shard-skew")
+        )
     hot, sampled = _hot_slot_rows(live)
     for h in hot[:MAX_HOT_SLOTS]:
         findings.append(
@@ -172,7 +205,9 @@ def cluster_hot_slots(
                 category="hot-slot",
             )
         )
-    for row in live.values():
+    for ep, row in live.items():
+        if ep != hottest or not skew:
+            row.pop("offenders", None)  # only the hottest shard of a skewed cluster reports offenders
         row["slots_sampled"] = len(row.pop("slot_counts", {}))
     counts = _shard_counts(outcomes)
     return {
