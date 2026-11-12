@@ -9,6 +9,19 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - name: Build smoke test
+        run: uv build
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -21,8 +34,13 @@ jobs:
         options: >-
           --health-cmd "redis-cli ping || valkey-cli ping"
           --health-interval 2s --health-timeout 2s --health-retries 15
+      memcached:
+        image: memcached:1.6-alpine
+        ports: ["11211:11211"]
     env:
       REDIS_TEST_URL: redis://localhost:6379/0
+      MEMCACHED_TEST_HOST: localhost
+      MEMCACHED_TEST_PORT: "11211"
       AWS_EC2_METADATA_DISABLED: "true"
     steps:
       - uses: actions/checkout@v4
@@ -30,6 +48,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --locked
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run pytest -q
+      - run: uv run pytest -q --cov=mcp_elasticache_ops

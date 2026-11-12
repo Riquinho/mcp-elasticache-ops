@@ -61,3 +61,112 @@ def test_client_refuses_before_network():
     pipe = r.pipeline()
     with pytest.raises(ReadOnlyViolation):
         pipe.delete("k")
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("CONFIG GET", "requirepass"),
+        ("CONFIG GET", "REQUIREPASS"),
+        ("CONFIG GET", "masterauth"),
+        ("CONFIG GET", "masteruser"),
+        ("CONFIG GET", "*"),
+        ("CONFIG GET", "*pass*"),
+        ("CONFIG GET", "*auth"),
+        ("CONFIG GET", "tls-key-file"),
+        ("CONFIG GET", "tls-*"),
+        ("CONFIG GET", "m?xmemory"),
+        ("CONFIG GET", "maxmemory", "requirepass"),
+        ("CONFIG GET", "[mr]*"),
+        ("CONFIG GET", "max*"),
+        ("CONFIG GET",),
+        ("CONFIG", "GET", "requirepass"),
+        ("CONFIG", "GET", "*"),
+        ("CONFIG GET", b"requirepass"),
+        ("CONFIG GET", 123),
+    ],
+)
+def test_config_get_sensitive_or_broad_is_rejected(args):
+    with pytest.raises(ReadOnlyViolation):
+        check(args)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("CONFIG GET", "maxmemory"),
+        ("CONFIG GET", "maxmemory*"),
+        ("CONFIG GET", "maxmemory-policy"),
+        ("CONFIG GET", "maxclients"),
+        ("CONFIG GET", "timeout"),
+        ("CONFIG GET", "latency-monitor-threshold"),
+        ("CONFIG GET", "slowlog-*"),
+        ("CONFIG GET", "slowlog-log-slower-than"),
+        ("CONFIG GET", "appendonly"),
+        ("CONFIG GET", "save"),
+        ("CONFIG GET", "notify-keyspace-events"),
+        ("CONFIG GET", "activedefrag"),
+        ("CONFIG GET", "cluster-enabled"),
+        ("CONFIG", "GET", "maxmemory"),
+        ("CONFIG GET", b"maxclients"),
+        ("CONFIG GET", "maxmemory", "maxclients"),
+    ],
+)
+def test_config_get_allowed_parameters(args):
+    check(args)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("INFO\nSET k v",),
+        ("INFO SET k v",),
+        ("INFO\tmemory",),
+        (" INFO",),
+        ("INFO ",),
+        ("PING GET k",),
+        ("CLIENT LIST SET k v",),
+        ("CLIENT LIST\nFLUSHALL",),
+        ("CLIENT", "LIST\nFLUSHALL"),
+        ("CLIENT", "LIST SET"),
+        ("CONFIG GET maxmemory",),  # no space tricks: pattern must be a separate argument
+        ("",),
+        (None,),
+        (123,),
+        (["INFO"],),
+        (object(),),
+    ],
+)
+def test_malformed_or_untyped_heads_are_rejected(args):
+    with pytest.raises(ReadOnlyViolation):
+        check(args)
+
+
+def test_command_key_rejects_extra_tokens_and_types():
+    with pytest.raises(ReadOnlyViolation):
+        command_key(("INFO\nSET k v",))
+    with pytest.raises(ReadOnlyViolation):
+        command_key((5,))
+    with pytest.raises(ReadOnlyViolation):
+        command_key(())
+
+
+def test_pipeline_paths_use_the_same_guard():
+    r = SafeRedis(host="127.0.0.1", port=1, socket_connect_timeout=0.2)
+    pipe = r.pipeline()
+    for bad in (
+        ("CONFIG GET", "requirepass"),
+        ("CONFIG GET", "*"),
+        ("CONFIG", "GET", "masterauth"),
+        ("INFO\nSET k v",),
+        ("SET", "k", "v"),
+    ):
+        with pytest.raises(ReadOnlyViolation):
+            pipe.execute_command(*bad)
+    with pytest.raises(ReadOnlyViolation):
+        pipe.config_get("requirepass")
+    with pytest.raises(ReadOnlyViolation):
+        r.config_get("*")
+    with pytest.raises(ReadOnlyViolation):
+        r.execute_command("INFO\nSET k v")
+    assert not pipe.command_stack

@@ -14,6 +14,7 @@ from pydantic import Field
 
 from . import dataplane, memcached
 from .config import ControlPlaneConfig, DataPlaneConfig, MemcachedConfig
+from .connection import build_client
 from .controlplane import ControlPlane
 from .safe_client import SafeRedis
 
@@ -34,22 +35,11 @@ mcp = FastMCP("mcp-elasticache-ops", instructions=INSTRUCTIONS)
 
 @lru_cache(maxsize=1)
 def redis_client() -> SafeRedis:
-    cfg = DataPlaneConfig.from_env()
-    kwargs = dict(
-        host=cfg.host,
-        port=cfg.port,
-        db=cfg.db,
-        username=cfg.username,
-        password=cfg.password,
-        socket_timeout=cfg.socket_timeout,
-        socket_connect_timeout=cfg.socket_timeout,
-        decode_responses=True,
-        encoding_errors="backslashreplace",
-        client_name="mcp-elasticache-ops",
-    )
-    if cfg.tls:
-        kwargs.update(ssl=True, ssl_cert_reqs="required" if cfg.tls_verify else "none")
-    return SafeRedis(**kwargs)
+    return build_client(DataPlaneConfig.from_env())
+
+
+def _node_client(host: str, port: int) -> SafeRedis:
+    return build_client(DataPlaneConfig.from_env(), host=host, port=port)
 
 
 @lru_cache(maxsize=1)
@@ -84,7 +74,7 @@ def node_info(
         ),
     ] = None,
 ) -> dict:
-    """Raw INFO output, optionally for a single section."""
+    """Raw INFO output, optionally for a single section. Password-like keys are masked."""
     return dataplane.server_info(redis_client(), section)
 
 
@@ -134,11 +124,15 @@ def node_keyspace_sample(
     top: Annotated[int, Field(ge=1, le=500)] = 20,
     scan_count: Annotated[int, Field(ge=10, le=5000, description="SCAN COUNT hint")] = 250,
     pause_ms: Annotated[int, Field(ge=0, le=1000, description="Sleep between SCAN batches")] = 0,
+    max_seconds: Annotated[
+        float, Field(gt=0, le=60, description="Wall-clock budget; returns partial=true when exceeded")
+    ] = 10.0,
 ) -> dict:
     """Big keys (bytes and element count), hot keys (LFU policies) or coldest keys,
     type distribution and TTL coverage from a bounded SCAN. Metadata only; values
-    are never read. On cluster-mode-enabled groups this samples the connected node only."""
-    return dataplane.keyspace_sample(redis_client(), sample_size, match, top, scan_count, pause_ms)
+    are never read. Stops at max_seconds and reports partial=true. On cluster-mode-enabled
+    groups this samples the connected node's slots only (see node_cluster_nodes)."""
+    return dataplane.keyspace_sample(redis_client(), sample_size, match, top, scan_count, pause_ms, max_seconds)
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -152,6 +146,23 @@ def node_cluster() -> dict:
     """Cluster-mode view: CLUSTER INFO, slots per primary and CLUSTER SHARDS when
     available. Reports cluster mode disabled otherwise."""
     return dataplane.cluster(redis_client())
+
+
+@mcp.tool(annotations=READ_ONLY)
+def node_cluster_nodes() -> dict:
+    """CLUSTER NODES parsed into per-shard primary/replica endpoints, slot counts and
+    failing nodes, plus how to target each shard with ELASTICACHE_HOST."""
+    return dataplane.cluster_nodes(redis_client())
+
+
+@mcp.tool(annotations=READ_ONLY)
+def node_cluster_health(
+    max_workers: Annotated[int, Field(ge=1, le=32, description="Concurrent node probes")] = 8,
+    per_node_timeout: Annotated[float, Field(gt=0, le=60, description="Seconds to wait per node")] = 5.0,
+) -> dict:
+    """Cluster-mode fan-out: INFO on every node (bounded concurrency, per-node timeout)
+    flagging memory/ops skew across shards, failed nodes, uncovered slots and replica lag."""
+    return dataplane.cluster_health(redis_client(), _node_client, max_workers, per_node_timeout)
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -214,19 +225,79 @@ def aws_parameters(parameter_group: str, only_modified: bool = True) -> dict:
 
 
 @mcp.tool(annotations=READ_ONLY)
+def aws_snapshots(
+    replication_group_id: str | None = None,
+    cache_cluster_id: str | None = None,
+    source: Annotated[Literal["automated", "manual"] | None, Field(description="Filter by snapshot source")] = None,
+    stale_hours: Annotated[int, Field(ge=1, le=8760, description="Flag automatic snapshots older than this")] = 36,
+) -> dict:
+    """DescribeSnapshots: age, size, status, automatic vs manual, with findings for
+    retention gaps, failed snapshots and groups without automatic backups."""
+    return control_plane().snapshots(replication_group_id, cache_cluster_id, source, stale_hours)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def aws_users(engine: Annotated[Literal["redis", "valkey"] | None, Field(description="Engine filter")] = None) -> dict:
+    """DescribeUsers (RBAC): authentication type and access strings, never passwords.
+    Flags users with '~* +@all' access and users without a password."""
+    return control_plane().users(engine)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def aws_user_groups() -> dict:
+    """DescribeUserGroups: members, attached replication groups/serverless caches, pending changes."""
+    return control_plane().user_groups()
+
+
+@mcp.tool(annotations=READ_ONLY)
+def aws_global_replication_groups() -> dict:
+    """DescribeGlobalReplicationGroups: global datastore members, regions, roles and status."""
+    return control_plane().global_replication_groups()
+
+
+@mcp.tool(annotations=READ_ONLY)
+def aws_reserved_nodes() -> dict:
+    """DescribeReservedCacheNodes plus running nodes: reservation coverage per node type and
+    engine, on-demand nodes not covered, unused or soon-expiring reservations."""
+    return control_plane().reserved_nodes()
+
+
+@mcp.tool(annotations=READ_ONLY)
+def aws_service_updates(
+    status: Annotated[Literal["available", "cancelled", "expired"], Field(description="Update status")] = "available",
+) -> dict:
+    """DescribeServiceUpdates: pending updates by severity with apply-by and auto-update dates."""
+    return control_plane().service_updates(status)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def aws_subnet_groups() -> dict:
+    """DescribeCacheSubnetGroups: VPC, subnets and AZ spread (flags groups in fewer than 2 AZs)."""
+    return control_plane().subnet_groups()
+
+
+@mcp.tool(annotations=READ_ONLY)
 def aws_metrics(
     cache_cluster_id: Annotated[
-        str, Field(description="CacheClusterId (node cluster, e.g. 'my-rg-0001-001') or serverless cache name")
-    ],
+        str | None,
+        Field(description="CacheClusterId (node cluster, e.g. 'my-rg-0001-001') or serverless cache name"),
+    ] = None,
     metrics: Annotated[list[str] | None, Field(description="CloudWatch metric names; default set if omitted")] = None,
     minutes: Annotated[int, Field(ge=1, le=20160)] = 60,
-    period_seconds: Annotated[int, Field(ge=60, le=86400)] = 60,
+    period_seconds: Annotated[int, Field(ge=60, le=86400, multiple_of=60)] = 60,
     node_id: str | None = None,
     serverless: bool = False,
+    include_series: Annotated[bool, Field(description="Return the full time series (token heavy)")] = False,
+    replication_group_id: Annotated[
+        str | None, Field(description="Query every member node of this replication group (cluster mode aware)")
+    ] = None,
 ) -> dict:
     """CloudWatch AWS/ElastiCache metrics (EngineCPUUtilization, memory %, Evictions,
-    CurrConnections, CacheHitRate, ReplicationLag, ...) with latest/max/avg summary."""
-    return control_plane().metrics(cache_cluster_id, metrics, minutes, period_seconds, node_id, serverless)
+    CurrConnections, CacheHitRate, ReplicationLag, ...). Findings first, then a
+    min/avg/max/latest summary; the raw series only with include_series=true."""
+    return control_plane().metrics(
+        cache_cluster_id, metrics, minutes, period_seconds, node_id, serverless, include_series, replication_group_id
+    )
 
 
 # ------------------------------------------------------------------------ main

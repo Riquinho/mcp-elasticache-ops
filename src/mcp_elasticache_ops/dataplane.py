@@ -11,9 +11,13 @@ reported as ``unavailable`` instead of failing the whole tool.
 
 from __future__ import annotations
 
+import re
 import statistics
 import time
 from collections import Counter, defaultdict
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Any
 
 import redis
@@ -52,10 +56,23 @@ def engine_of(info_server: dict) -> dict:
 # --------------------------------------------------------------------------- INFO
 
 
+_SECRET_KEY = re.compile(r"pass(word)?|secret|token|masterauth|masteruser|requirepass", re.IGNORECASE)
+REDACTED = "***REDACTED***"
+
+
+def redact(value: Any) -> Any:
+    """Mask values of password-like keys (masterauth, requirepass, ...) recursively."""
+    if isinstance(value, dict):
+        return {k: REDACTED if _SECRET_KEY.search(str(k)) else redact(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact(v) for v in value]
+    return value
+
+
 def server_info(r: redis.Redis, section: str | None = None) -> dict:
     """Raw INFO, optionally a single section (server, clients, memory, stats, ...)."""
     data = r.info(section) if section else r.info()
-    return {"section": section or "default", "info": data}
+    return {"section": section or "default", "info": redact(data)}
 
 
 def health_summary(r: redis.Redis) -> dict:
@@ -277,6 +294,11 @@ def commandstats(r: redis.Redis, top: int = 20) -> dict:
 # --------------------------------------------------------------------- keyspace
 
 
+DEFAULT_SAMPLE_SECONDS = 10.0
+MAX_SAMPLE_SECONDS = 60.0
+PIPELINE_CHUNK = 100
+
+
 def keyspace_sample(
     r: redis.Redis,
     sample_size: int = 1000,
@@ -284,15 +306,26 @@ def keyspace_sample(
     top: int = 20,
     scan_count: int = 250,
     pause_ms: int = 0,
+    max_seconds: float = DEFAULT_SAMPLE_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
 ) -> dict:
     """Big/hot key finder based on a bounded SCAN.
 
-    Cost control: at most ``sample_size`` keys are inspected, SCAN uses COUNT
-    ``scan_count`` and an optional pause between batches. Hot keys need an LFU
-    ``maxmemory-policy`` (OBJECT FREQ); otherwise idle time is reported.
+    Cost control: at most ``sample_size`` keys are inspected (so at most four
+    pipelined metadata commands per key plus one length command), SCAN uses COUNT
+    ``scan_count`` and an optional pause between batches, and the whole call
+    stops at the ``max_seconds`` wall-clock budget (hard cap 60 s), returning
+    what it has with ``partial=True``. Hot keys need an LFU ``maxmemory-policy``
+    (OBJECT FREQ); otherwise idle time is reported. Only the connected node is
+    sampled, which in cluster mode means only that node's slots.
     """
     sample_size = max(1, min(int(sample_size), 100_000))
-    policy = str(r.info("memory").get("maxmemory_policy", ""))
+    max_seconds = max(0.01, min(float(max_seconds), MAX_SAMPLE_SECONDS))
+    started = clock()
+    deadline = started + max_seconds
+    partial_reason: str | None = None
+    mem_info = r.info("memory")
+    policy = str(mem_info.get("maxmemory_policy", ""))
     lfu = "lfu" in policy
     keys: list[str] = []
     cursor = 0
@@ -301,13 +334,19 @@ def keyspace_sample(
         keys.extend(batch)
         if cursor == 0 or len(keys) >= sample_size:
             break
+        if clock() >= deadline:
+            partial_reason = f"time budget of {max_seconds:g}s exhausted while scanning"
+            break
         if pause_ms:
             time.sleep(pause_ms / 1000)
     keys = keys[:sample_size]
 
     rows = []
-    for i in range(0, len(keys), 200):
-        chunk = keys[i : i + 200]
+    for i in range(0, len(keys), PIPELINE_CHUNK):
+        if clock() >= deadline:
+            partial_reason = partial_reason or f"time budget of {max_seconds:g}s exhausted while inspecting keys"
+            break
+        chunk = keys[i : i + PIPELINE_CHUNK]
         pipe = r.pipeline()
         for k in chunk:
             pipe.type(k)
@@ -342,10 +381,16 @@ def keyspace_sample(
         by_type[row["type"]]["bytes"] += row["bytes"] or 0
     no_ttl = sum(1 for row in rows if row["ttl_ms"] == -1)
     top = max(1, int(top))
-    result = {
+    partial = partial_reason is not None
+    result: dict[str, Any] = {
         "sampled_keys": len(rows),
         "dbsize": r.dbsize(),
-        "complete_scan": cursor == 0 and len(keys) < sample_size,
+        "complete_scan": cursor == 0 and len(keys) < sample_size and not partial,
+        "partial": partial,
+        "partial_reason": partial_reason,
+        "max_seconds": max_seconds,
+        "elapsed_seconds": round(clock() - started, 3),
+        "scope": "connected node only",
         "maxmemory_policy": policy,
         "by_type": dict(by_type),
         "keys_without_ttl": no_ttl,
@@ -355,6 +400,16 @@ def keyspace_sample(
             (x for x in rows if x["type"] != "string"), key=lambda x: x["length"] or 0, reverse=True
         )[:top],
     }
+    cluster_info, _ = _try(r.info, "cluster")
+    if int(_num((cluster_info or {}).get("cluster_enabled"))):
+        result["cluster_mode"] = True
+        result["cluster_note"] = (
+            "cluster mode is enabled: only the slots owned by this node were sampled. "
+            "Run node_cluster_nodes for per-shard endpoints and repeat with ELASTICACHE_HOST "
+            "pointing at each shard primary."
+        )
+    else:
+        result["cluster_mode"] = False
     if lfu:
         result["hot_keys_by_lfu"] = sorted(rows, key=lambda x: x["lfu_freq"] or 0, reverse=True)[:top]
     else:
@@ -408,6 +463,174 @@ def cluster(r: redis.Redis) -> dict:
         "slots_per_primary": dict(coverage),
         "slots_covered": sum(coverage.values()),
         "shards": _jsonable(shards) if shards is not None else {"unavailable": shards_err},
+    }
+
+
+TOTAL_SLOTS = 16384
+_BAD_FLAGS = {"fail", "fail?", "handshake", "noaddr"}
+
+
+def parse_cluster_nodes(text: str) -> list[dict]:
+    """Parse CLUSTER NODES output into one dict per node."""
+    nodes = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 8:
+            continue
+        node_id, addr, flags, master_id = parts[0], parts[1], parts[2].split(","), parts[3]
+        hostport, _, hostname = addr.partition(",")
+        hostport = hostport.split("@", 1)[0]
+        ip, _, port = hostport.rpartition(":")
+        slots = [t for t in parts[8:] if not t.startswith("[")]
+        slot_count = 0
+        for tok in slots:
+            lo, _, hi = tok.partition("-")
+            slot_count += int(hi or lo) - int(lo) + 1
+        nodes.append(
+            {
+                "id": node_id,
+                "ip": ip,
+                "port": int(port) if port.isdigit() else None,
+                "hostname": hostname or None,
+                "flags": flags,
+                "role": "primary" if "master" in flags else "replica",
+                "master_id": None if master_id == "-" else master_id,
+                "link_state": parts[7],
+                "slots": slots,
+                "slot_count": slot_count,
+                "myself": "myself" in flags,
+                "failing": bool(_BAD_FLAGS & set(flags)) or parts[7] != "connected",
+            }
+        )
+    return nodes
+
+
+def _endpoint(n: dict) -> str:
+    return f"{n.get('hostname') or n['ip']}:{n['port']}"
+
+
+def cluster_nodes(r: redis.Redis) -> dict:
+    """Per-shard endpoints from CLUSTER NODES, with a recommendation for fan-out."""
+    cluster_info, _ = _try(r.info, "cluster")
+    if not int(_num((cluster_info or {}).get("cluster_enabled"))):
+        return {"cluster_enabled": False, "note": "cluster mode disabled (single shard); use the primary endpoint"}
+    raw, err = _try(r.execute_command, "CLUSTER", "NODES")
+    if raw is None:
+        return {"cluster_enabled": True, "unavailable": err}
+    nodes = parse_cluster_nodes(_s(raw))
+    primaries = [n for n in nodes if n["role"] == "primary"]
+    shards = []
+    for p in sorted(primaries, key=lambda n: int((n["slots"] or ["99999"])[0].split("-")[0])):
+        replicas = [n for n in nodes if n["master_id"] == p["id"]]
+        shards.append(
+            {
+                "primary": _endpoint(p),
+                "replicas": [_endpoint(n) for n in replicas],
+                "slot_count": p["slot_count"],
+                "slots": p["slots"],
+                "failing": [_endpoint(n) for n in [p, *replicas] if n["failing"]],
+            }
+        )
+    covered = sum(n["slot_count"] for n in primaries)
+    findings = []
+    if covered != TOTAL_SLOTS:
+        findings.append(f"{covered} of {TOTAL_SLOTS} slots covered by primaries")
+    findings += [f"node {_endpoint(n)} is {','.join(n['flags'])}/{n['link_state']}" for n in nodes if n["failing"]]
+    return {
+        "cluster_enabled": True,
+        "nodes": nodes,
+        "shards": shards,
+        "slots_covered": covered,
+        "findings": findings,
+        "recommendation": (
+            "Per-key tools only see the connected node. To inspect each shard, set ELASTICACHE_HOST to each "
+            "primary endpoint above (and replicas for read-side checks), or use node_cluster_health for a fan-out."
+        ),
+    }
+
+
+def _node_snapshot(info: dict) -> dict:
+    return {
+        "role": info.get("role"),
+        "used_memory": int(_num(info.get("used_memory"))),
+        "maxmemory": int(_num(info.get("maxmemory"))),
+        "ops_per_sec": int(_num(info.get("instantaneous_ops_per_sec"))),
+        "connected_clients": int(_num(info.get("connected_clients"))),
+        "evicted_keys": int(_num(info.get("evicted_keys"))),
+        "master_link_status": info.get("master_link_status"),
+        "master_repl_offset": int(_num(info.get("master_repl_offset"))),
+        "replicas": [
+            {"addr": f"{v.get('ip')}:{v.get('port')}", "offset": int(_num(v.get("offset"))), "lag": _num(v.get("lag"))}
+            for k, v in info.items()
+            if k.startswith("slave") and isinstance(v, dict)
+        ],
+    }
+
+
+def cluster_health(
+    r: redis.Redis,
+    client_factory: Callable[[str, int], redis.Redis],
+    max_workers: int = 8,
+    per_node_timeout: float = 5.0,
+    skew_ratio: float = 1.5,
+    lag_bytes_threshold: int = 1_000_000,
+) -> dict:
+    """INFO on every cluster node (bounded concurrency, per-node timeout) with skew findings."""
+    topo = cluster_nodes(r)
+    if not topo.get("cluster_enabled") or "nodes" not in topo:
+        return topo
+    nodes = [n for n in topo["nodes"] if n["port"]]
+    results: dict[str, dict] = {}
+
+    def probe(n: dict) -> dict:
+        client = client_factory(n.get("hostname") or n["ip"], n["port"])
+        try:
+            return _node_snapshot(client.info())
+        finally:
+            close = getattr(client, "close", None)
+            if close:
+                close()
+
+    pool = ThreadPoolExecutor(max_workers=max(1, min(int(max_workers), 32)))
+    try:
+        futures = {_endpoint(n): pool.submit(probe, n) for n in nodes if not n["failing"]}
+        for ep, fut in futures.items():
+            try:
+                results[ep] = fut.result(timeout=per_node_timeout)
+            except FutureTimeout:
+                results[ep] = {"error": f"timeout after {per_node_timeout:g}s"}
+            except Exception as exc:  # one dead node must not hide the others
+                results[ep] = {"error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    findings: list[str] = list(topo["findings"])
+    for ep, res in results.items():
+        if "error" in res:
+            findings.append(f"node {ep} unreachable: {res['error']}")
+    primaries = {ep: res for ep, res in results.items() if res.get("role") == "master"}
+    for label, key, floor in (("memory", "used_memory", 1), ("ops/sec", "ops_per_sec", 100)):
+        vals = [res[key] for res in primaries.values()]
+        if len(vals) > 1 and statistics.mean(vals) >= floor:
+            avg = statistics.mean(vals)
+            for ep, res in primaries.items():
+                if res[key] > avg * skew_ratio:
+                    findings.append(f"shard primary {ep} {label} is {res[key] / avg:.1f}x the shard average (skew)")
+    for ep, res in primaries.items():
+        for rep in res.get("replicas", []):
+            lag = res["master_repl_offset"] - rep["offset"]
+            if lag > lag_bytes_threshold:
+                findings.append(f"replica {rep['addr']} of {ep} lags {lag} bytes")
+    for ep, res in results.items():
+        if res.get("role") == "slave" and res.get("master_link_status") not in (None, "up"):
+            findings.append(f"replica {ep} link is {res['master_link_status']}")
+    return {
+        "cluster_enabled": True,
+        "nodes_probed": len(results),
+        "slots_covered": topo["slots_covered"],
+        "shards": topo["shards"],
+        "per_node": results,
+        "findings": findings or ["no skew, lag or coverage problems detected"],
     }
 
 

@@ -30,7 +30,38 @@ def _data(result):
 async def test_all_tools_read_only():
     async with Client(server.mcp) as c:
         tools = await c.list_tools()
-    assert len(tools) == 17
+    names = {t.name for t in tools}
+    assert len(tools) == 26
+    assert {
+        "node_health",
+        "node_info",
+        "node_memory",
+        "node_slowlog",
+        "node_clients",
+        "node_latency",
+        "node_commandstats",
+        "node_keyspace_sample",
+        "node_replication",
+        "node_cluster",
+        "memcached_stats",
+        "aws_replication_groups",
+        "aws_cache_clusters",
+        "aws_serverless_caches",
+        "aws_events",
+        "aws_parameters",
+        "aws_metrics",
+    } <= names  # the original 17
+    assert {
+        "node_cluster_nodes",
+        "node_cluster_health",
+        "aws_snapshots",
+        "aws_users",
+        "aws_user_groups",
+        "aws_global_replication_groups",
+        "aws_reserved_nodes",
+        "aws_service_updates",
+        "aws_subnet_groups",
+    } <= names
     for t in tools:
         assert t.annotations.read_only_hint is True, t.name
         assert t.annotations.destructive_hint is False, t.name

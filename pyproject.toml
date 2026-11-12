@@ -27,6 +27,7 @@ dev = [
     "moto[cloudwatch]>=5.2.5",
     "pytest>=9.2.0",
     "pytest-asyncio>=1.4.1.post1",
+    "pytest-cov>=7.0.0",
     "ruff>=0.17.4",
 ]
 
@@ -48,3 +49,15 @@ ignore = ["C408"]
 
 [tool.ruff.lint.per-file-ignores]
 "src/mcp_elasticache_ops/server.py" = ["E501"]
+"src/mcp_elasticache_ops/controlplane.py" = ["E501"]  # long finding messages
+"src/mcp_elasticache_ops/config.py" = ["E501"]  # long error messages
+
+[tool.coverage.run]
+source = ["mcp_elasticache_ops"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+skip_covered = true
+exclude_lines = ["pragma: no cover", "if __name__ == .__main__.:"]

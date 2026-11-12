@@ -9,3 +9,4 @@ build/
 .env
 .env.*
 .lotes/
+.coverage
