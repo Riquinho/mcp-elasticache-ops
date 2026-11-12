@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 import statistics
+import threading
+from typing import Any
 
 import redis
 
@@ -296,17 +298,8 @@ def engine_quirk_findings(info: dict) -> list[dict]:
     return findings
 
 
-def node_doctor(r: redis.Redis, serverless: bool = False) -> dict:
-    """MEMORY DOCTOR and LATENCY DOCTOR of this node: the engine's own advice, findings first.
-
-    ``findings`` keeps only the non-healthy lines. A node that rejects a command (older engine, ElastiCache or
-    Serverless restriction) gets a ``not available`` note for that command instead of an error. Run it per node:
-    each node reports on its own memory and latency history.
-    """
+def _doctor_stages(r: redis.Redis, serverless: bool, findings: list, notes: list, report: dict) -> None:
     info_server, _ = _try(r.info, "server")
-    findings: list[dict] = []
-    notes: list[str] = []
-    report: dict[str, dict] = {}
     full_info, _ = _try(r.info)
     if isinstance(full_info, dict):
         findings += engine_quirk_findings({**(info_server or {}), **full_info})
@@ -333,4 +326,52 @@ def node_doctor(r: redis.Redis, serverless: bool = False) -> dict:
             else raw[:LATENCY_DOCTOR_CHARS] + (f"... [trimmed, {len(raw) - LATENCY_DOCTOR_CHARS} more characters]")
         )
         report[key] = {"status": "findings" if found else "healthy", "advice": advice}
-    return {"findings": _sorted_findings(findings), **report, "notes": notes}
+
+
+DOCTOR_MAX_SECONDS = 10.0  # node_doctor tool budget; a node that stops answering must not hang the call
+
+
+def node_doctor(r: redis.Redis, serverless: bool = False, max_seconds: float | None = None) -> dict:
+    """MEMORY DOCTOR and LATENCY DOCTOR of this node: the engine's own advice, findings first.
+
+    ``findings`` keeps only the non-healthy lines. A node that rejects a command (older engine, ElastiCache or
+    Serverless restriction) gets a ``not available`` note for that command instead of an error. Run it per node:
+    each node reports on its own memory and latency history. With ``max_seconds`` a node that stops answering
+    returns what was gathered so far plus a critical finding and ``partial=true`` instead of hanging.
+    """
+    findings: list[dict] = []
+    notes: list[str] = []
+    report: dict[str, dict] = {}
+    partial = False
+    if max_seconds is None:
+        _doctor_stages(r, serverless, findings, notes, report)
+    else:
+        failure: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                _doctor_stages(r, serverless, findings, notes, report)
+            except BaseException as exc:  # re-raised below so the tool wrapper turns it into error + hint
+                failure.append(exc)
+
+        worker = threading.Thread(target=run, daemon=True, name="node-doctor")
+        worker.start()
+        worker.join(max_seconds)
+        if failure:
+            raise failure[0]
+        if worker.is_alive():
+            partial = True
+            findings = [
+                *findings,
+                _finding(
+                    "critical",
+                    f"node did not answer within {max_seconds:g}s: the doctor report is partial",
+                    source="doctor",
+                ),
+            ]
+            notes = [*notes, f"time budget of {max_seconds:g}s ran out"]
+    out: dict[str, Any] = {"findings": _sorted_findings(list(findings)), **dict(report), "notes": list(notes)}
+    if partial:
+        out["partial"] = True
+        out["error"] = f"node did not answer within {max_seconds:g}s"
+    return out

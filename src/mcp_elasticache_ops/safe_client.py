@@ -49,6 +49,7 @@ READ_ONLY_COMMANDS: frozenset[str] = frozenset(
         "CLUSTER SHARDS",
         "CLUSTER NODES",
         "CLUSTER MYID",
+        "CLUSTER COUNTKEYSINSLOT",
         "CONFIG GET",
         # pub/sub introspection: counts only, never message payloads
         "PUBSUB CHANNELS",
@@ -191,6 +192,7 @@ MAX_CLIENT_LIST_IDS = 100
 MAX_ACL_LOG_COUNT = 128
 MAX_PUBSUB_PATTERN_LEN = 128
 MAX_PUBSUB_NUMSUB_CHANNELS = 100
+LAST_CLUSTER_SLOT = 16383  # slots are 0..16383
 
 _CLIENT_LIST_TYPES = frozenset({"NORMAL", "MASTER", "REPLICA", "SLAVE", "PUBSUB"})
 _SCAN_OPTIONS = frozenset({"MATCH", "COUNT", "TYPE"})
@@ -284,6 +286,14 @@ def _check_pubsub(sub: str, rest: tuple) -> None:
         raise ReadOnlyViolation("PUBSUB NUMPAT takes no arguments")
 
 
+def _check_countkeysinslot(rest: tuple) -> None:
+    # One slot per call: a count, never keys (CLUSTER GETKEYSINSLOT stays refused).
+    if len(rest) != 1:
+        raise ReadOnlyViolation("CLUSTER COUNTKEYSINSLOT takes exactly one slot")
+    if _int_arg(rest[0], "CLUSTER COUNTKEYSINSLOT slot") > LAST_CLUSTER_SLOT:
+        raise ReadOnlyViolation(f"CLUSTER COUNTKEYSINSLOT slot must be between 0 and {LAST_CLUSTER_SLOT}")
+
+
 def _check_single_key(key: str, rest: tuple) -> None:
     if len(rest) > 1:
         raise ReadOnlyViolation(f"{key} takes a single key")
@@ -308,6 +318,8 @@ def check(args: tuple) -> None:
         _check_client_list(rest)
     elif key == "COMMAND DOCS" and not rest:
         raise ReadOnlyViolation("COMMAND DOCS needs at least one command name (the full dump is large)")
+    elif key == "CLUSTER COUNTKEYSINSLOT":
+        _check_countkeysinslot(rest)
     elif name == "PUBSUB":
         _check_pubsub(sub, rest)
     elif key.startswith("OBJECT "):

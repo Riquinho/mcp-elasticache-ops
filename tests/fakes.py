@@ -286,6 +286,7 @@ def _audit_reply(args: tuple) -> Any:
         "CONFIG GET": {},
         "CLUSTER INFO": {"cluster_state": "ok"},
         "CLUSTER NODES": {},
+        "CLUSTER COUNTKEYSINSLOT": 0,
         "ROLE": ["master", 0, []],
     }.get(key, 1)
 

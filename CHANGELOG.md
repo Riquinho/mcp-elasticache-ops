@@ -1,5 +1,37 @@
 # Changelog
 
+## Round 22 additions to 0.3.0
+
+Round 22. 59 tools.
+
+### Added
+- `node_hot_slots`: read-only shard skew and hot slots for cluster-mode groups. Per shard `DBSIZE`, `used_memory` and
+  `instantaneous_ops_per_sec`, plus `CLUSTER COUNTKEYSINSLOT` on an evenly spread, capped slot sample (default 64,
+  max 256 per shard). Hot shards (1.5x the shard average, critical at 3x) and hot slots (8x the sampled median)
+  come first; "reached N/M shards", per-node isolation and one shared deadline.
+- `CLUSTER COUNTKEYSINSLOT` joins the SafeRedis allowlist with a single-slot, 0-16383 bound; `CLUSTER GETKEYSINSLOT`,
+  `DELSLOTS`, `SETSLOT` and `ADDSLOTS` stay refused (tests prove it).
+- `aws_security_audit` covers Memcached clusters and a new "network exposure" category (security groups open to the
+  world, legacy cache security groups) and flags legacy or AUTH-only Redis groups (TLS off, default user open).
+- `aws_cost_overview` flags idle groups and names the next smaller node type of the same family
+  (`suggested_node_type`); the Valkey savings finding stays a single fleet-level note.
+- `tests/test_hot_slots.py`, `tests/test_security_audit.py`, `tests/test_cost_overview.py`, and hanging-node tests
+  for `node_cluster_triage`, the cluster keyspace sample and `node_doctor` in `tests/test_failure_modes.py`.
+
+### Fixed
+- `aws_metrics` is Memcached-aware: for a Memcached cluster the default metric list is `MEMCACHED_METRICS`
+  (resolved with `DescribeCacheClusters`, falling back to the Redis list when that call is denied) and memcached
+  findings are added. `aws_metrics` now needs `DescribeCacheClusters` (see `docs/iam-matrix.md`). Closes the round 21
+  known gap.
+- `node_doctor` had no deadline: it now returns a partial result plus a critical finding after 10 s instead of hanging
+  on a node that stops answering.
+
+### Changed
+- tools/list text trimmed (about 20 tool descriptions shortened) so the new tool fits the unchanged 49,500 byte budget.
+- Right-sizing reuses the existing single 14-day GetMetricData call per group (it covers the requested 7 days and keeps
+  the one-call-per-group contract that existing tests pin).
+- Integration run (`scripts/integration.sh`): ran (5.9G free on C:): 1702 passed, 5 skipped, containers cleaned up (no `prova-` left). One timing assertion in `test_fan_out_splits_budget_across_waves` compares a float budget to exactly 9.0 and failed once under load (8.984); it passes alone and in the plain run.
+
 ## 0.3.0 - 2026-11-12
 
 Round 21. 58 tools.
@@ -21,9 +53,6 @@ Round 21. 58 tools.
 ### Changed
 - tools/list byte budget raised from 48,500 to 49,500: one new tool (57 to 58), about 1 KB of description.
 - Release hygiene: duplicate `0.2.0` headings merged under one `0.3.0` entry; version bumped to 0.3.0.
-
-### Known gap
-- For Memcached clusters `aws_metrics` defaults to the Redis metric list; `MEMCACHED_METRICS` is not used yet.
 
 ## Earlier in 0.3.0: round 20 additions
 

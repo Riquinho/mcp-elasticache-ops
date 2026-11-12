@@ -8,15 +8,16 @@ usable ``AUDIT_CALLS`` entry fails ``test_every_registered_tool_is_covered`` ins
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 import redis
 from botocore.exceptions import ConnectTimeoutError
 from fastmcp import Client
 
-from mcp_elasticache_ops import server
+from mcp_elasticache_ops import dataplane, server
 from mcp_elasticache_ops.controlplane import ControlPlane, ControlPlaneConfig
-from tests.fakes import AwsAudit
+from tests.fakes import AwsAudit, FakeRedis
 from tests.test_server import AUDIT_CALLS, audit  # noqa: F401  (audit is a fixture)
 
 
@@ -111,3 +112,59 @@ async def test_node_tool_turns_a_node_error_into_error_and_hint(monkeypatch, nam
     degraded = data.get("status") in {"partial", "unavailable"} and _mentions(data, type(exc).__name__)
     assert (data.get("error") and data.get("hint")) or degraded, (name, data)
     assert "traceback" not in json.dumps(data, default=str).lower()
+
+
+# ------------------------------------------------------- hanging nodes: partial result inside the budget
+
+
+def _hang_fan(hang_for: float = 3.0):
+    """Three shard primaries where the middle one blocks; returns (seed, factory)."""
+    from tests.test_dataplane_unit import _fan_factory, _seed, _shard_client
+
+    def hang():
+        time.sleep(hang_for)
+        return _shard_client("b")
+
+    clients = {"10.0.0.1:6379": _shard_client("a"), "10.0.0.2:6379": hang, "10.0.0.3:6379": _shard_client("c")}
+    factory, _ = _fan_factory(clients)
+    return _seed(), factory
+
+
+def test_cluster_triage_hanging_node_is_a_critical_entry_within_budget():
+    seed, factory = _hang_fan()
+    started = time.monotonic()
+    out = dataplane.cluster_triage(seed, factory, max_seconds=0.6, per_node_timeout=0.3)
+    assert time.monotonic() - started < 3.0
+    assert out["per_node"]["10.0.0.2:6379"]["status"] == "unreachable"
+    assert out["per_node"]["10.0.0.1:6379"]["status"] != "unreachable"
+    assert any(f["severity"] == "critical" and "10.0.0.2:6379" in f["message"] for f in out["findings"])
+    assert len(out["findings"]) <= dataplane.CLUSTER_TRIAGE_MAX_FINDINGS
+
+
+def test_cluster_keyspace_sample_hanging_node_returns_partial_with_error_entry():
+    seed, factory = _hang_fan()
+    started = time.monotonic()
+    out = dataplane.cluster_keyspace_sample(seed, factory, sample_size=60, max_seconds=0.6, per_node_timeout=0.3)
+    assert time.monotonic() - started < 3.0
+    assert out["per_shard"]["10.0.0.2:6379"]["status"] == "unreachable"
+    assert out["per_shard"]["10.0.0.2:6379"]["error"]
+    assert out["partial"] is True and out["shards_ok"] == 2
+    assert out["sampled_keys"] > 0
+
+
+def test_node_doctor_hanging_node_returns_partial_with_error_within_budget():
+    class Stuck(FakeRedis):
+        def info(self, section=None):
+            time.sleep(3)
+            return {}
+
+    started = time.monotonic()
+    out = dataplane.node_doctor(Stuck(), max_seconds=0.4)
+    assert time.monotonic() - started < 2.0
+    assert out["partial"] is True and "did not answer" in out["error"]
+    assert out["findings"][0]["severity"] == "critical"
+
+
+def test_node_doctor_without_a_budget_is_unchanged():
+    out = dataplane.node_doctor(FakeRedis(infos={"server": {"redis_version": "7.1.0"}}))
+    assert "partial" not in out and "error" not in out

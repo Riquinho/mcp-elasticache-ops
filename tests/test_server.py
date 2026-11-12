@@ -32,7 +32,7 @@ async def test_all_tools_read_only():
     async with Client(server.mcp) as c:
         tools = await c.list_tools()
     names = {t.name for t in tools}
-    assert len(tools) == 58
+    assert len(tools) == 59
     assert {
         "node_health",
         "node_info",
@@ -120,7 +120,7 @@ async def test_node_config_end_to_end(env):
 
 async def test_every_registered_tool_is_wrapped_with_the_output_cap():
     tools = await server.mcp.list_tools()
-    assert len(tools) == 58
+    assert len(tools) == 59
     unwrapped = [t.name for t in tools if not getattr(t.fn, "__capped__", False)]
     assert unwrapped == []
 
@@ -341,7 +341,7 @@ async def test_oncall_prompts_are_registered_and_do_not_change_the_tool_count():
     assert {p.name for p in prompts} == RUNBOOKS
     async with Client(server.mcp) as c:
         assert {p.name for p in await c.list_prompts()} == RUNBOOKS
-        assert len(await c.list_tools()) == 58  # prompts are not tools
+        assert len(await c.list_tools()) == 59  # prompts are not tools
 
 
 @pytest.mark.parametrize("name", sorted(RUNBOOKS))
@@ -374,6 +374,7 @@ AUDIT_CALLS: list[tuple[str, dict]] = [
     ("node_health", {}),
     ("node_triage", {}),
     ("node_cluster_triage", {}),
+    ("node_hot_slots", {}),
     ("node_pubsub", {}),
     ("aws_maintenance", {}),
     ("aws_maintenance", {"replication_group_id": "audit-rg"}),
@@ -421,6 +422,7 @@ AUDIT_CALLS: list[tuple[str, dict]] = [
     ("aws_subnet_groups", {}),
     ("aws_metrics", {"replication_group_id": "audit-rg"}),
     ("aws_metrics", {"cache_cluster_id": "sc", "serverless": True}),
+    ("aws_metrics", {"cache_cluster_id": "audit-mc"}),
     ("aws_parameter_drift", {"group_a": "a", "group_b": "b"}),
     ("aws_triage", {"replication_group_id": "audit-rg"}),
     ("aws_serverless_triage", {"serverless_cache_name": "audit-sc"}),

@@ -2276,3 +2276,93 @@ def test_serverless_limits_throttling_below_the_cap_is_called_out():
     f = next(x for x in _limit_findings(out) if "ThrottledCmds" in x["message"])
     assert "40 ThrottledCmds" in f["message"] and "30%" in f["message"]
     assert "ecpu_per_second_max" in f["recommendation"]
+
+
+# ------------------------------------------------- memcached-aware aws_metrics
+
+REDIS_ONLY_METRICS = {
+    "EngineCPUUtilization",
+    "DatabaseMemoryUsagePercentage",
+    "BytesUsedForCache",
+    "CacheHitRate",
+    "ReplicationLag",
+    "NewConnections",
+}
+
+
+def _describe_cluster(ec, engine, node_type="cache.t3.micro"):
+    ec.add_response(
+        "describe_cache_clusters",
+        {"CacheClusters": [{"CacheClusterId": "mc", "Engine": engine, "CacheNodeType": node_type}]},
+        {"CacheClusterId": "mc"},
+    )
+
+
+def test_metrics_default_for_memcached_cluster_uses_memcached_metric_list(aws):
+    from mcp_elasticache_ops.controlplane import MEMCACHED_METRICS
+
+    cp, ec, cw = aws
+    _describe_cluster(ec, "memcached")
+    cw.add_response("get_metric_data", {"MetricDataResults": []}, None)
+    out = cp.metrics("mc", minutes=30)
+    assert out["engine"] == "memcached"
+    assert list(out["summary"]) == MEMCACHED_METRICS
+    assert {"CurrItems", "Evictions", "BytesUsedForCacheItems"} <= set(out["summary"])
+    assert not REDIS_ONLY_METRICS & set(out["summary"])
+
+
+def test_metrics_default_for_redis_cluster_keeps_redis_list(aws):
+    from mcp_elasticache_ops.controlplane import REDIS_METRICS
+
+    cp, ec, cw = aws
+    _describe_cluster(ec, "redis")
+    cw.add_response("get_metric_data", {"MetricDataResults": []}, None)
+    assert list(cp.metrics("mc", minutes=30)["summary"]) == REDIS_METRICS
+
+
+def test_metrics_describe_failure_falls_back_to_redis_list(aws):
+    from mcp_elasticache_ops.controlplane import REDIS_METRICS
+
+    cp, ec, cw = aws
+    ec.add_client_error("describe_cache_clusters", "AccessDenied")
+    cw.add_response("get_metric_data", {"MetricDataResults": []}, None)
+    out = cp.metrics("mc", minutes=30)
+    assert list(out["summary"]) == REDIS_METRICS
+    assert "engine" not in out
+
+
+def test_metrics_explicit_names_skip_the_describe_call(aws):
+    cp, _, cw = aws
+    cw.add_response("get_metric_data", {"MetricDataResults": []}, None)
+    assert list(cp.metrics("mc", ["Evictions"], minutes=30)["summary"]) == ["Evictions"]
+
+
+def test_memcached_findings_cover_eviction_connections_swap_cpu_memory_and_misses(aws):
+    cp, ec, cw = aws
+    _describe_cluster(ec, "memcached", "cache.t3.micro")  # 0.5 GiB
+    gib = 1024**3
+    cw.add_response(
+        "get_metric_data",
+        {
+            "MetricDataResults": [
+                _result("mc|CPUUtilization", _pts(50, 85)),
+                _result("mc|BytesUsedForCacheItems", _pts(0.48 * gib)),
+                _result("mc|Evictions", _pts(5, 7)),
+                _result("mc|CurrConnections", _pts(60000)),
+                _result("mc|GetHits", _pts(100, 100)),
+                _result("mc|GetMisses", _pts(900, 900)),
+                _result("mc|SwapUsage", _pts(100 * 1024 * 1024)),
+            ]
+        },
+        None,
+    )
+    msgs = " | ".join(f["message"] for f in cp.metrics("mc", minutes=30)["findings"])
+    for needle in (
+        "12 evictions",
+        "memcached CPUUtilization max 85%",
+        "memcached CurrConnections max 60000",
+        "of the node memory (cache.t3.micro)",
+        "GetMisses are 90%",
+        "SwapUsage max 100 MB",
+    ):
+        assert needle in msgs

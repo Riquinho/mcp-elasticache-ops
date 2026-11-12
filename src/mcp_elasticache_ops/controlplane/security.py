@@ -209,6 +209,7 @@ AUDIT_CATEGORIES = (
     "ACL",
     "snapshots",
     "patching",
+    "network exposure",
 )
 
 
@@ -226,6 +227,7 @@ _AUDIT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         AUDIT_CATEGORIES[5],
         re.compile(r"auto minor version|\(< 7\.0\)|end-of-life|retired|behind the newest", re.I),
     ),
+    (AUDIT_CATEGORIES[6], re.compile(r"security group|network reach", re.I)),
 )
 
 
@@ -234,8 +236,77 @@ _AUDIT_NOT_APPLICABLE: dict[str, frozenset[str]] = {
     "memcached_cluster": frozenset({AUDIT_CATEGORIES[1], AUDIT_CATEGORIES[3], AUDIT_CATEGORIES[4]}),
     "user": frozenset(AUDIT_CATEGORIES) - {AUDIT_CATEGORIES[2], AUDIT_CATEGORIES[3]},
     "user_group": frozenset(AUDIT_CATEGORIES) - {AUDIT_CATEGORIES[3]},
-    "serverless_cache": frozenset({AUDIT_CATEGORIES[0], AUDIT_CATEGORIES[1], AUDIT_CATEGORIES[5]}),
+    "serverless_cache": frozenset({AUDIT_CATEGORIES[0], AUDIT_CATEGORIES[1], AUDIT_CATEGORIES[5], AUDIT_CATEGORIES[6]}),
 }
+
+
+SG_SHARED_MIN = 3  # one security group on this many cache resources: a rule change reaches all of them
+
+
+def _sg_ids(obj: dict) -> list[str]:
+    return sorted(str(sg["SecurityGroupId"]) for sg in obj.get("SecurityGroups") or [] if sg.get("SecurityGroupId"))
+
+
+def _legacy_sg_names(obj: dict) -> list[str]:
+    return sorted(
+        str(sg["CacheSecurityGroupName"])
+        for sg in obj.get("CacheSecurityGroups") or []
+        if sg.get("CacheSecurityGroupName")
+    )
+
+
+def _network_findings(
+    members: list[dict], open_auth: bool, engine: str, sg_users: dict[str, int] | None = None
+) -> list[dict]:
+    """Exposure hints from the security-group ids DescribeCacheClusters already returns.
+
+    Ingress rules need ``ec2:DescribeSecurityGroups``, which this server never calls, so the findings say what is
+    attached and what to verify; they never claim a group is open."""
+    sgs = sorted({sg for m in members for sg in _sg_ids(m)})
+    legacy = sorted({name for m in members for name in _legacy_sg_names(m)})
+    out: list[dict] = []
+    if legacy:
+        out.append(
+            finding(
+                "warning",
+                f"legacy cache security groups in use ({', '.join(legacy)}): the EC2-Classic model is gone; "
+                "move the cluster into a VPC and control access with VPC security groups",
+            )
+        )
+    if open_auth and sgs:
+        out.append(
+            finding(
+                "warning",
+                f"network reach is the only access control ({engine} has no usable credentials here): verify the "
+                f"ingress rules of security group(s) {', '.join(sgs)} allow only the application tier "
+                "(ec2:DescribeSecurityGroups is not called by this server)",
+            )
+        )
+    elif not sgs and not legacy and members:
+        out.append(finding("info", "no security group reported on the cluster: check its VPC security group setup"))
+    shared = [f"{sg} ({sg_users[sg]} resources)" for sg in sgs if sg_users and sg_users.get(sg, 0) >= SG_SHARED_MIN]
+    if shared:
+        out.append(
+            finding(
+                "info",
+                f"security group shared across cache resources: {', '.join(shared)}; one ingress change affects "
+                "all of them, prefer a group per cache",
+            )
+        )
+    return out
+
+
+def _auth_only_findings(g: dict) -> list[dict]:
+    """Replication group that authenticates with the shared AUTH token only (no RBAC user group)."""
+    if g.get("AuthTokenEnabled") and not g.get("UserGroupIds"):
+        return [
+            finding(
+                "warning",
+                "authentication is a single shared AUTH token and no user group: no per-user identity, no per-command "
+                "ACL, and a token rotation touches every client; move to RBAC user groups",
+            )
+        ]
+    return []
 
 
 def _kms_findings(obj: dict) -> list[dict]:
@@ -465,10 +536,21 @@ class _SecurityMixin(_CostMixin):
             if users is not None and user_groups is None:
                 notes.append("default-user attachment not checked: DescribeUserGroups failed")
             entries: list[tuple[str, str, list[dict]]] = []  # (kind, resource id, raw findings)
+            by_id = {str(c.get("CacheClusterId")): c for c in clusters or []}
+            sg_users: dict[str, int] = defaultdict(int)
+            for sg in {
+                (sg, str(c.get("ReplicationGroupId") or c.get("CacheClusterId")))
+                for c in by_id.values()
+                for sg in _sg_ids(c)
+            }:
+                sg_users[sg[0]] += 1
             for g in groups or []:
                 gid = str(g.get("ReplicationGroupId"))
                 found = _rg_findings(g, versions.get(gid), ctx)
-                found += _kms_findings(g)
+                found += _kms_findings(g) + _auth_only_findings(g)
+                member_data = [by_id[str(m)] for m in g.get("MemberClusters", []) if str(m) in by_id]
+                no_auth = g.get("AuthTokenEnabled") is False and not g.get("UserGroupIds")
+                found += _network_findings(member_data, no_auth, str(g.get("Engine") or "redis"), sg_users)
                 entries.append(("replication_group", gid, found))
             for c in clusters or []:
                 if c.get("ReplicationGroupId"):  # members are covered by their replication group
@@ -484,6 +566,8 @@ class _SecurityMixin(_CostMixin):
                             "write; only the security group protects it",
                         )
                     )
+                no_auth = engine == "memcached" or (c.get("AuthTokenEnabled") is False)
+                found += _network_findings([c], no_auth, engine or "cache", sg_users)
                 entries.append(("memcached_cluster" if engine == "memcached" else "cache_cluster", cid, found))
             for s in serverless or []:
                 entries.append(("serverless_cache", str(s.get("ServerlessCacheName")), _serverless_cache_findings(s)))

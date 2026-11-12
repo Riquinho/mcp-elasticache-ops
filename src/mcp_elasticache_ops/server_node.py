@@ -33,17 +33,17 @@ def node_connectivity() -> dict:
 @server.read_tool
 def node_triage() -> dict:
     """On-call snapshot of the connected endpoint: health, memory, replication, clients, failed commandstats, top-5
-    slowlog, latency, MEMORY/LATENCY DOCTOR. Findings merged worst-first (max 30); a failing section is reported
-    unavailable. Start here, then drill into the node_ tool."""
+    slowlog, latency, DOCTOR. Findings worst-first (max 30); a failing section is reported unavailable. Start here."""
     return server.dataplane.triage(server.redis_client(), server._node_client, server._serverless())
 
 
 @server.read_tool
 def node_doctor() -> dict:
-    """MEMORY DOCTOR and LATENCY DOCTOR of the connected node: the engine's advice (trimmed) plus findings for non-
-    healthy lines. Engines that reject the command (older versions, Serverless) get a note, not an error. Per
-    node: point ELASTICACHE_HOST at it. node_triage includes this."""
-    return server.dataplane.node_doctor(server.redis_client(), server._serverless())
+    """MEMORY DOCTOR and LATENCY DOCTOR of the connected node: the engine's advice plus findings for non-healthy
+    lines. Engines that reject the command get a note, not an error. node_triage includes this."""
+    return server.dataplane.node_doctor(
+        server.redis_client(), server._serverless(), server.dataplane.DOCTOR_MAX_SECONDS
+    )
 
 
 @server.read_tool
@@ -70,8 +70,8 @@ def node_memory() -> dict:
 @server.read_tool
 def node_config() -> dict:
     """Allowlisted CONFIG GET view (maxmemory policy, timeout, appendonly, output buffer limits, keyspace
-    notifications, slowlog/latency thresholds, io-threads) with findings. Secrets are never requested. Points at
-    aws_parameters when CONFIG is refused, as ElastiCache usually does."""
+    notifications, slowlog/latency thresholds, io-threads) with findings. Points at aws_parameters when CONFIG
+    is refused, as ElastiCache usually does."""
     return server.dataplane.config_view(server.redis_client())
 
 
@@ -97,9 +97,8 @@ def node_clients_summary(
     top: Annotated[int, Field(ge=1, le=50)] = 10,
     near_maxclients_pct: Annotated[int, Field(ge=1, le=100)] = 80,
 ) -> dict:
-    """Who holds the connections: CLIENT LIST grouped by source IP, name or library, user and flags (blocked,
-    pubsub, multi, tracking), top IPs, idle over 1h, big output/query buffers, and use of maxclients. Capped to
-    top rows per group; never commands, arguments or keys."""
+    """Who holds the connections: CLIENT LIST grouped by source IP, name or library, user and flags, top IPs, idle
+    over 1h, big buffers, maxclients use. Capped rows per group; never commands, arguments or keys."""
     return server.dataplane.client_summary(server.redis_client(), top, near_maxclients_pct)
 
 
@@ -112,17 +111,15 @@ def node_latency(ping_samples: Annotated[int, Field(ge=1, le=500)] = 20) -> dict
 
 @server.read_tool
 def node_latency_events() -> dict:
-    """LATENCY LATEST, then HISTORY for the 3 worst events (newest 20 samples), findings first: fork or aof-fsync
-    over 100 ms, expire-cycle spikes, plus trimmed LATENCY/MEMORY DOCTOR. With latency-monitor-threshold 0
-    (ElastiCache default) the finding names that parameter."""
+    """LATENCY LATEST, then HISTORY for the 3 worst events, findings first: fork or aof-fsync over 100 ms,
+    expire-cycle spikes, trimmed LATENCY/MEMORY DOCTOR. With latency-monitor-threshold 0 the finding names it."""
     return server.dataplane.latency_events(server.redis_client())
 
 
 @server.read_tool
 def node_commandstats(top: Annotated[int, Field(ge=1, le=500)] = 20) -> dict:
-    """Commands ranked by CPU time (INFO commandstats): calls, usec per call, rejected and failed, error prefix
-    counts, p50/p99/p99.9 (latencystats) when available. Findings for OOM/READONLY/NOPERM errors and commands
-    with p99 over 10 ms."""
+    """Commands ranked by CPU time (INFO commandstats): calls, usec per call, rejected and failed, error prefixes,
+    p50/p99/p99.9 when available. Findings for OOM/READONLY/NOPERM errors and p99 over 10 ms."""
     return server.dataplane.commandstats(server.redis_client(), top)
 
 
@@ -152,10 +149,9 @@ def node_keyspace_sample(
         int, Field(ge=1, le=100_000_000, description="Element count above which a collection is flagged")
     ] = 10_000,
 ) -> dict:
-    """Big keys, hot (LFU) or cold keys, type mix, TTL coverage, per-prefix bytes from a bounded SCAN. Metadata
-    only; values never read. partial=true at max_seconds. Cluster mode: this node's slots only (see
-    node_cluster_keyspace_sample). include_access adds the idle-key share; include_sizes flags prefixes with
-    collections over size_threshold elements."""
+    """Big keys, hot (LFU) or cold keys, type mix, TTL coverage, per-prefix bytes from a bounded SCAN. Metadata only,
+    never values. partial=true at max_seconds. Cluster mode: this node only (see node_cluster_keyspace_sample).
+    include_access adds the idle-key share; include_sizes flags large collections."""
     return server.dataplane.keyspace_sample(
         server.redis_client(),
         sample_size,
@@ -227,9 +223,8 @@ def node_cluster_keyspace_sample(
     per_node_timeout: Annotated[float, Field(gt=0, le=60, description="Extra seconds to wait for a stuck shard")] = 5.0,
     top_prefixes: Annotated[int, Field(ge=1, le=50, description="Key prefixes to report")] = 10,
 ) -> dict:
-    """node_keyspace_sample on every shard primary of a cluster-mode group: big/hot/cold keys merged with a `shard`
-    label, per-shard status (ok, partial, unreachable), skew findings. A dead shard is reported, never fatal.
-    Budget and sample size split across primaries."""
+    """node_keyspace_sample on every shard primary: keys merged with a `shard` label, per-shard status, skew
+    findings. A dead shard is reported, never fatal. Budget and sample split across primaries."""
     return server.dataplane.cluster_keyspace_sample(
         server.redis_client(),
         server._node_client,
@@ -270,15 +265,28 @@ def node_cluster_memory(
 
 
 @server.read_tool
+def node_hot_slots(
+    slots_per_shard: Annotated[int, Field(ge=1, le=256, description="Slots sampled per shard")] = 64,
+    max_workers: Annotated[int, Field(ge=1, le=32, description="Concurrent probes")] = 8,
+    per_node_timeout: Annotated[float, Field(gt=0, le=60, description="Seconds per node")] = 5.0,
+    max_seconds: Annotated[float, Field(gt=0, le=60, description="Total budget")] = 15.0,
+) -> dict:
+    """Cluster-mode shard skew and hot slots: per-shard keys, memory, ops/sec plus CLUSTER COUNTKEYSINSLOT on a
+    capped slot sample. Findings name hot shards and slots; `reached N/M shards`. Counts only."""
+    return server.dataplane.cluster_hot_slots(
+        server.redis_client(), server._node_client, slots_per_shard, max_workers, per_node_timeout, max_seconds
+    )
+
+
+@server.read_tool
 def node_pubsub(
     top: Annotated[int, Field(ge=1, le=100, description="Channels to list by subscriber count")] = 10,
     pattern: Annotated[str | None, Field(max_length=128, description="PUBSUB CHANNELS glob filter")] = None,
     max_workers: Annotated[int, Field(ge=1, le=32, description="Concurrent shard probes (cluster mode)")] = 8,
     per_node_timeout: Annotated[float, Field(gt=0, le=60, description="Seconds to wait per node")] = 5.0,
 ) -> dict:
-    """Pub/Sub pressure (PUBSUB CHANNELS/NUMSUB/NUMPAT/SHARDCHANNELS, CLIENT LIST TYPE pubsub): channel and pattern
-    counts, top channels by subscribers, subscribers with large output buffers. Counts only, never messages.
-    Cluster mode aggregates shard primaries."""
+    """Pub/Sub pressure: channel and pattern counts, top channels by subscribers, subscribers with large output
+    buffers. Counts only, never messages. Cluster mode aggregates shard primaries."""
     return server.dataplane.cluster_pubsub(
         server.redis_client(), server._node_client, top, pattern, max_workers, per_node_timeout
     )

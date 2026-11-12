@@ -1396,6 +1396,40 @@
   "properties": {},
   "type": "object"
  },
+ "node_hot_slots": {
+  "additionalProperties": false,
+  "properties": {
+   "max_seconds": {
+    "default": 15.0,
+    "description": "Total budget",
+    "exclusiveMinimum": 0,
+    "maximum": 60,
+    "type": "number"
+   },
+   "max_workers": {
+    "default": 8,
+    "description": "Concurrent probes",
+    "maximum": 32,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "per_node_timeout": {
+    "default": 5.0,
+    "description": "Seconds per node",
+    "exclusiveMinimum": 0,
+    "maximum": 60,
+    "type": "number"
+   },
+   "slots_per_shard": {
+    "default": 64,
+    "description": "Slots sampled per shard",
+    "maximum": 256,
+    "minimum": 1,
+    "type": "integer"
+   }
+  },
+  "type": "object"
+ },
  "node_info": {
   "additionalProperties": false,
   "properties": {

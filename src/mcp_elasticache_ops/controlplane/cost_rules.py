@@ -68,6 +68,35 @@ OVERSIZED_MEMORY_PEAK = 30.0  # peak DatabaseMemoryUsagePercentage under this: t
 
 OLD_MANUAL_SNAPSHOT_DAYS = 90
 
+IDLE_CPU_PEAK = 5.0  # a group whose peak EngineCPUUtilization stays under this ...
+IDLE_MEMORY_PEAK = 10.0  # ... and peak memory under this does almost nothing (idle candidate)
+_SIZES = (
+    "micro",
+    "small",
+    "medium",
+    "large",
+    "xlarge",
+    "2xlarge",
+    "4xlarge",
+    "8xlarge",
+    "12xlarge",
+    "16xlarge",
+    "24xlarge",
+)
+_NODE_TYPE = re.compile(r"^(cache\.[a-z0-9]+)\.([0-9a-z]+)$")
+
+
+def smaller_node_type(node_type: Any) -> str | None:
+    """The next size down in the same family (half the memory), or None when it is already the smallest.
+
+    Only ``t`` families go below ``large``; the size is a candidate, not an availability guarantee."""
+    m = _NODE_TYPE.match(str(node_type or ""))
+    if not m or m.group(2) not in _SIZES:
+        return None
+    i = _SIZES.index(m.group(2))
+    floor = _SIZES.index("micro" if m.group(1).startswith("cache.t") else "large")
+    return f"{m.group(1)}.{_SIZES[i - 1]}" if i - 1 >= floor else None
+
 
 MAX_TAG_CALLS = 3  # ListTagsForResource calls per tool call (replication group, then a member cluster)
 
@@ -134,12 +163,27 @@ def _cost_group(
 
     mem_peak, cpu_peak = peak("DatabaseMemoryUsagePercentage"), peak("EngineCPUUtilization")
     window = f"over {COST_WINDOW_DAYS} days"
-    if mem_peak is not None and mem_peak < OVERSIZED_MEMORY_PEAK:
+    smaller = smaller_node_type(node_type)
+    if mem_peak is not None and cpu_peak is not None and mem_peak < IDLE_MEMORY_PEAK and cpu_peak < IDLE_CPU_PEAK:
+        add(
+            "warning",
+            f"{nodes} x {node_type} looks idle: peak memory {mem_peak:.0f}% and peak CPU {cpu_peak:.0f}% {window}; "
+            "confirm nothing uses it, then snapshot and delete it" + (f", or shrink to {smaller}" if smaller else ""),
+            hint="idle",
+            suggested_node_type=smaller,
+        )
+    elif mem_peak is not None and mem_peak < OVERSIZED_MEMORY_PEAK:
+        advice = (
+            f"{smaller} (half the memory, peak would be about {mem_peak * 2:.0f}%) would likely carry this dataset"
+            if smaller
+            else f"{node_type} is already the smallest size of its family: cut replicas or shards instead"
+        )
         add(
             "warning" if nodes > 2 else "info",
             f"{nodes} x {node_type}: peak memory {mem_peak:.0f}% {window} (under {OVERSIZED_MEMORY_PEAK:.0f}%); "
-            "a smaller node type would likely carry this dataset",
+            + advice,
             hint="oversized",
+            suggested_node_type=smaller,
         )
     idle = [
         m
@@ -189,6 +233,7 @@ def _cost_group(
         "reserved_nodes_covering": covered,
         "peak_memory_percent": round(mem_peak, 1) if mem_peak is not None else None,
         "peak_engine_cpu_percent": round(cpu_peak, 1) if cpu_peak is not None else None,
+        "suggested_node_type": smaller if mem_peak is not None and mem_peak < OVERSIZED_MEMORY_PEAK else None,
         "idle_replicas": idle,
         "metrics_checked": bool(metrics),
         "findings_total": len(out),

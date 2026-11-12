@@ -331,7 +331,15 @@ def test_fuzz_dangerous_commands_never_pass(base):
 @pytest.mark.parametrize("key", sorted(READ_ONLY_COMMANDS))
 def test_fuzz_allowlisted_commands_are_case_and_bytes_insensitive(key):
     name, _, sub = key.partition(" ")
-    extra = ("maxmemory",) if key == "CONFIG GET" else ("get",) if key == "COMMAND DOCS" else ()
+    extra = (
+        ("maxmemory",)
+        if key == "CONFIG GET"
+        else ("get",)
+        if key == "COMMAND DOCS"
+        else ("5",)
+        if key == "CLUSTER COUNTKEYSINSLOT"
+        else ()
+    )
     for args in (
         (key, *extra),
         (key.lower(), *extra),

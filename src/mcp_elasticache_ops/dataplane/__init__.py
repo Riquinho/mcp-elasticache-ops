@@ -106,6 +106,7 @@ from .doctor import (  # noqa: F401
     _DOCTOR_LEAD_IN,
     DOCTOR_LINE_CHARS,
     DOCTOR_MAX_FINDINGS,
+    DOCTOR_MAX_SECONDS,
     EVENTLOOP_BUSY_USEC,
     LATENCY_DOCTOR_CHARS,
     LATENCY_EVENTS_HISTORY,
@@ -156,6 +157,16 @@ from .health import (  # noqa: F401
     latency,
     memory_report,
     slowlog,
+)
+from .hot_slots import (  # noqa: F401
+    DEFAULT_SLOTS_PER_SHARD,
+    HOT_SLOT_MIN_KEYS,
+    HOT_SLOT_RATIO,
+    MAX_HOT_SLOTS,
+    MAX_SLOTS_PER_SHARD,
+    SHARD_CRITICAL_RATIO,
+    SHARD_HOT_RATIO,
+    cluster_hot_slots,
 )
 from .keyspace import (  # noqa: F401
     _HEX_ID,

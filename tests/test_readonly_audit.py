@@ -43,6 +43,7 @@ AUDITED_MODULES = {
     "dataplane/config_stats.py",
     "dataplane/doctor.py",
     "dataplane/fanout.py",
+    "dataplane/hot_slots.py",
     "dataplane/health.py",
     "dataplane/keyspace.py",
     "dataplane/replication.py",

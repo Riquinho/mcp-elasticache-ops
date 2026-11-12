@@ -50,6 +50,7 @@ TOOL_ARGS: dict[str, dict[str, Any]] = {
             "node_cluster_memory",
             "node_pubsub",
             "node_cluster_triage",
+            "node_hot_slots",
             "memcached_stats",
             "memcached_cluster_stats",
             "aws_replication_groups",

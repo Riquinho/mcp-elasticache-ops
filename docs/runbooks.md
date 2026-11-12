@@ -13,7 +13,9 @@ transient spike or sustained.
 1. `aws_triage` with the replication group id. A "transient spike" finding is not an incident: report it and stop.
    Note `ownership` to know whom to page.
 2. `aws_cluster_overview`. One node far above the peer median is a hot shard or hot key; all nodes high is load or sizing.
-3. `aws_shard_balance` to confirm the skew from CloudWatch alone (no data-plane connection needed).
+3. `aws_shard_balance` to confirm the skew from CloudWatch alone (no data-plane connection needed). With a
+   data-plane connection, `node_hot_slots` names the hot shard (keys, memory, ops/sec against the shard average) and
+   any hot slot in a capped sample; a hot slot usually means a hash tag or one key family on a single slot.
 4. `node_triage` on the hot node, then `node_cluster_slowlog` and `node_commandstats` for the commands that burn the most time.
 5. `node_clients` for huge output buffers or blocked clients; `node_cluster_health` if the cluster state is not ok.
 6. `aws_metrics` with EngineCPUUtilization, CPUUtilization, CurrConnections, NewConnections for 360 minutes.

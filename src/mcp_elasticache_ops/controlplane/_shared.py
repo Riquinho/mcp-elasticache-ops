@@ -39,6 +39,7 @@ AUTH_FAILURE_METRICS = {
 MEMCACHED_METRICS = [
     "CPUUtilization",
     "BytesUsedForCacheItems",
+    "CurrItems",
     "Evictions",
     "CurrConnections",
     "GetHits",

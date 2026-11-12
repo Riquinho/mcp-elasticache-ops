@@ -50,6 +50,7 @@
  ],
  "aws_metrics": [
   "cloudwatch:GetMetricData",
+  "elasticache:DescribeCacheClusters",
   "elasticache:DescribeReplicationGroups",
   "elasticache:DescribeServerlessCaches"
  ],

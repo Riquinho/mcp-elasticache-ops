@@ -47,9 +47,8 @@ def aws_events(
     hours: Annotated[int, Field(ge=1, le=336)] = 24,
     region: Region = None,
 ) -> dict:
-    """DescribeEvents, findings first: critical (failover, failure, not available), warning (replacement, reboot,
-    restart, maintenance) or info, worst then newest; counts per source and the 100 newest events (`truncated`
-    if more). Invalid source_type is refused."""
+    """DescribeEvents, findings first: failover/failure critical, replacement/reboot/maintenance warning, worst then
+    newest; counts per source and the 100 newest events (`truncated` if more). Invalid source_type is refused."""
     return server._cp(region).events(source_identifier, source_type, hours)
 
 
@@ -186,9 +185,9 @@ def aws_metrics(
     ] = None,
     region: Region = None,
 ) -> dict:
-    """CloudWatch AWS/ElastiCache metrics (EngineCPUUtilization, memory %, Evictions,
-    CurrConnections, CacheHitRate, ReplicationLag, ...). Findings first, then a
-    min/avg/max/latest summary; the raw series only with include_series=true."""
+    """CloudWatch AWS/ElastiCache metrics (Redis/Valkey: EngineCPUUtilization, memory %, Evictions, CacheHitRate,
+    ReplicationLag; Memcached: CPU, swap, evictions, connections). Findings first, then min/avg/max/latest; raw
+    series only with include_series=true."""
     return server._cp(region).metrics(
         cache_cluster_id, metrics, minutes, period_seconds, node_id, serverless, include_series, replication_group_id
     )
@@ -210,9 +209,8 @@ def aws_triage(
     replication_group_id: Annotated[str, Field(description="ReplicationGroupId to triage")],
     region: Region = None,
 ) -> dict:
-    """One-call incident summary for a replication group: status, Multi-AZ/failover, 6h events, CloudWatch peaks
-    per member, pending service updates, snapshot age. Findings worst-first (max 30); a failing section is
-    reported unavailable."""
+    """One-call incident summary for a replication group: status, Multi-AZ/failover, 6h events, CloudWatch peaks per
+    member, pending updates, snapshot age. Findings worst-first (max 30); a failing section is reported unavailable."""
     return server.control_plane().triage_fan_out(replication_group_id, region)
 
 
@@ -222,8 +220,7 @@ def aws_serverless_triage(
     region: Region = None,
 ) -> dict:
     """One-call incident summary for a serverless cache: status, usage limits, snapshot health, 6h
-    ThrottledCmds/ECPU/storage vs limits. Findings worst-first (max 30); a failing section (for example
-    AccessDenied) is reported unavailable."""
+    ThrottledCmds/ECPU/storage vs limits. Findings worst-first (max 30); a failing section is reported unavailable."""
     return server._cp(region).serverless_triage(serverless_cache_name)
 
 
@@ -233,9 +230,8 @@ def aws_shard_balance(
     minutes: Annotated[int, Field(ge=5, le=20160, description="CloudWatch window in minutes")] = 60,
     region: Region = None,
 ) -> dict:
-    """Per-shard skew from CloudWatch only (one GetMetricData per member; no data-plane connection). Findings
-    first: hot shard (over 2x the median and above 50% CPU), memory skew, one primary pinned near 100% CPU (hot-
-    key signature)."""
+    """Per-shard skew from CloudWatch only (no data-plane connection). Findings first: hot shard (over 2x the median
+    and above 50% CPU), memory skew, one primary pinned near 100% CPU (hot-key signature)."""
     return server._cp(region).shard_balance(replication_group_id, minutes)
 
 
@@ -246,9 +242,8 @@ def aws_snapshot_restore_readiness(
     stale_hours: Annotated[int, Field(ge=1, le=720, description="Flag when no automatic snapshot is newer")] = 24,
     region: Region = None,
 ) -> dict:
-    """Can this group or serverless cache be restored? Pass exactly one id. Findings first: backups off,
-    no recent or expired automatic snapshot, failed snapshot, no manual snapshot before an engine upgrade,
-    KMS key mismatch, snapshot too big for the target node."""
+    """Can this group or serverless cache be restored? Pass exactly one id. Findings first: backups off, stale,
+    expired or failed snapshot, none before an engine upgrade, KMS mismatch, snapshot too big for the target node."""
     return server._cp(region).snapshot_restore_readiness(replication_group_id, serverless_cache_name, stale_hours)
 
 
@@ -256,9 +251,8 @@ def aws_snapshot_restore_readiness(
 def aws_failover_readiness(
     replication_group_id: Annotated[str, Field(description="ReplicationGroupId to check")], region: Region = None
 ) -> dict:
-    """Would a primary failure be survived? Findings first: failover or Multi-AZ off, shards without
-    replicas, replicas in the primary's AZ, uneven replica counts, unavailable replicas, single-node
-    group, plus a recovery-risk level. Describe calls only."""
+    """Would a primary failure be survived? Findings first: failover or Multi-AZ off, shards without replicas,
+    replicas in the primary's AZ, uneven or unavailable replicas, single-node group, recovery-risk level."""
     return server._cp(region).failover_readiness(replication_group_id)
 
 
@@ -266,9 +260,9 @@ def aws_failover_readiness(
 def aws_scale_readiness(
     replication_group_id: Annotated[str, Field(description="ReplicationGroupId to check")], region: Region = None
 ) -> dict:
-    """Headroom for online resharding or a node-type change, from 7 days of CloudWatch. Findings first: is
-    scale-in safe (projected memory per surviving shard), is scale-out advised, and why a node-type change is
-    risky (burstable credits, replica lag, pending modification, Multi-AZ off). Describe and GetMetricData only."""
+    """Headroom for resharding or a node-type change, from 7 days of CloudWatch. Findings first: is scale-in safe
+    (projected memory per surviving shard), is scale-out advised, why a node-type change is risky (burstable
+    credits, replica lag, pending modification, Multi-AZ off). Describe and GetMetricData only."""
     return server._cp(region).scale_readiness(replication_group_id)
 
 
@@ -282,9 +276,9 @@ def aws_upgrade_plan(
     snapshot_max_age_hours: Annotated[int, Field(ge=1, le=720, description="Newest snapshot must be younger")] = 24,
     region: Region = None,
 ) -> dict:
-    """Engine upgrade pre-flight, verdict first: go or no-go plus blockers (version path, Redis to Valkey,
-    parameter group family, group status, failover readiness, snapshot freshness), then caveats (ACL/TLS,
-    quirks, pending service updates, maintenance window). A gate that cannot be read blocks. Describe calls only."""
+    """Engine upgrade pre-flight, verdict first: go or no-go plus blockers (version path, Redis to Valkey, parameter
+    group family, status, failover, snapshot freshness), then caveats (ACL/TLS, quirks, service updates, window).
+    An unreadable gate blocks. Describe calls only."""
     return server._cp(region).upgrade_plan(replication_group_id, target_engine, target_version, snapshot_max_age_hours)
 
 
@@ -296,9 +290,9 @@ def aws_alarms(
     ] = None,
     region: Region = None,
 ) -> dict:
-    """CloudWatch alarm coverage (DescribeAlarms). Findings first: alarms in ALARM, INSUFFICIENT_DATA or with
-    actions disabled, and members with no alarm on core metrics (CPU, memory, evictions, lag, connections,
-    swap). partial=true if denied. No group id covers every region in ELASTICACHE_REGIONS."""
+    """CloudWatch alarm coverage. Findings first: alarms in ALARM, INSUFFICIENT_DATA or with actions disabled, members
+    with no alarm on core metrics (CPU, memory, evictions, lag, connections, swap). partial=true if denied.
+    No group id covers ELASTICACHE_REGIONS."""
     if replication_group_id:
         return server._cp(region).alarms(replication_group_id)
     return server.control_plane().alarms_fan_out(None, region)
@@ -312,9 +306,8 @@ def aws_maintenance(
     ] = None,
     region: Region = None,
 ) -> dict:
-    """Maintenance urgency (DescribeUpdateActions, ServiceUpdates, CacheClusters). Findings first: required updates
-    past apply-by, maintenance windows overlapping the snapshot window, end-of-life engines. partial=true if a
-    call is denied. No group id covers every region in ELASTICACHE_REGIONS."""
+    """Maintenance urgency. Findings first: required updates past apply-by, maintenance windows overlapping the
+    snapshot window, end-of-life engines. partial=true if a call is denied. No group id covers ELASTICACHE_REGIONS."""
     return server.control_plane().maintenance_fan_out(replication_group_id, region)
 
 
@@ -327,9 +320,8 @@ def aws_cluster_overview(
     minutes: Annotated[int, Field(ge=5, le=20160, description="CloudWatch window (multiple of 5 min is fine)")] = 360,
     region: Region = None,
 ) -> dict:
-    """One findings-first call per replication group: shards, replicas, AZ spread, failover, engine version joined
-    with per-node CloudWatch signals; flags outlier nodes, reader gaps, right-sizing. No group id: fleet mode
-    over ELASTICACHE_REGIONS."""
+    """One findings-first call per replication group: shards, replicas, AZ spread, failover, engine version plus
+    per-node CloudWatch signals; flags outlier nodes, reader gaps, right-sizing. No group id: fleet mode."""
     if replication_group_id:
         return server._cp(region).cluster_overview(replication_group_id, minutes)
     return server.control_plane().cluster_overview_fan_out(None, minutes, region)
@@ -340,18 +332,17 @@ def aws_security_audit(
     top: Annotated[int, Field(ge=1, le=200, description="Rows of the per-resource pass/fail matrix")] = 25,
     region: Region = None,
 ) -> dict:
-    """Fleet hardening roll-up from existing Describe data (no new IAM). Findings first: counts by severity,
-    findings by category (transit, at rest/KMS, auth, ACL, snapshots, patching) naming the resource, then a
-    pass/fail matrix capped to `top`. A denied call is a note, partial=true."""
+    """Fleet hardening roll-up from existing Describe data (no new IAM), Redis and Memcached. Findings first: counts
+    by severity, findings by category (transit, at rest, auth, ACL, network, snapshots, patching) naming the
+    resource, then a pass/fail matrix capped to `top`. A denied call is a note, partial=true."""
     return server.control_plane().security_audit_fan_out(region, top)
 
 
 @server.read_tool
 def aws_cost_overview(region: Region = None) -> dict:
-    """Fleet cost and right-sizing, findings first: node type and count, reserved coverage, 14-day peak memory/CPU
-    per group and serverless cache. Flags oversized nodes (peak memory under 30%), idle replicas, on-demand and
-    non-Graviton nodes, old manual snapshots, uncapped serverless. All ELASTICACHE_REGIONS unless `region` is
-    set."""
+    """Fleet cost and right-sizing, findings first: node type and count, reserved coverage, peak memory/CPU per group
+    and serverless cache. Flags idle groups, oversized nodes (names the smaller node type), idle replicas,
+    on-demand and non-Graviton nodes, old snapshots, uncapped serverless. All ELASTICACHE_REGIONS unless `region`."""
     return server.control_plane().cost_overview_fan_out(region)
 
 
@@ -359,5 +350,5 @@ def aws_cost_overview(region: Region = None) -> dict:
 def aws_capacity_forecast(region: Region = None) -> dict:
     """Days until memory is full across the fleet, findings first, from 14 days of DatabaseMemoryUsagePercentage
     (Serverless: BytesUsedForCache vs the storage maximum), soonest first. Under 7 days critical, under 30
-    warning, with a sizing hint. All ELASTICACHE_REGIONS unless `region` is set."""
+    warning. All ELASTICACHE_REGIONS unless `region` is set."""
     return server.control_plane().capacity_forecast_fan_out(region)

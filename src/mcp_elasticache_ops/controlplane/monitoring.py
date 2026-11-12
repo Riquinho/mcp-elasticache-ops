@@ -16,6 +16,7 @@ from ._shared import (
     AUTH_FAILURE_METRICS,
     FLEET_DEADLINE_SECONDS,
     MAX_FLEET_FINDINGS,
+    MEMCACHED_METRICS,
     NETWORK_ALLOWANCE_METRICS,
     SERVERLESS_METRICS,
     _fleet_deadline_error,
@@ -31,6 +32,7 @@ from ._shared import (
     is_burstable,
 )
 from .inventory import _InventoryMixin
+from .restore import _node_memory_bytes
 
 # Metrics worth looking at first, per engine family. Units follow CloudWatch.
 REDIS_METRICS = [
@@ -104,6 +106,81 @@ def _windows_overlap(maintenance: str, snapshot: str) -> bool:
     weekly = _window_minutes(maintenance, True)
     daily = _window_minutes(snapshot, False)
     return any(a < d and c < b for a, b in weekly for c, d in daily)
+
+
+MEMCACHED_MISS_RATIO_WARN = 0.5  # GetMisses over GetHits+GetMisses above this: the cache is mostly missing
+MEMCACHED_MISS_MIN_REQUESTS = 1000  # fewer gets than this in the window say nothing about the ratio
+MEMCACHED_MEMORY_WARN = 0.9  # item bytes over this share of the node memory
+MEMCACHED_CPU_WARN = 80.0
+MEMCACHED_CONN_LIMIT = 65_000  # ElastiCache default max_simultaneous_connections for memcached
+
+
+def _memcached_findings(target: str, summary: dict[str, dict], node_type: str | None) -> list[dict]:
+    """Memcached-only findings (the shared ones cover evictions, swap and host CPU above 90%)."""
+
+    def val(name: str, field: str) -> float | None:
+        s = summary.get(name) or {}
+        return s.get(field) if s.get("points") else None
+
+    out: list[dict] = []
+    cpu = val("CPUUtilization", "max")
+    if cpu is not None and cpu > MEMCACHED_CPU_WARN:
+        out.append(
+            finding(
+                "warning",
+                f"memcached CPUUtilization max {cpu:.0f}% above {MEMCACHED_CPU_WARN:.0f}% (it is multi-threaded; "
+                "this is host CPU, not one core)",
+                resource=target,
+            )
+        )
+    conns = val("CurrConnections", "max")
+    if conns is not None and conns > 0.8 * MEMCACHED_CONN_LIMIT:
+        out.append(
+            finding(
+                "warning",
+                f"memcached CurrConnections max {conns:.0f} is over 80% of the connection limit "
+                f"({MEMCACHED_CONN_LIMIT}); new clients are refused at the limit",
+                resource=target,
+            )
+        )
+    items, free = val("BytesUsedForCacheItems", "max"), val("FreeableMemory", "min")
+    total = _node_memory_bytes(node_type)
+    if items is not None and total and items / total > MEMCACHED_MEMORY_WARN:
+        out.append(
+            finding(
+                "warning",
+                f"BytesUsedForCacheItems max {items / 1024**2:.0f} MB is {items / total:.0%} of the node memory "
+                f"({node_type}); the cache is full and evicts on every new item",
+                resource=target,
+            )
+        )
+    elif (
+        items is not None
+        and free is not None
+        and items + free > 0
+        and free / (items + free) < 1 - MEMCACHED_MEMORY_WARN
+    ):
+        out.append(
+            finding(
+                "warning",
+                f"FreeableMemory min {free / 1024**2:.0f} MB is under 10% of item bytes plus free memory; "
+                "little headroom left",
+                resource=target,
+            )
+        )
+    hits, misses = val("GetHits", "sum"), val("GetMisses", "sum")
+    if hits is not None and misses is not None and hits + misses >= MEMCACHED_MISS_MIN_REQUESTS:
+        ratio = misses / (hits + misses)
+        if ratio > MEMCACHED_MISS_RATIO_WARN:
+            out.append(
+                finding(
+                    "info",
+                    f"GetMisses are {ratio:.0%} of gets in the window ({misses:.0f} of {hits + misses:.0f}); "
+                    "check TTLs, key naming and whether evictions are dropping hot items",
+                    resource=target,
+                )
+            )
+    return out
 
 
 class _MonitoringMixin(_InventoryMixin):
@@ -521,7 +598,16 @@ class _MonitoringMixin(_InventoryMixin):
             return {"error": "InvalidArgument", "message": problem}
 
         def run() -> dict:
-            names = metrics or (SERVERLESS_METRICS if serverless else REDIS_METRICS)
+            engine_note: str | None = None
+            node_type: str | None = None
+            if metrics:
+                names = metrics
+            elif serverless:
+                names = SERVERLESS_METRICS
+            elif cache_cluster_id and not replication_group_id:
+                names, engine_note, node_type = self._default_metric_names(str(cache_cluster_id))
+            else:
+                names = REDIS_METRICS
             if replication_group_id and not serverless:
                 groups = self._paginate(
                     "describe_replication_groups", "ReplicationGroups", ReplicationGroupId=replication_group_id
@@ -539,6 +625,9 @@ class _MonitoringMixin(_InventoryMixin):
                 limits = self._serverless_limits(targets)
                 for target in targets:
                     findings += _serverless_limit_findings(target, summary[target], limits.get(target), period_seconds)
+            if engine_note == "memcached":
+                for target in targets:
+                    findings += _memcached_findings(target, summary[target], node_type)
             single = len(targets) == 1
             out: dict[str, Any] = {
                 "cache_cluster_id": cache_cluster_id,
@@ -550,6 +639,8 @@ class _MonitoringMixin(_InventoryMixin):
                 "findings": _sorted_findings(findings),
                 "summary": summary[targets[0]] if single else summary,
             }
+            if engine_note:
+                out["engine"] = engine_note
             if serverless:
                 out["serverless_limits"] = {t: _limits_view(limits.get(t), summary[t], period_seconds) for t in targets}
             if include_series:
@@ -557,6 +648,19 @@ class _MonitoringMixin(_InventoryMixin):
             return out
 
         return self._guard(run)
+
+    def _default_metric_names(self, cluster_id: str) -> tuple[list[str], str | None, str | None]:
+        """Default metric list for one cache cluster: the Memcached set when DescribeCacheClusters says memcached.
+
+        Best effort: when the describe call fails the Redis list is used, which is what earlier versions did."""
+        try:
+            found = self._paginate("describe_cache_clusters", "CacheClusters", CacheClusterId=cluster_id)
+        except (BotoCoreError, ClientError):
+            return REDIS_METRICS, None, None
+        cluster = found[0] if found else {}
+        engine = str(cluster.get("Engine") or "").lower() or None
+        names = MEMCACHED_METRICS if engine == "memcached" else REDIS_METRICS
+        return names, engine, cluster.get("CacheNodeType")
 
     def _serverless_limits(self, targets: list[str]) -> dict[str, dict]:
         """Configured usage limits per serverless cache; best effort, never fails the metrics call."""
