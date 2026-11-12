@@ -13,6 +13,8 @@ Memcached), built on [FastMCP](https://gofastmcp.com). Point Claude, Cursor or a
 get the answers an on-call engineer needs in seconds: *is it healthy, where is the memory, what is slow, who is
 connected, which keys are big or hot, what did AWS do to the cluster.*
 
+**Contents:** [Why](#why) | [Without / with](#without--with) | [Example prompts](#example-prompts) | [Quick start](#quick-start) | [Tools](#tools) | [Safety model](#safety-model) | [Configuration](#configuration)
+
 ## Why
 
 - **Safe by construction.** Every Redis command passes an allowlist of 53 read-only commands. `SET`, `DEL`,
@@ -61,6 +63,13 @@ Audit the security posture of my replication groups: encryption, auth, subnet gr
 - **Capacity reviews.** Memory, evictions, hit rate and big keys across regions.
 - **Safe AI access to production.** Let a team use an assistant on prod caches without a write path.
 - **Audits.** Encryption, auth, parameter groups and pending maintenance in one pass.
+
+## Why you might not want it
+
+- It cannot fix anything. It diagnoses; you or your automation apply the change.
+- It never reads key values, so it cannot answer "what is stored under this key".
+- Big-key and hot-key results come from bounded `SCAN` sampling, not an exhaustive pass.
+- The server must reach the cache endpoint (same VPC, VPN or tunnel). ElastiCache has no public data plane.
 
 ## What it looks like
 
