@@ -10,7 +10,7 @@ written from scratch for ElastiCache.
 
 ## Tools
 
-All 41 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
+All 42 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 
 **Data plane** (redis-py, talks to the node endpoint)
 
@@ -57,6 +57,7 @@ All 41 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `aws_service_updates` | `DescribeServiceUpdates`: pending updates, past or near apply-by dates |
 | `aws_subnet_groups` | `DescribeCacheSubnetGroups`: AZ spread (Multi-AZ needs 2+) |
 | `aws_triage` | One call per replication group: status/Multi-AZ/failover, last 6h events, CloudWatch peaks per member (EngineCPU, memory %, Evictions, ReplicationLag, CurrConnections), pending service updates, newest snapshot. Worst-first findings (max 30); a failing section is reported `unavailable` |
+| `aws_serverless_triage` | One call per serverless cache: status and usage limits, snapshot health, 6h `ThrottledCmds`, ECPU and storage against the limits. Worst-first findings (max 30); a failing section (for example `AccessDenied`) is reported `unavailable`. Describe/GetMetricData calls only |
 | `aws_cluster_overview` | One findings-first call per replication group: shards, replicas per shard, AZ spread, failover, engine version joined with per-node CloudWatch (EngineCPU, memory %, ReplicationLag, Evictions, CurrConnections, NewConnections). Flags nodes above 1.5x the peer median, reader endpoint gaps and right-sizing (memory p95 < 30% and CPU p95 < 20%; data tiering for r6gd). Worst-first, bounded; `GetMetricData` denied gives `status: partial` |
 | `aws_alarms` | `DescribeAlarms` (AWS/ElastiCache, paginated, optional `replication_group_id`): alarms in ALARM, INSUFFICIENT_DATA or with actions disabled, and members with no alarm on EngineCPUUtilization, DatabaseMemoryUsagePercentage, Evictions, ReplicationLag, CurrConnections, SwapUsage (plus ThrottledCmds on Serverless). Denied `DescribeAlarms` gives `partial: true` |
 | `aws_engine_versions` | `DescribeCacheEngineVersions` for `redis`, `valkey` or `memcached` (optional `version_prefix`): versions with parameter group family and upgrade targets (latest minor of each major, latest Valkey for Redis OSS) |
@@ -88,6 +89,11 @@ and `node_memory` emit:
 | Fragmentation | `mem_fragmentation_ratio` > 1.5 (high) or < 1.0 with data (swapping) | warning |
 | Evictions | `evicted_keys` > 0; the message adds the average per minute since start | warning |
 | Failed persistence | `rdb_last_bgsave_status` or `aof_last_write_status` not `ok` | warning |
+| Fork latency | `latest_fork_usec` > 1 s (warning), > 5 s (critical): the main thread blocks while forking for a save or resync | warning / critical |
+| Replication resync trouble | `sync_partial_err` > 0, or `sync_full` >= 3 at >= 1 per hour of uptime (after 10 minutes) | warning |
+| Client eviction | `evicted_clients` > 0 (`maxmemory-clients` reached; Redis 7.0+/Valkey) | warning |
+| Error replies | `total_error_replies` > 5% of `total_commands_processed` (at least 1000 commands) | warning |
+| Burstable CPU credits | `CPUCreditBalance` minimum < 20 credits (warning) or 0 (critical) on `cache.t*` nodes in `aws_cluster_overview` / `aws_triage`, with a right-sizing hint towards a non-burstable type; `CPUCreditBalance` is also in the recommended alarms for `cache.t*` groups | warning / critical |
 | Replica link down | `master_link_status` not `up` on a replica | critical |
 | Large client buffers | `client_recent_max_output_buffer` or `..._input_buffer` >= 16 MiB; per client `omem + qbuf` >= 10 MiB in `node_triage` | warning |
 | Connection pressure | `connected_clients / maxclients` > 80% (warning), > 95% (critical); `maxclients` from INFO or `CONFIG GET` | warning / critical |

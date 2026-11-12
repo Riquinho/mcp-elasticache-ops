@@ -23,7 +23,7 @@ from typing import Any
 
 import redis
 
-from .safe_client import CONFIG_GET_EXACT, CONFIG_GET_PREFIXES
+from .safe_client import CONFIG_GET_EXACT, CONFIG_GET_PREFIXES, MAX_SCAN_COUNT
 
 LENGTH_COMMAND = {
     "string": "STRLEN",
@@ -78,6 +78,8 @@ MIN_ENGINE_VERSION: dict[str, tuple[int, ...]] = {
     "ACL WHOAMI": (6, 0),
     "MEMORY DOCTOR": (4, 0),
     "LATENCY LATEST": (2, 8, 13),
+    "INFO ERRORSTATS": (6, 2),
+    "INFO LATENCYSTATS": (7, 0),
 }
 
 
@@ -141,6 +143,74 @@ CLIENT_MEMORY_SHARE = 0.10  # mem_clients_normal / used_memory above this is a w
 CLIENT_MEMORY_FLOOR_BYTES = 8 * 1024 * 1024  # ... but only when client buffers hold at least this much
 CHURN_MIN_UPTIME_SECONDS = 600  # too early to average the connection rate before this
 CHURN_PER_SECOND = 20.0  # average new connections per second that hints at a missing connection pool
+
+
+FORK_WARN_USEC = 1_000_000  # latest_fork_usec above this stalls the main thread for over a second
+FORK_CRIT_USEC = 5_000_000
+SYNC_MIN_UPTIME_SECONDS = 600  # too early to judge full-resync frequency before this
+SYNC_FULL_MIN = 3  # at least this many full syncs ...
+SYNC_FULL_PER_HOUR = 1.0  # ... at this average rate per hour of uptime is a resync storm
+ERROR_REPLIES_MIN_COMMANDS = 1000  # ignore the error share on a barely used node
+ERROR_REPLIES_SHARE = 0.05  # total_error_replies / total_commands_processed above this is a warning
+
+
+# Raw INFO fields echoed by health_summary when the engine reports them (absent on older engines).
+HEALTH_EXTRA_FIELDS = (
+    "latest_fork_usec",
+    "rdb_last_bgsave_time_sec",
+    "sync_full",
+    "sync_partial_ok",
+    "sync_partial_err",
+    "evicted_clients",
+    "total_error_replies",
+    "total_commands_processed",
+    "expired_stale_perc",
+    "active_defrag_running",
+)
+
+
+def _fork_findings(info: dict) -> list[str]:
+    fork = _num(info.get("latest_fork_usec"))
+    if fork <= FORK_WARN_USEC:
+        return []
+    tail = "the main thread blocks while forking (large heap or slow host); expect latency spikes during saves"
+    return [f"fork latency {fork / 1_000_000:.1f}s (latest_fork_usec={int(fork)}): {tail}"]
+
+
+def _sync_findings(info: dict) -> list[str]:
+    out: list[str] = []
+    partial_err = int(_num(info.get("sync_partial_err")))
+    if partial_err > 0:
+        out.append(
+            f"{partial_err} partial resync requests refused (sync_partial_err): the replication backlog is too small "
+            "or replicas fall too far behind, so replicas fall back to full resyncs (see repl-backlog-size)"
+        )
+    full = _num(info.get("sync_full"))
+    uptime = _num(info.get("uptime_in_seconds"))
+    if uptime >= SYNC_MIN_UPTIME_SECONDS and full >= SYNC_FULL_MIN and full * 3600 / uptime >= SYNC_FULL_PER_HOUR:
+        out.append(
+            f"{int(full)} full resyncs served since start (about {full * 3600 / uptime:.1f}/hour, sync_full): "
+            "replicas keep resyncing, each one forks and ships a full RDB"
+        )
+    return out
+
+
+def _error_findings(info: dict) -> list[str]:
+    out: list[str] = []
+    evicted_clients = int(_num(info.get("evicted_clients")))
+    if evicted_clients > 0:
+        out.append(
+            f"{evicted_clients} clients evicted since restart (evicted_clients): maxmemory-clients was reached; "
+            "look for clients with large buffers, see node_clients"
+        )
+    errors = _num(info.get("total_error_replies"))
+    commands = _num(info.get("total_commands_processed"))
+    if commands >= ERROR_REPLIES_MIN_COMMANDS and errors / commands > ERROR_REPLIES_SHARE:
+        out.append(
+            f"{errors / commands:.0%} of commands ended in an error reply ({int(errors)} of {int(commands)}, "
+            "total_error_replies); see node_commandstats for the commands and error prefixes"
+        )
+    return out
 
 
 def _persistence_findings(info: dict) -> list[str]:
@@ -244,6 +314,9 @@ def health_summary(r: redis.Redis, serverless: bool = False) -> dict:
     if info.get("role") == "slave" and info.get("master_link_status") != "up":
         findings.append(f"replica link is {info.get('master_link_status')}")
     findings += _persistence_findings(info)
+    findings += _fork_findings(info)
+    findings += _sync_findings(info)
+    findings += _error_findings(info)
     findings += _buffer_findings(info)
     maxclients = _num(info.get("maxclients"))
     if not maxclients and _num(info.get("connected_clients")) > 0:
@@ -265,6 +338,7 @@ def health_summary(r: redis.Redis, serverless: bool = False) -> dict:
         "mem_fragmentation_ratio": frag,
         "evicted_keys": info.get("evicted_keys"),
         "expired_keys": info.get("expired_keys"),
+        **{k: info[k] for k in HEALTH_EXTRA_FIELDS if k in info},
         "keyspace": {k: v for k, v in info.items() if k.startswith("db")},
         "findings": findings or ["no issues detected by basic thresholds"],
         **({"serverless": serverless} if serverless else {}),
@@ -488,8 +562,47 @@ def latency(r: redis.Redis, ping_samples: int = 20) -> dict:
     }
 
 
+COMMANDSTATS_P99_WARN_USEC = 10_000  # a top-by-time command whose p99 exceeds 10 ms is worth a look
+MAX_ERROR_PREFIXES = 20  # errorstats rows returned
+# Error prefixes that point at a specific, fixable cause (INFO errorstats, Redis 6.2+/Valkey).
+_ERROR_CAUSES = {
+    "OOM": "maxmemory is reached with a noeviction-like policy: raise memory, evict, or shorten TTLs",
+    "READONLY": "writes reached a replica (failover or a client pinned to a replica): check endpoints and failovers",
+    "NOPERM": "an ACL user lacks permission for the command or key: check ACL LOG with node_acl_log",
+}
+_LATENCY_PREFIX = "latency_percentiles_usec_"
+
+
+def _error_rows(stats: dict) -> list[dict]:
+    rows = [
+        {"error": key.removeprefix("errorstat_"), "count": int(_num((v or {}).get("count")))}
+        for key, v in stats.items()
+        if isinstance(v, dict)
+    ]
+    rows.sort(key=lambda row: row["count"], reverse=True)
+    return rows
+
+
+def _latency_rows(stats: dict) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for key, v in stats.items():
+        if key.startswith(_LATENCY_PREFIX) and isinstance(v, dict):
+            out[key.removeprefix(_LATENCY_PREFIX)] = {
+                "p50_usec": _num(v.get("p50")),
+                "p99_usec": _num(v.get("p99")),
+                "p99_9_usec": _num(v.get("p99.9")),
+            }
+    return out
+
+
 def commandstats(r: redis.Redis, top: int = 20) -> dict:
+    """Commands ranked by CPU time, plus error prefix counts and per-command latency percentiles.
+
+    ``INFO errorstats`` (Redis 6.2+/Valkey) and ``INFO latencystats`` (7.0+/Valkey) are optional: an older
+    engine or a managed endpoint that refuses them yields a note, never an error. Output is capped at ``top``.
+    """
     stats = r.info("commandstats")
+    top = max(1, int(top))
     rows = []
     for key, v in stats.items():
         name = key.removeprefix("cmdstat_")
@@ -504,7 +617,40 @@ def commandstats(r: redis.Redis, top: int = 20) -> dict:
             }
         )
     rows.sort(key=lambda x: x["usec"], reverse=True)
-    return {"commands": len(rows), "top_by_total_time": rows[: max(1, int(top))]}
+    top_rows = rows[:top]
+
+    notes: list[str] = []
+    server, _ = _try(r.info, "server")
+    errors, errors_err = _try(r.info, "errorstats")
+    if errors is None:
+        notes.append(command_support_note("INFO ERRORSTATS", server, errors_err))
+    error_rows = _error_rows(errors or {})
+    latency_stats, latency_err = _try(r.info, "latencystats")
+    if latency_stats is None:
+        notes.append(command_support_note("INFO LATENCYSTATS", server, latency_err))
+    latency = _latency_rows(latency_stats or {})
+
+    findings: list[str] = []
+    for row in error_rows:
+        cause = _ERROR_CAUSES.get(row["error"].upper())
+        if cause and row["count"] > 0:
+            findings.append(f"{row['count']} {row['error']} error replies since start: {cause}")
+    for row in top_rows:
+        p99 = (latency.get(row["command"]) or {}).get("p99_usec", 0.0)
+        if p99 > COMMANDSTATS_P99_WARN_USEC:
+            findings.append(
+                f"{row['command']} p99 latency is {p99 / 1000:.1f} ms (above {COMMANDSTATS_P99_WARN_USEC // 1000} ms) "
+                f"over {row['calls']} calls; see node_slowlog for the arguments"
+            )
+    shown = {row["command"] for row in top_rows}
+    return {
+        "commands": len(rows),
+        "top_by_total_time": top_rows,
+        "errorstats": error_rows[: min(top, MAX_ERROR_PREFIXES)],
+        "latencystats": {k: v for k, v in sorted(latency.items(), key=lambda kv: -kv[1]["p99_usec"]) if k in shown},
+        "findings": findings,
+        **({"notes": notes} if notes else {}),
+    }
 
 
 # ----------------------------------------------------------------------- config
@@ -790,6 +936,7 @@ def keyspace_sample(
     normalised prefix (see ``normalize_key``) from data already fetched, so it costs no extra commands.
     """
     sample_size = max(1, min(int(sample_size), 100_000))
+    scan_count = max(1, min(int(scan_count), MAX_SCAN_COUNT))
     max_seconds = max(0.01, min(float(max_seconds), MAX_SAMPLE_SECONDS))
     started = clock()
     deadline = started + max_seconds
@@ -1952,10 +2099,14 @@ def _safe(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> tuple[Any, str |
 
 
 _CONNECTIONS_PCT = re.compile(r"connections at (\d+)%")
+_FORK_USEC = re.compile(r"fork latency .*latest_fork_usec=(\d+)")
 
 
 def _health_severity(message: str) -> str:
     if message.startswith(("replica link", "memory at", "noeviction at")):
+        return "critical"
+    fork = _FORK_USEC.match(message)
+    if fork and int(fork.group(1)) > FORK_CRIT_USEC:
         return "critical"
     match = _CONNECTIONS_PCT.match(message)
     if match and int(match.group(1)) > CONNECTIONS_CRIT_RATIO * 100:
@@ -2023,6 +2174,7 @@ def _triage_commandstats(d: dict) -> tuple[dict, list[dict]]:
                 command=c["command"],
             )
         )
+    findings += [_finding("warning", f) for f in d.get("findings", [])]
     summary = {
         "commands": d["commands"],
         "failed_calls": sum(c["failed_calls"] for c in rows),

@@ -31,7 +31,7 @@ async def test_all_tools_read_only():
     async with Client(server.mcp) as c:
         tools = await c.list_tools()
     names = {t.name for t in tools}
-    assert len(tools) == 41
+    assert len(tools) == 42
     assert {
         "node_health",
         "node_info",
@@ -116,7 +116,7 @@ async def test_node_config_end_to_end(env):
 
 async def test_every_registered_tool_is_wrapped_with_the_output_cap():
     tools = await server.mcp.list_tools()
-    assert len(tools) == 41
+    assert len(tools) == 42
     unwrapped = [t.name for t in tools if not getattr(t.fn, "__capped__", False)]
     assert unwrapped == []
 
@@ -310,3 +310,18 @@ async def test_memcached_tools_survive_socket_timeouts(monkeypatch, tool):
     assert not result.is_error
     data = _data(result)
     assert data.get("hint") or data.get("status") in {"partial", "error"}
+
+
+async def test_every_tool_has_a_short_docstring_and_readme_rows_match_registry():
+    import re
+    from pathlib import Path
+
+    async with Client(server.mcp) as c:
+        tools = await c.list_tools()
+    for t in tools:
+        assert t.description and t.description.strip(), t.name
+        assert len(t.description) < 400, f"{t.name}: description is {len(t.description)} chars"
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    rows = re.findall(r"^\| `((?:node|aws|memcached)_[a-z_]+)` \|", readme, flags=re.M)
+    assert len(rows) == len(set(rows)), "duplicate README tool rows"
+    assert set(rows) == {t.name for t in tools}

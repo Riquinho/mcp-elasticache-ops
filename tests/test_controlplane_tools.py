@@ -4,6 +4,7 @@ import datetime as dt
 
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 from botocore.stub import Stubber
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
@@ -604,6 +605,7 @@ def test_every_tool_only_calls_describe_list_or_get_metric_data():
     cp.reserved_nodes()
     cp.reserved_offerings("cache.r6g.large", "redis")
     cp.serverless_snapshots()
+    cp.serverless_triage("sc")
     cp.service_updates()
     cp.subnet_groups()
     cp.metrics("a", minutes=5)
@@ -1510,3 +1512,236 @@ async def test_serverless_snap_tool_access_denied_is_a_structured_failure(monkey
     assert not result.is_error
     data = result.structured_content.get("result", result.structured_content)
     assert data["error"] == "AccessDenied" and "IAM" in data["hint"]
+
+
+# ------------------------------------------------- burstable nodes: CPU credits
+
+
+class _Recorder:
+    """Duck-typed boto client: canned elasticache responses, GetMetricData answered from ``values``."""
+
+    def __init__(self, responses=None, values=None):
+        self.responses = responses or {}
+        self.values = values or {}
+        self.queries: list[dict] = []
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+
+        def call(**kwargs):
+            if name == "get_metric_data":
+                self.queries.extend(kwargs["MetricDataQueries"])
+                return {
+                    "MetricDataResults": [
+                        _result(q["Label"], _pts(*self.values[q["Label"]]))
+                        for q in kwargs["MetricDataQueries"]
+                        if q["Label"] in self.values
+                    ]
+                }
+            return self.responses.get(name, {})
+
+        return call
+
+
+def _burst_plane(node_type, values):
+    rg = {
+        **_placed_rg([_member("rg1-001", "primary", "us-east-1a")]),
+        "CacheNodeType": node_type,
+        "MemberClusters": ["rg1-001"],
+    }
+    ec = _Recorder(
+        {
+            "describe_replication_groups": {"ReplicationGroups": [rg]},
+            "describe_events": {"Events": []},
+            "describe_update_actions": {"UpdateActions": []},
+            "describe_snapshots": {"Snapshots": []},
+        }
+    )
+    cw = _Recorder(values=values)
+
+    class Session:
+        def client(self, service, region_name=None, config=None):
+            return {"elasticache": ec, "cloudwatch": cw}[service]
+
+    return ControlPlane(ControlPlaneConfig(region=REGION), session_factory=Session, clock=lambda: NOW), cw
+
+
+def _metric_names(cw):
+    return {q["MetricStat"]["Metric"]["MetricName"] for q in cw.queries}
+
+
+@pytest.mark.parametrize("balance,severity", [([5.0, 12.0, 30.0], "warning"), ([40.0, 8.0, 0.0], "critical")])
+def test_overview_low_cpu_credits_on_t4g_fire_finding_and_hint(balance, severity):
+    cp, cw = _burst_plane("cache.t4g.medium", {"rg1-001|CPUCreditBalance": balance})
+    out = cp.cluster_overview("rg1", minutes=60)
+    credit = [f for f in out["findings"] if "CPUCreditBalance" in f["message"]]
+    assert [f["severity"] for f in credit] == [severity]
+    assert any(f.get("category") == "right-sizing" and "non-burstable" in f["message"] for f in out["findings"])
+    assert {"CPUCreditBalance", "CPUCreditUsage"} <= _metric_names(cw)
+
+
+def test_triage_low_cpu_credits_on_t4g_fire_finding():
+    cp, cw = _burst_plane("cache.t4g.medium", {"rg1-001|CPUCreditBalance": [3.0, 1.0]})
+    out = cp.triage("rg1")
+    assert any("CPUCreditBalance" in f["message"] and f["section"] == "metrics" for f in out["findings"])
+    assert {"CPUCreditBalance", "CPUCreditUsage"} <= _metric_names(cw)
+
+
+def test_healthy_credit_balance_is_quiet():
+    cp, _ = _burst_plane("cache.t3.small", {"rg1-001|CPUCreditBalance": [20.0, 300.0]})
+    out = cp.cluster_overview("rg1", minutes=60)
+    assert not any("CPUCredit" in f["message"] for f in out["findings"])
+
+
+@pytest.mark.parametrize("call", ["cluster_overview", "triage"])
+def test_non_burstable_group_never_requests_credit_metrics(call):
+    cp, cw = _burst_plane("cache.r6g.large", {})
+    out = cp.cluster_overview("rg1", minutes=60) if call == "cluster_overview" else cp.triage("rg1")
+    assert cw.queries, "metrics were requested at all"
+    assert not _metric_names(cw) & {"CPUCreditBalance", "CPUCreditUsage"}
+    assert not any("CPUCredit" in f["message"] for f in out["findings"])
+
+
+def test_recommended_alarms_include_credit_balance_only_for_t_types(aws):
+    cp, ec, _ = aws
+    t = {
+        **_placed_rg([_member("t-001", "primary", "us-east-1a")]),
+        "ReplicationGroupId": "t",
+        "CacheNodeType": "cache.t4g.small",
+    }
+    t["MemberClusters"] = ["t-001"]
+    r = {**t, "ReplicationGroupId": "r", "CacheNodeType": "cache.r6g.large", "MemberClusters": ["r-001"]}
+    ec.add_response("describe_replication_groups", {"ReplicationGroups": [t, r]}, {})
+    ec.add_response("describe_cache_clusters", {"CacheClusters": []}, {})
+    ec.add_response("describe_serverless_caches", {"ServerlessCaches": []}, {})
+    targets = {x["id"]: x["metrics"] for x in cp._alarm_targets(None) if x["kind"] == "replication-group"}
+    assert "CPUCreditBalance" in targets["t"] and "CPUCreditBalance" not in targets["r"]
+
+
+# ------------------------------------------------------------- serverless triage
+
+
+def _sl_cache(name="sc", **over):
+    return {**_scache(name), "Status": "available", "Engine": "valkey", "UserGroupId": "ug", **over}
+
+
+def _sl_plane(cache_resp, snaps=None, metrics=None):
+    """Plane whose elasticache/cloudwatch clients return canned data or raise the given ClientError."""
+    calls = {"ec": [], "cw": []}
+
+    class EC:
+        def describe_serverless_caches(self, **kw):
+            calls["ec"].append(("describe_serverless_caches", kw))
+            if isinstance(cache_resp, Exception):
+                raise cache_resp
+            return cache_resp
+
+        def describe_serverless_cache_snapshots(self, **kw):
+            calls["ec"].append(("describe_serverless_cache_snapshots", kw))
+            if isinstance(snaps, Exception):
+                raise snaps
+            return snaps if snaps is not None else {"ServerlessCacheSnapshots": []}
+
+    class CW:
+        def get_metric_data(self, **kw):
+            calls["cw"].append(kw)
+            if isinstance(metrics, Exception):
+                raise metrics
+            values = metrics or {}
+            return {
+                "MetricDataResults": [
+                    _result(q["Label"], _pts(*values[q["Label"]]))
+                    for q in kw["MetricDataQueries"]
+                    if q["Label"] in values
+                ]
+            }
+
+    class Session:
+        def client(self, service, region_name=None, config=None):
+            return {"elasticache": EC(), "cloudwatch": CW()}[service]
+
+    cp = ControlPlane(ControlPlaneConfig(region=REGION), session_factory=Session, clock=lambda: NOW)
+    return cp, calls
+
+
+def _denied(op):
+    return ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}}, op)
+
+
+def test_serverless_triage_happy_path_flags_throttling_and_limits():
+    limits = {"DataStorage": {"Maximum": 1, "Unit": "GB"}, "ECPUPerSecond": {"Maximum": 1000}}
+    cp, calls = _sl_plane(
+        {"ServerlessCaches": [_sl_cache(CacheUsageLimits=limits)]},
+        {"ServerlessCacheSnapshots": [_ssnap("s1", "sc", 3, expires_in=100)]},
+        {
+            "sc|ThrottledCmds": [0.0, 12.0],
+            "sc|BytesUsedForCache": [1024.0**3 * 0.95],
+            "sc|ElastiCacheProcessingUnits": [300.0 * 100],
+        },
+    )
+    out = cp.serverless_triage("sc")
+    assert [s["section"] for s in out["sections"]] == ["cache", "snapshots", "limits"]
+    assert all(s["status"] != "unavailable" for s in out["sections"])
+    messages = " ".join(f["message"] for f in out["findings"])
+    assert "12 throttled commands" in messages and "DataStorage maximum" in messages
+    sev = [f["severity"] for f in out["findings"]]
+    rank = {"critical": 0, "warning": 1, "info": 2}
+    assert [rank[x] for x in sev] == sorted(rank[x] for x in sev)
+    assert out["overall"] == "critical"
+    assert calls["ec"][0][1] == {"ServerlessCacheName": "sc"}
+    assert calls["cw"][0]["MetricDataQueries"][0]["MetricStat"]["Metric"]["Dimensions"] == [
+        {"Name": "clusterId", "Value": "sc"}
+    ]
+
+
+def test_serverless_triage_quiet_cache_has_no_findings():
+    limits = {"DataStorage": {"Maximum": 10, "Unit": "GB"}, "ECPUPerSecond": {"Maximum": 1000}}
+    cp, _ = _sl_plane(
+        {"ServerlessCaches": [_sl_cache(CacheUsageLimits=limits)]},
+        {"ServerlessCacheSnapshots": [_ssnap("s1", "sc", 3, expires_in=100)]},
+        {"sc|ThrottledCmds": [0.0, 0.0]},
+    )
+    out = cp.serverless_triage("sc")
+    assert out["overall"] == "ok" and out["findings_total"] == 0
+
+
+def test_serverless_triage_unknown_cache_is_a_tool_error_dict():
+    for resp in (
+        {"ServerlessCaches": []},
+        ClientError({"Error": {"Code": "ServerlessCacheNotFoundFault", "Message": "nope"}}, "DescribeServerlessCaches"),
+    ):
+        cp, calls = _sl_plane(resp)
+        out = cp.serverless_triage("ghost")
+        assert out["error"] == "ServerlessCacheNotFoundFault"
+        assert calls["cw"] == []
+
+
+def test_serverless_triage_access_denied_section_is_unavailable_and_others_survive():
+    cp, _ = _sl_plane(
+        {"ServerlessCaches": [_sl_cache()]},
+        _denied("DescribeServerlessCacheSnapshots"),
+        {"sc|ThrottledCmds": [5.0]},
+    )
+    out = cp.serverless_triage("sc")
+    status = {s["section"]: s["status"] for s in out["sections"]}
+    assert status["snapshots"] == "unavailable"
+    assert status["cache"] != "unavailable" and status["limits"] != "unavailable"
+    assert any("snapshots unavailable" in f["message"] and "AccessDenied" in f["message"] for f in out["findings"])
+    assert "error" not in out
+
+
+def test_serverless_triage_cache_and_metrics_denied_keeps_snapshots():
+    cp, _ = _sl_plane(
+        _denied("DescribeServerlessCaches"),
+        {"ServerlessCacheSnapshots": [_ssnap("s1", "sc", 3, expires_in=100)]},
+        _denied("GetMetricData"),
+    )
+    out = cp.serverless_triage("sc")
+    status = {s["section"]: s["status"] for s in out["sections"]}
+    assert status == {"cache": "unavailable", "snapshots": "ok", "limits": "unavailable"}
+
+
+def test_serverless_triage_disabled_control_plane():
+    cp = ControlPlane(ControlPlaneConfig(region=REGION, enabled=False))
+    assert "unavailable" in cp.serverless_triage("sc")

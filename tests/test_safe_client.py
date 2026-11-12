@@ -331,7 +331,7 @@ def test_fuzz_dangerous_commands_never_pass(base):
 @pytest.mark.parametrize("key", sorted(READ_ONLY_COMMANDS))
 def test_fuzz_allowlisted_commands_are_case_and_bytes_insensitive(key):
     name, _, sub = key.partition(" ")
-    extra = ("maxmemory",) if key == "CONFIG GET" else ()
+    extra = ("maxmemory",) if key == "CONFIG GET" else ("get",) if key == "COMMAND DOCS" else ()
     for args in (
         (key, *extra),
         (key.lower(), *extra),
@@ -364,7 +364,7 @@ def test_fuzz_allowlisted_commands_reject_whitespace_and_unicode_tricks(key):
 _OK_ARGS = [
     ("MEMORY", "USAGE", "k"),
     ("MEMORY", "USAGE", "k", "SAMPLES", "5"),
-    ("memory", "usage", "k", "samples", "0"),
+    ("memory", "usage", "k", "samples", "1"),
     ("SCAN", "0"),
     ("SCAN", "0", "MATCH", "user:*", "COUNT", "100", "TYPE", "string"),
     ("scan", "17", "count", "10"),
@@ -382,7 +382,7 @@ _OK_ARGS = [
 
 
 @pytest.mark.parametrize("args", _OK_ARGS, ids=lambda a: " ".join(a))
-def test_round03_allowed_forms(args):
+def test_dataplane_allowed_forms(args):
     check(args)
 
 
@@ -392,6 +392,8 @@ _BAD_ARGS = [
     ("MEMORY", "USAGE", "k", "FOO", "5"),
     ("MEMORY", "USAGE", "k", "SAMPLES", "5", "extra"),
     ("MEMORY", "USAGE", "k", "SAMPLES", "-1"),
+    ("MEMORY", "USAGE", "k", "SAMPLES", "0"),
+    ("MEMORY", "USAGE", "k", "SAMPLES", "101"),
     ("SCAN", "0", "MATCH"),
     ("SCAN", "0", "COUNT", "x"),
     ("SCAN", "0", "TYPE", "string", "DELETE", "1"),
@@ -427,7 +429,7 @@ _BAD_ARGS = [
 
 
 @pytest.mark.parametrize("args", _BAD_ARGS, ids=lambda a: repr(a))
-def test_round03_refused_forms(args):
+def test_dataplane_refused_forms(args):
     with pytest.raises(ReadOnlyViolation):
         check(args)
 
@@ -469,3 +471,33 @@ def test_pipeline_allows_the_sampling_commands():
     pipe.object("FREQ", "k")
     pipe.execute_command("OBJECT", "IDLETIME", "k")
     assert len(pipe.command_stack) == 5
+
+
+_BOUNDARIES = [
+    (("SCAN", "0", "COUNT", "1000"), ("SCAN", "0", "COUNT", "1001")),
+    (("MEMORY", "USAGE", "k", "SAMPLES", "100"), ("MEMORY", "USAGE", "k", "SAMPLES", "101")),
+    (("MEMORY", "USAGE", "k", "SAMPLES", "1"), ("MEMORY", "USAGE", "k", "SAMPLES", "0")),
+    (("CLIENT", "LIST", "ID", *map(str, range(100))), ("CLIENT", "LIST", "ID", *map(str, range(101)))),
+    (("ACL", "LOG", "128"), ("ACL", "LOG", "129")),
+    (("COMMAND", "DOCS", "get"), ("COMMAND", "DOCS")),
+]
+
+
+@pytest.mark.parametrize("ok,bad", _BOUNDARIES, ids=lambda a: " ".join(a[:5]))
+def test_bounds_accept_at_limit_reject_beyond(ok, bad):
+    check(ok)
+    with pytest.raises(ReadOnlyViolation):
+        check(bad)
+
+
+def test_bounds_apply_to_int_arguments_too():
+    check(("SCAN", 0, "COUNT", 1000))
+    with pytest.raises(ReadOnlyViolation):
+        check(("SCAN", 0, "COUNT", 1001))
+
+
+@pytest.mark.parametrize("section", ["errorstats", "latencystats", "commandstats", "ERRORSTATS", "LATENCYSTATS"])
+def test_info_errorstats_and_latencystats_sections_are_allowed(section):
+    check(("INFO", section))
+    check((b"INFO", section.encode()))
+    assert command_key(("INFO", section)) == "INFO"

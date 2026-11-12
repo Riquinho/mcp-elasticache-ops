@@ -1301,3 +1301,143 @@ def test_cluster_health_timed_out_replica_is_isolated_in_partial_nodes():
     assert out["nodes_probed"] == 4
     assert not any("lags" in f for f in out["findings"])  # the healthy shard still gets its verdict
     assert any("10.0.0.3:6379 unreachable" in f for f in out["findings"])
+
+
+# ------------------------------------------------- round 08: fork, resync, client eviction, error replies
+
+
+def _health_findings(**over):
+    out = dataplane.health_summary(FakeRedis(infos=_risk_infos(**over)))
+    return out, out["findings"]
+
+
+def _has(findings, needle):
+    return any(needle in f for f in findings)
+
+
+@pytest.mark.parametrize(
+    "usec,fires,severity",
+    [
+        (1_000_000, False, None),
+        (1_000_001, True, "warning"),
+        (5_000_000, True, "warning"),
+        (5_000_001, True, "critical"),
+    ],
+)
+def test_fork_latency_thresholds(usec, fires, severity):
+    _, findings = _health_findings(persistence={"latest_fork_usec": usec})
+    assert _has(findings, "fork latency") is fires
+    if fires:
+        triage = dataplane.triage(FakeRedis(infos=_risk_infos(persistence={"latest_fork_usec": usec})), None)
+        hit = next(f for f in triage["findings"] if "fork latency" in f["message"])
+        assert hit["severity"] == severity
+
+
+def test_sync_partial_err_fires_and_zero_is_quiet():
+    _, findings = _health_findings(stats={"sync_partial_err": 2, "sync_partial_ok": 1})
+    assert _has(findings, "2 partial resync requests refused")
+    _, quiet = _health_findings(stats={"sync_partial_err": 0})
+    assert not _has(quiet, "resync")
+
+
+@pytest.mark.parametrize(
+    "full,uptime,fires",
+    [(2, 6000, False), (3, 6000, True), (3, 36000, False), (50, 100, False), (4, 7200, True)],
+)
+def test_sync_full_rate(full, uptime, fires):
+    _, findings = _health_findings(server={"uptime_in_seconds": uptime}, stats={"sync_full": full})
+    assert _has(findings, "full resyncs") is fires
+
+
+def test_evicted_clients_fires_only_above_zero():
+    _, findings = _health_findings(stats={"evicted_clients": 3})
+    assert _has(findings, "3 clients evicted")
+    _, quiet = _health_findings(stats={"evicted_clients": 0})
+    assert not _has(quiet, "clients evicted")
+
+
+@pytest.mark.parametrize(
+    "errors,commands,fires", [(50, 1000, False), (51, 1000, True), (900, 999, False), (10, 100_000, False)]
+)
+def test_error_reply_share(errors, commands, fires):
+    stats = {"total_error_replies": errors, "total_commands_processed": commands}
+    _, findings = _health_findings(stats=stats)
+    assert _has(findings, "ended in an error reply") is fires
+
+
+def test_new_fields_absent_produce_no_finding_and_raw_fields_exposed():
+    out, findings = _health_findings()
+    assert findings == ["no issues detected by basic thresholds"]
+    assert "latest_fork_usec" not in out and "sync_full" not in out
+    out, _ = _health_findings(
+        persistence={"latest_fork_usec": 10, "rdb_last_bgsave_time_sec": 2},
+        stats={"sync_full": 1, "expired_stale_perc": 0.5, "evicted_clients": 0},
+    )
+    assert out["latest_fork_usec"] == 10 and out["rdb_last_bgsave_time_sec"] == 2
+    assert out["sync_full"] == 1 and out["expired_stale_perc"] == 0.5 and out["evicted_clients"] == 0
+
+
+# ------------------------------------------------- round 08: errorstats and latencystats
+
+
+def _stats_infos(**extra):
+    infos = _risk_infos()
+    infos["commandstats"] = {
+        "cmdstat_get": {"calls": 1000, "usec": 9000, "usec_per_call": 9.0, "rejected_calls": 0, "failed_calls": 0},
+        "cmdstat_sort": {"calls": 50, "usec": 900000, "usec_per_call": 18000.0, "rejected_calls": 0, "failed_calls": 0},
+    }
+    infos.update(extra)
+    return infos
+
+
+def test_commandstats_errorstats_findings_name_the_cause():
+    infos = _stats_infos(
+        errorstats={
+            "errorstat_OOM": {"count": 4},
+            "errorstat_READONLY": {"count": 2},
+            "errorstat_NOPERM": {"count": 1},
+            "errorstat_ERR": {"count": 90},
+        }
+    )
+    out = dataplane.commandstats(FakeRedis(infos=infos), 10)
+    assert [e["error"] for e in out["errorstats"]] == ["ERR", "OOM", "READONLY", "NOPERM"]
+    text = " | ".join(out["findings"])
+    assert "4 OOM error replies" in text and "maxmemory" in text
+    assert "2 READONLY" in text and "replica" in text
+    assert "1 NOPERM" in text and "ACL" in text
+    assert "ERR error replies" not in text  # generic errors are listed, not flagged
+
+
+def test_commandstats_latency_p99_over_10ms_is_flagged_only_for_top_commands():
+    lat = {
+        "latency_percentiles_usec_get": {"p50": 5.0, "p99": 9000.0, "p99.9": 20000.0},
+        "latency_percentiles_usec_sort": {"p50": 8000.0, "p99": 12000.5, "p99.9": 30000.0},
+    }
+    out = dataplane.commandstats(FakeRedis(infos=_stats_infos(latencystats=lat)), 10)
+    assert out["latencystats"]["sort"] == {"p50_usec": 8000.0, "p99_usec": 12000.5, "p99_9_usec": 30000.0}
+    assert [f for f in out["findings"] if "p99" in f] == [
+        "sort p99 latency is 12.0 ms (above 10 ms) over 50 calls; see node_slowlog for the arguments"
+    ]
+    capped = dataplane.commandstats(FakeRedis(infos=_stats_infos(latencystats=lat)), 1)
+    assert list(capped["latencystats"]) == ["sort"] and len(capped["top_by_total_time"]) == 1
+
+
+def test_commandstats_old_engine_gets_notes_not_errors():
+    infos = _stats_infos()
+    infos["server"] = {"redis_version": "6.0.9", "uptime_in_seconds": 10}
+    out = dataplane.commandstats(FakeRedis(infos=infos), 5)
+    assert out["errorstats"] == [] and out["latencystats"] == {} and out["findings"] == []
+    assert any("INFO ERRORSTATS: not supported by redis 6.0.9" in n for n in out["notes"])
+    assert any("INFO LATENCYSTATS: not supported by redis 6.0.9" in n for n in out["notes"])
+    assert [c["command"] for c in out["top_by_total_time"]] == ["sort", "get"]
+
+
+def test_commandstats_refused_sections_on_a_modern_engine_say_unavailable():
+    out = dataplane.commandstats(FakeRedis(infos=_stats_infos()), 5)
+    assert all("unavailable" in n for n in out["notes"]) and len(out["notes"]) == 2
+
+
+def test_triage_includes_errorstats_findings():
+    infos = _stats_infos(errorstats={"errorstat_OOM": {"count": 7}})
+    out = dataplane.triage(FakeRedis(infos=infos), None)
+    assert any(f["section"] == "commandstats" and "OOM" in f["message"] for f in out["findings"])

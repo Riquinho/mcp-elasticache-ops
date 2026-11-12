@@ -65,6 +65,11 @@ SUM_STAT_METRICS = {
     "ElastiCacheProcessingUnits",
 }
 
+# Burstable (cache.t*) nodes throttle to baseline CPU when the credit balance hits zero; only these
+# node types report the credit metrics, so they are requested for them alone.
+BURSTABLE_METRICS = ["CPUCreditBalance", "CPUCreditUsage"]
+CPU_CREDIT_WARN = 20.0  # CPUCreditBalance minimum below this (credits) is a warning, 0 is critical
+
 SWAP_WARN_BYTES = 50 * 1024 * 1024
 MAXCLIENTS_DEFAULT = 65_000  # ElastiCache default maxclients
 MAX_QUERIES_PER_CALL = 500  # GetMetricData limit
@@ -107,6 +112,7 @@ TRIAGE_METRICS = [
     "CurrConnections",
 ]
 _TRIAGE_FATAL = {"ReplicationGroupNotFoundFault"}  # nothing useful to report: surface it as the tool error
+SERVERLESS_TRIAGE_FATAL = frozenset({"ServerlessCacheNotFoundFault"})
 _PENDING_ACTION_STATUSES = (
     "not-applied",
     "waiting-to-start",
@@ -410,7 +416,8 @@ class ControlPlane:
                     "id": g.get("ReplicationGroupId"),
                     "kind": "replication-group",
                     "members": members,
-                    "metrics": [m for m in RECOMMENDED_ALARMS if m != "ReplicationLag" or len(members) > 1],
+                    "metrics": [m for m in RECOMMENDED_ALARMS if m != "ReplicationLag" or len(members) > 1]
+                    + (["CPUCreditBalance"] if is_burstable(g.get("CacheNodeType")) else []),
                 }
             )
         if replication_group_id:
@@ -430,7 +437,8 @@ class ControlPlane:
                         m
                         for m in (MEMCACHED_RECOMMENDED_ALARMS if memcached else RECOMMENDED_ALARMS)
                         if m != "ReplicationLag"
-                    ],
+                    ]
+                    + (["CPUCreditBalance"] if not memcached and is_burstable(c.get("CacheNodeType")) else []),
                 }
             )
         ec = self.client("elasticache")
@@ -1251,39 +1259,134 @@ class ControlPlane:
         return out
 
     # --------------------------------------------------------------- triage
+    @staticmethod
+    def _section_runner(
+        resource: str,
+        sections: list[dict],
+        findings: list[dict],
+        fatal: frozenset[str] | set[str] = _TRIAGE_FATAL,
+    ) -> Callable[[str, Callable[[], tuple[str, list[dict]]]], None]:
+        """``section(name, fn)``: run one triage section; a failing one is recorded as ``unavailable``."""
+
+        def section(name: str, fn: Callable[[], tuple[str, list[dict]]]) -> None:
+            try:
+                summary, found = fn()
+            except (NoCredentialsError, NoRegionError):
+                raise
+            except ClientError as exc:
+                err = exc.response.get("Error", {})
+                code = err.get("Code", "ClientError")
+                if code in fatal:
+                    raise
+                detail = f"{code}: {err.get('Message', exc)}"
+            except BotoCoreError as exc:
+                detail = f"{type(exc).__name__}: {exc}"
+            else:
+                status = _worst_status(found)
+                sections.append({"section": name, "status": status, "summary": summary})
+                findings.extend({**f, "section": name, "resource": f.get("resource", resource)} for f in found)
+                return
+            sections.append({"section": name, "status": "unavailable", "summary": detail})
+            findings.append(finding("warning", f"{name} unavailable ({detail})", resource=resource, section=name))
+
+        return section
+
+    def serverless_triage(self, serverless_cache_name: str) -> dict:
+        """One-call incident summary for a serverless cache: configuration, snapshots and limit/throttle signals."""
+
+        def run() -> dict:
+            now = self._clock()
+            sections: list[dict] = []
+            findings: list[dict] = []
+            cache_box: list[dict] = []
+            section = self._section_runner(serverless_cache_name, sections, findings, SERVERLESS_TRIAGE_FATAL)
+
+            def cache_section() -> tuple[str, list[dict]]:
+                caches = self._paginate_token(
+                    "describe_serverless_caches", "ServerlessCaches", ServerlessCacheName=serverless_cache_name
+                )
+                if not caches:
+                    raise ClientError(
+                        {
+                            "Error": {
+                                "Code": "ServerlessCacheNotFoundFault",
+                                "Message": f"serverless cache {serverless_cache_name} not found",
+                            }
+                        },
+                        "DescribeServerlessCaches",
+                    )
+                cache_box.append(caches[0])
+                c = caches[0]
+                limits = c.get("CacheUsageLimits") or {}
+                text = (
+                    f"status {c.get('Status')}, engine {c.get('Engine')} {c.get('FullEngineVersion', '')}".strip()
+                    + f", data storage max {(limits.get('DataStorage') or {}).get('Maximum')}"
+                    + f", ECPU/s max {(limits.get('ECPUPerSecond') or {}).get('Maximum')}"
+                )
+                return text, _serverless_cache_findings(c)
+
+            def snapshots_section() -> tuple[str, list[dict]]:
+                snaps = self._paginate_token(
+                    "describe_serverless_cache_snapshots",
+                    "ServerlessCacheSnapshots",
+                    ServerlessCacheName=serverless_cache_name,
+                )
+                views = [_serverless_snapshot_view(x, now) for x in snaps]
+                found = _serverless_snapshot_findings(views, cache_box or None, now, 36)
+                ages = [v["age_hours"] for v in views if v["status"] == "available" and v["age_hours"] is not None]
+                text = f"newest available snapshot {min(ages):.0f}h old" if ages else "no available snapshot"
+                return text, found
+
+            def limits_section() -> tuple[str, list[dict]]:
+                period = 300
+                summary, _, found = self._collect_metrics(
+                    [serverless_cache_name],
+                    SERVERLESS_METRICS,
+                    TRIAGE_WINDOW_HOURS * 60,
+                    period,
+                    None,
+                    True,
+                    rightsizing=False,
+                )
+                metrics = summary[serverless_cache_name]
+                limits = cache_box[0].get("CacheUsageLimits") if cache_box else None
+                found += _serverless_limit_findings(serverless_cache_name, metrics, limits, period)
+                view = _limits_view(limits, metrics, period)
+                throttled = (metrics.get("ThrottledCmds") or {}).get("sum") or 0
+                parts = [f"{throttled:.0f} throttled command(s)"]
+                for key, label in (("ecpu_used_pct", "ECPU peak"), ("data_storage_used_pct", "storage peak")):
+                    if view.get(key) is not None:
+                        parts.append(f"{label} {view[key]:.0f}% of limit")
+                return f"over {TRIAGE_WINDOW_HOURS}h: " + ", ".join(parts), found
+
+            section("cache", cache_section)
+            section("snapshots", snapshots_section)
+            section("limits", limits_section)
+            ordered = _sorted_findings(findings)
+            return {
+                "serverless_cache_name": serverless_cache_name,
+                "generated_at": now.isoformat(),
+                "window_hours": TRIAGE_WINDOW_HOURS,
+                "overall": _worst_status(ordered) if ordered else "ok",
+                "sections": sections,
+                "findings": ordered[:MAX_TRIAGE_FINDINGS],
+                "findings_total": len(ordered),
+                "truncated": len(ordered) > MAX_TRIAGE_FINDINGS,
+            }
+
+        return self._guard(run)
+
     def triage(self, replication_group_id: str) -> dict:
         """One-call incident summary for a replication group: worst findings first, per-section status."""
 
         def run() -> dict:
             now = self._clock()
             members: list[str] = []
+            node_types: list[str | None] = []
             sections: list[dict] = []
             findings: list[dict] = []
 
-            def section(name: str, fn: Callable[[], tuple[str, list[dict]]]) -> None:
-                try:
-                    summary, found = fn()
-                except (NoCredentialsError, NoRegionError):
-                    raise
-                except ClientError as exc:
-                    err = exc.response.get("Error", {})
-                    code = err.get("Code", "ClientError")
-                    if code in _TRIAGE_FATAL:
-                        raise
-                    detail = f"{code}: {err.get('Message', exc)}"
-                except BotoCoreError as exc:
-                    detail = f"{type(exc).__name__}: {exc}"
-                else:
-                    status = _worst_status(found)
-                    sections.append({"section": name, "status": status, "summary": summary})
-                    findings.extend(
-                        {**f, "section": name, "resource": f.get("resource", replication_group_id)} for f in found
-                    )
-                    return
-                sections.append({"section": name, "status": "unavailable", "summary": detail})
-                findings.append(
-                    finding("warning", f"{name} unavailable ({detail})", resource=replication_group_id, section=name)
-                )
+            section = self._section_runner(replication_group_id, sections, findings)
 
             def rg_section() -> tuple[str, list[dict]]:
                 groups = self._paginate(
@@ -1293,6 +1396,7 @@ class ControlPlane:
                     raise _TriageEmpty(f"replication group {replication_group_id} not found")
                 g = groups[0]
                 members.extend(g.get("MemberClusters", []))
+                node_types.append(g.get("CacheNodeType"))
                 found = _triage_rg_findings(g)
                 summary = (
                     f"status {g.get('Status')}, multi-az {g.get('MultiAZ')}, failover {g.get('AutomaticFailover')}, "
@@ -1314,8 +1418,9 @@ class ControlPlane:
             def metrics_section() -> tuple[str, list[dict]]:
                 if not members:
                     raise _TriageEmpty("no member clusters known (replication group section failed)")
+                names = TRIAGE_METRICS + (BURSTABLE_METRICS if any(is_burstable(t) for t in node_types) else [])
                 summary, _, found = self._collect_metrics(
-                    members, TRIAGE_METRICS, TRIAGE_WINDOW_HOURS * 60, 300, None, False, rightsizing=False
+                    members, names, TRIAGE_WINDOW_HOURS * 60, 300, None, False, rightsizing=False
                 )
                 peaks = _triage_peaks(summary)
                 text = ", ".join(f"{k} {v['value']:.4g} on {v['member']}" for k, v in peaks.items())
@@ -1381,8 +1486,9 @@ class ControlPlane:
             status, summary, series = "ok", {}, {}
             if nodes:
                 try:
+                    names = OVERVIEW_METRICS + (BURSTABLE_METRICS if is_burstable(g.get("CacheNodeType")) else [])
                     summary, series, _ = self._collect_metrics(
-                        list(nodes), OVERVIEW_METRICS, int(minutes), 300, None, False, rightsizing=False
+                        list(nodes), names, int(minutes), 300, None, False, rightsizing=False
                     )
                 except ClientError as exc:
                     err = exc.response.get("Error", {})
@@ -1398,6 +1504,12 @@ class ControlPlane:
                 n["signals"] = {m: _signal(summary.get(cid, {}).get(m)) for m in OVERVIEW_METRICS}
                 n["p95"] = {m: _p95(series.get(cid, {}).get(m, {}).get("values", [])) for m in OVERVIEW_P95}
             if summary:
+                hinted = False
+                for cid in nodes:
+                    credit = _credit_findings(cid, summary.get(cid, {}))
+                    # one right-sizing hint per group is enough
+                    findings += [f for f in credit if not (f.get("category") == "right-sizing" and hinted)]
+                    hinted = hinted or bool(credit)
                 findings += _overview_outliers(topology["shards"])
                 findings += _overview_rightsizing(topology["shards"], g.get("CacheNodeType"), int(minutes))
             for shard in topology["shards"]:
@@ -1582,6 +1694,36 @@ def _overview_rightsizing(shards: list[dict], node_type: str | None, minutes: in
     return out
 
 
+def is_burstable(node_type: str | None) -> bool:
+    """True for burstable node types (``cache.t2``, ``cache.t3``, ``cache.t4g``)."""
+    return bool(node_type) and str(node_type).startswith("cache.t")
+
+
+def _credit_findings(resource: str, summary: dict[str, dict]) -> list[dict]:
+    """Low or exhausted CPU credits on a burstable node, plus a right-sizing hint."""
+    balance = summary.get("CPUCreditBalance") or {}
+    if not balance.get("points") or balance["min"] >= CPU_CREDIT_WARN:
+        return []
+    low = balance["min"]
+    exhausted = low <= 0
+    msg = (
+        "CPUCreditBalance hit 0: the node is throttled to its baseline CPU, expect sudden latency"
+        if exhausted
+        else f"CPUCreditBalance min {low:.1f} credits is below {CPU_CREDIT_WARN:.0f}: the node is close to being "
+        "throttled to its baseline CPU"
+    )
+    return [
+        finding("critical" if exhausted else "warning", msg, resource=resource),
+        finding(
+            "info",
+            "right-sizing: burstable nodes (cache.t*) suit light or spiky load only; move to a non-burstable type "
+            "(cache.m6g/m7g or cache.r6g/r7g) for steady traffic",
+            resource=resource,
+            category="right-sizing",
+        ),
+    ]
+
+
 def _validate_window(minutes: Any, period_seconds: Any) -> str | None:
     if not isinstance(minutes, int) or isinstance(minutes, bool) or not 1 <= minutes <= 20160:
         return "minutes must be an integer between 1 and 20160"
@@ -1654,6 +1796,7 @@ def _metric_findings(resource: str, summary: dict[str, dict]) -> list[dict]:
             "warning",
             f"network bandwidth allowance exceeded {bw:.0f} times (packets shaped); consider a larger node type",
         )
+    out += _credit_findings(resource, summary)
     return out
 
 

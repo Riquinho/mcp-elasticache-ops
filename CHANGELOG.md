@@ -3,6 +3,20 @@
 ## Unreleased
 
 ### Added
+- `aws_serverless_triage`: one-call incident summary for a serverless cache (configuration findings, snapshot health,
+  `ThrottledCmds`/ECPU/storage against the usage limits), sections with per-section `unavailable` on errors such as
+  `AccessDenied`, findings worst-first. Describe/GetMetricData calls only, no new IAM actions. Tool count is now 42.
+- Burstable node types: `aws_cluster_overview` and `aws_triage` request `CPUCreditBalance` / `CPUCreditUsage` only for
+  `cache.t*` groups and report low balance (< 20 credits warning, 0 critical) with a right-sizing hint towards a
+  non-burstable type; `aws_alarms` recommends a `CPUCreditBalance` alarm for them.
+- `node_health` / `node_triage` findings for fork latency (`latest_fork_usec` > 1 s warning, > 5 s critical),
+  replication resync trouble (`sync_partial_err`, `sync_full` rate), `evicted_clients` and the `total_error_replies`
+  share. `node_health` echoes `latest_fork_usec`, `rdb_last_bgsave_time_sec`, `sync_*`, `evicted_clients`,
+  `total_error_replies`, `expired_stale_perc` and `active_defrag_running` when the engine reports them; absent
+  fields (older engines) produce no finding.
+- `SafeRedis` bounds expensive reads: `SCAN COUNT` <= 1000, `MEMORY USAGE SAMPLES` 1..100 (0 walks the whole key),
+  `CLIENT LIST ID` <= 100 ids, `ACL LOG` count <= 128, and `COMMAND DOCS` needs a command name. The `scan_count`
+  tool argument is now capped at 1000 (was 5000).
 - `aws_serverless_snapshots` (`DescribeServerlessCacheSnapshots` + `DescribeServerlessCaches`): caches without an
   available snapshot in `stale_hours` (default 24), failed snapshots, a newest snapshot expiring within 24h, snapshots
   without a customer KMS key and unset per-cache retention; a failing cache listing degrades to `partial`.

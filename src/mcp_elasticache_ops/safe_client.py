@@ -178,6 +178,12 @@ def _check_config_get(patterns: tuple) -> None:
         raise ReadOnlyViolation(f"CONFIG GET {pat!r} is not in the allowed parameter list")
 
 
+# Upper bounds so no caller can issue an expensive read, whatever it passes.
+MAX_SCAN_COUNT = 1000
+MAX_MEMORY_USAGE_SAMPLES = 100
+MAX_CLIENT_LIST_IDS = 100
+MAX_ACL_LOG_COUNT = 128
+
 _CLIENT_LIST_TYPES = frozenset({"NORMAL", "MASTER", "REPLICA", "SLAVE", "PUBSUB"})
 _SCAN_OPTIONS = frozenset({"MATCH", "COUNT", "TYPE"})
 
@@ -202,8 +208,8 @@ def _check_acl_log(rest: tuple) -> None:
     # ACL LOG [count]; the only other form is ACL LOG RESET, which clears server state.
     if len(rest) > 1:
         raise ReadOnlyViolation("ACL LOG accepts at most a count")
-    if rest:
-        _int_arg(rest[0], "ACL LOG count")
+    if rest and _int_arg(rest[0], "ACL LOG count") > MAX_ACL_LOG_COUNT:
+        raise ReadOnlyViolation(f"ACL LOG count is capped at {MAX_ACL_LOG_COUNT}")
 
 
 def _check_memory_usage(rest: tuple) -> None:
@@ -212,7 +218,10 @@ def _check_memory_usage(rest: tuple) -> None:
     if len(rest) == 3:
         if _text(rest[1], "MEMORY USAGE option").upper() != "SAMPLES":
             raise ReadOnlyViolation("MEMORY USAGE only supports the SAMPLES option")
-        _int_arg(rest[2], "MEMORY USAGE SAMPLES")
+        samples = _int_arg(rest[2], "MEMORY USAGE SAMPLES")
+        # SAMPLES 0 walks every element of the key, which blocks the node on a huge key.
+        if not 1 <= samples <= MAX_MEMORY_USAGE_SAMPLES:
+            raise ReadOnlyViolation(f"MEMORY USAGE SAMPLES must be between 1 and {MAX_MEMORY_USAGE_SAMPLES}")
 
 
 def _check_scan(rest: tuple) -> None:
@@ -227,7 +236,8 @@ def _check_scan(rest: tuple) -> None:
         if name not in _SCAN_OPTIONS:
             raise ReadOnlyViolation(f"SCAN option {name!r} is not allowed")
         if name == "COUNT":
-            _int_arg(value, "SCAN COUNT")
+            if _int_arg(value, "SCAN COUNT") > MAX_SCAN_COUNT:
+                raise ReadOnlyViolation(f"SCAN COUNT is capped at {MAX_SCAN_COUNT}")
         else:  # MATCH takes a glob and TYPE a type name; both are server-side filters only
             _text(value, f"SCAN {name} value")
 
@@ -240,6 +250,8 @@ def _check_client_list(rest: tuple) -> None:
         if _text(rest[1], "CLIENT LIST TYPE").upper() not in _CLIENT_LIST_TYPES:
             raise ReadOnlyViolation("CLIENT LIST TYPE must be normal, master, replica or pubsub")
     elif option == "ID" and len(rest) >= 2:
+        if len(rest) - 1 > MAX_CLIENT_LIST_IDS:
+            raise ReadOnlyViolation(f"CLIENT LIST ID accepts at most {MAX_CLIENT_LIST_IDS} ids")
         for client_id in rest[1:]:
             _int_arg(client_id, "CLIENT LIST ID")
     else:
@@ -268,6 +280,8 @@ def check(args: tuple) -> None:
         _check_scan(rest)
     elif key == "CLIENT LIST":
         _check_client_list(rest)
+    elif key == "COMMAND DOCS" and not rest:
+        raise ReadOnlyViolation("COMMAND DOCS needs at least one command name (the full dump is large)")
     elif key.startswith("OBJECT "):
         _check_single_key(key, rest)
 

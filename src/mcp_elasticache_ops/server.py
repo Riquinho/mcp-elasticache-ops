@@ -268,8 +268,9 @@ def node_latency(ping_samples: Annotated[int, Field(ge=1, le=500)] = 20) -> dict
 
 @read_tool
 def node_commandstats(top: Annotated[int, Field(ge=1, le=500)] = 20) -> dict:
-    """Commands ranked by total CPU time (INFO commandstats), with calls, usec per
-    call, rejected and failed calls."""
+    """Commands ranked by total CPU time (INFO commandstats), with calls, usec per call, rejected and
+    failed calls, plus error prefix counts (errorstats) and p50/p99/p99.9 per command (latencystats)
+    when the engine has them; findings for OOM/READONLY/NOPERM errors and commands with p99 over 10 ms."""
     return dataplane.commandstats(redis_client(), top)
 
 
@@ -278,20 +279,16 @@ def node_keyspace_sample(
     sample_size: Annotated[int, Field(ge=1, le=100_000, description="Max keys to inspect")] = 1000,
     match: Annotated[str | None, Field(description="SCAN MATCH glob, e.g. 'session:*'")] = None,
     top: Annotated[int, Field(ge=1, le=500)] = 20,
-    scan_count: Annotated[int, Field(ge=10, le=5000, description="SCAN COUNT hint")] = 250,
+    scan_count: Annotated[int, Field(ge=10, le=1000, description="SCAN COUNT hint")] = 250,
     pause_ms: Annotated[int, Field(ge=0, le=1000, description="Sleep between SCAN batches")] = 0,
     max_seconds: Annotated[
         float, Field(gt=0, le=60, description="Wall-clock budget; returns partial=true when exceeded")
     ] = 10.0,
     top_prefixes: Annotated[int, Field(ge=1, le=50, description="Key prefixes to report")] = 10,
 ) -> dict:
-    """Big keys (bytes and element count), hot keys (LFU policies) or coldest keys,
-    type distribution and TTL coverage from a bounded SCAN. Metadata only; values
-    are never read. Stops at max_seconds and reports partial=true. On cluster-mode-enabled
-    groups this samples the connected node's slots only: use node_cluster_keyspace_sample for every shard.
-    `prefixes` groups the sampled keys by normalised prefix (user:123:cart -> user:*:cart) with key count,
-    estimated bytes scaled to dbsize, % of keys without TTL and types; findings call out large no-TTL prefixes
-    when the policy is noeviction or memory is near maxmemory."""
+    """Big keys, hot keys (LFU) or coldest keys, type mix, TTL coverage and per-prefix bytes from a bounded
+    SCAN. Metadata only; values never read. Partial=true at max_seconds. Cluster mode: connected node's
+    slots only, use node_cluster_keyspace_sample for all shards. Flags large no-TTL prefixes under pressure."""
     return dataplane.keyspace_sample(
         redis_client(), sample_size, match, top, scan_count, pause_ms, max_seconds, top_prefixes=top_prefixes
     )
@@ -345,7 +342,7 @@ def node_cluster_keyspace_sample(
     ] = 1000,
     match: Annotated[str | None, Field(description="SCAN MATCH glob, e.g. 'session:*'")] = None,
     top: Annotated[int, Field(ge=1, le=500)] = 20,
-    scan_count: Annotated[int, Field(ge=10, le=5000, description="SCAN COUNT hint")] = 250,
+    scan_count: Annotated[int, Field(ge=10, le=1000, description="SCAN COUNT hint")] = 250,
     pause_ms: Annotated[int, Field(ge=0, le=1000, description="Sleep between SCAN batches")] = 0,
     max_seconds: Annotated[
         float, Field(gt=0, le=60, description="Total wall-clock budget, split across primaries")
@@ -600,6 +597,16 @@ def aws_triage(replication_group_id: Annotated[str, Field(description="Replicati
 
 
 @read_tool
+def aws_serverless_triage(
+    serverless_cache_name: Annotated[str, Field(description="ServerlessCacheName to triage")],
+) -> dict:
+    """One-call incident summary for a serverless cache: status and usage limits, snapshot health, and
+    6h ThrottledCmds/ECPU/storage against the limits. Findings are worst-first (max 30); a section that
+    fails (for example AccessDenied) is reported as unavailable instead of failing the call."""
+    return control_plane().serverless_triage(serverless_cache_name)
+
+
+@read_tool
 def aws_alarms(
     replication_group_id: Annotated[
         str | None,
@@ -618,11 +625,9 @@ def aws_cluster_overview(
     replication_group_id: Annotated[str, Field(description="ReplicationGroupId to summarise")],
     minutes: Annotated[int, Field(ge=5, le=20160, description="CloudWatch window (multiple of 5 min is fine)")] = 360,
 ) -> dict:
-    """One findings-first call per replication group: shards, replicas per shard, AZ spread, failover and
-    engine version joined with per-node CloudWatch signals (CPU, memory, replication lag, evictions,
-    connections). Flags nodes above 1.5x their peers' median, reader endpoint gaps and right-sizing
-    hints (memory p95 < 30% and CPU p95 < 20%; data tiering for r6gd). Worst-first, bounded; if
-    GetMetricData is denied the topology is still returned with status partial."""
+    """One findings-first call per replication group: shards, replicas, AZ spread, failover and engine
+    version joined with per-node CloudWatch signals. Flags nodes above 1.5x peer median, reader endpoint
+    gaps and right-sizing hints. Worst-first, bounded; status partial if GetMetricData is denied."""
     return control_plane().cluster_overview(replication_group_id, minutes)
 
 
