@@ -3,6 +3,13 @@
 ## Unreleased
 
 ### Added
+- Round 13: `node_connectivity` (staged DNS, TCP, TLS with plaintext fallback probe, PING, AUTH; stops at the first
+  failure, findings first, secrets never echoed); `aws_security_audit` (fleet hardening roll-up with region fan-out:
+  severity counts, findings grouped by category, capped pass/fail matrix; AccessDenied degrades to `partial`);
+  `aws_cost_overview` adds an info-level Valkey savings hint (assumed list-price discount, version >= 5.0.6, never
+  memcached or Valkey, no new IAM); stdio smoke test over the real transport; `py.typed`, classifiers and a wheel and
+  sdist content check (no `.env*`, `.coverage`, `.lotes`, `*.pem`, `*.key`) in CI and `scripts/release-check.sh`.
+  Tool count is now 49.
 - Round 12: every control-plane pagination loop stops at 50 pages or on a repeated token and reports `partial` with a
   note; `memcached_discovery` (`config get cluster` joins the memcached allowlist); `aws_cost_overview`; Valkey quirks
   in data-plane findings and EOL findings only for engine redis; botocore connection errors in every `aws_*` tool

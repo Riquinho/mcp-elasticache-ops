@@ -319,3 +319,241 @@ def test_elasticache_regions_parsing(monkeypatch):
             aws_regions(bad)
     monkeypatch.setenv("ELASTICACHE_REGIONS", "us-east-1,us-west-2")
     assert ControlPlaneConfig.from_env().regions == ("us-east-1", "us-west-2")
+
+
+# ------------------------------------------------------------------ node_connectivity (staged diagnosis)
+
+import socket  # noqa: E402
+import ssl  # noqa: E402
+
+import redis  # noqa: E402
+
+from mcp_elasticache_ops import connection  # noqa: E402
+
+SECRET = "s3cr3t-pa55word"
+PRIMARY = "my-rg.abc123.ng.0001.use1.cache.amazonaws.com"
+
+
+class _FakeSock:
+    def __init__(self, reply: bytes = b"") -> None:
+        self.reply = reply
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def close(self):
+        pass
+
+    def settimeout(self, t):
+        pass
+
+    def sendall(self, data):
+        pass
+
+    def recv(self, n):
+        return self.reply
+
+
+class _FakeCtx:
+    def __init__(self, fail: Exception | None) -> None:
+        self.fail = fail
+
+    def wrap_socket(self, sock, server_hostname=None):
+        if self.fail:
+            raise self.fail
+        return _FakeTls()
+
+
+class _FakeTls(_FakeSock):
+    def version(self):
+        return "TLSv1.3"
+
+
+class _Ping:
+    def __init__(self, exc: Exception | None) -> None:
+        self.exc = exc
+
+    def ping(self):
+        if self.exc:
+            raise self.exc
+        return True
+
+
+def _net(
+    monkeypatch,
+    *,
+    ips=("10.0.1.5",),
+    dns_error=None,
+    tcp_error=None,
+    tls_error=None,
+    plaintext_reply=b"+PONG\r\n",
+    anon=None,
+    authed=None,
+):
+    """Patch DNS, TCP, TLS and the redis client. ``tls_error=None`` means the TLS handshake succeeds."""
+
+    def getaddrinfo(host, port, **kw):
+        if dns_error:
+            raise dns_error
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port)) for ip in ips]
+
+    def create_connection(addr, timeout=None):
+        if tcp_error:
+            raise tcp_error
+        return _FakeSock(plaintext_reply)
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(socket, "create_connection", create_connection)
+    monkeypatch.setattr(connection, "_tls_context", lambda cfg, verify: _FakeCtx(tls_error))
+
+    def fake_build(cfg, host=None, port=None):
+        return _Ping(authed if cfg.password or cfg.username else anon)
+
+    monkeypatch.setattr(connection, "build_client", fake_build)
+
+
+def _cfg(**kw) -> DataPlaneConfig:
+    return DataPlaneConfig(host=PRIMARY, **kw)
+
+
+PLAIN = ssl.SSLError("not tls")  # handshake attempt against a plaintext server
+
+
+def test_connectivity_dns_failure(monkeypatch):
+    _net(monkeypatch, dns_error=socket.gaierror(-2, "Name or service not known"))
+    out = connection.diagnose_connectivity(_cfg(password=SECRET))
+    assert out["ok"] is False and out["failed_stage"] == "dns"
+    assert [s["stage"] for s in out["stages"]] == ["dns"]
+    assert "VPC" in out["findings"][0] and list(out)[0] == "findings"
+    assert out["endpoint"]["kind"] == "primary"
+
+
+def test_connectivity_tcp_refused_and_timeout(monkeypatch):
+    _net(monkeypatch, tcp_error=ConnectionRefusedError("refused"))
+    out = connection.diagnose_connectivity(_cfg())
+    assert out["failed_stage"] == "tcp" and [s["stage"] for s in out["stages"]] == ["dns", "tcp"]
+    assert "security group" in out["findings"][0]
+    assert out["stages"][0]["private"] is True and out["stages"][0]["addresses"] == ["10.0.1.5"]
+    _net(monkeypatch, tcp_error=TimeoutError("timed out"), ips=("54.1.2.3",))
+    out = connection.diagnose_connectivity(_cfg())
+    assert out["failed_stage"] == "tcp" and out["stages"][0]["private"] is False
+    assert any("public address" in f for f in out["findings"])
+
+
+def test_connectivity_tls_vs_plaintext_mismatch(monkeypatch):
+    _net(monkeypatch, tls_error=ssl.SSLError("WRONG_VERSION_NUMBER"), plaintext_reply=b"+PONG\r\n")
+    out = connection.diagnose_connectivity(_cfg(tls=True))
+    assert out["failed_stage"] == "tls"
+    assert out["stages"][-1]["plaintext_answers"] is True
+    assert "ELASTICACHE_TLS=false" in out["findings"][0]
+    # handshake fails and plaintext does not answer either: certificate/CA problem, not a mismatch
+    _net(monkeypatch, tls_error=ssl.SSLError("CERTIFICATE_VERIFY_FAILED"), plaintext_reply=b"")
+    out = connection.diagnose_connectivity(_cfg(tls=True))
+    assert out["stages"][-1]["plaintext_answers"] is False and "TLS_CA_FILE" in out["findings"][0]
+
+
+def test_connectivity_tls_required_but_disabled(monkeypatch):
+    _net(monkeypatch, tls_error=None)
+    out = connection.diagnose_connectivity(_cfg(tls=False))
+    assert out["failed_stage"] == "tls" and "ELASTICACHE_TLS=true" in out["findings"][0]
+
+
+def test_connectivity_auth_failure_never_echoes_secret(monkeypatch):
+    _net(
+        monkeypatch,
+        tls_error=PLAIN,
+        anon=redis.exceptions.AuthenticationError("Authentication required."),
+        authed=redis.exceptions.AuthenticationError(f"WRONGPASS invalid {SECRET}"),
+    )
+    out = connection.diagnose_connectivity(_cfg(tls=False, username="app", password=SECRET))
+    assert out["failed_stage"] == "auth"
+    assert [s["stage"] for s in out["stages"]] == ["dns", "tcp", "tls", "ping", "auth"]
+    assert out["stages"][3]["verdict"] == "ok" and "credentials" in out["findings"][0]
+    assert SECRET not in repr(out)
+
+
+def test_connectivity_noperm(monkeypatch):
+    _net(
+        monkeypatch,
+        tls_error=PLAIN,
+        anon=redis.exceptions.AuthenticationError("Authentication required."),
+        authed=redis.exceptions.NoPermissionError("NOPERM user has no permissions to run 'ping'"),
+    )
+    out = connection.diagnose_connectivity(_cfg(username="app", password=SECRET))
+    assert out["failed_stage"] == "auth" and "NOPERM" in out["stages"][-1]["detail"]
+    assert "not allowed" in out["findings"][0]
+
+
+def test_connectivity_ping_failure_and_endpoint_hint(monkeypatch):
+    _net(monkeypatch, tls_error=PLAIN, anon=redis.exceptions.TimeoutError("timed out"))
+    out = connection.diagnose_connectivity(DataPlaneConfig(host="c.abc.serverless.use1.cache.amazonaws.com"))
+    assert out["failed_stage"] == "ping" and out["endpoint"]["kind"] == "serverless"
+    assert any("Endpoint type" in f for f in out["findings"])
+
+
+def test_connectivity_success_and_open_server(monkeypatch):
+    _net(monkeypatch, tls_error=PLAIN, anon=redis.exceptions.AuthenticationError("NOAUTH"))
+    out = connection.diagnose_connectivity(_cfg(password=SECRET))
+    assert out["ok"] is True and out["failed_stage"] is None
+    assert [s["verdict"] for s in out["stages"]] == ["ok"] * 5
+    assert SECRET not in repr(out)
+    _net(monkeypatch, tls_error=PLAIN)
+    out = connection.diagnose_connectivity(_cfg(password=SECRET))
+    assert out["ok"] is True and any("no AUTH configured" in f for f in out["findings"])
+    out = connection.diagnose_connectivity(_cfg())
+    assert out["stages"][-1]["detail"] == "no authentication required"
+
+
+def test_connectivity_tls_success(monkeypatch):
+    _net(monkeypatch, tls_error=None, anon=None)
+    out = connection.diagnose_connectivity(_cfg(tls=True))
+    assert out["ok"] is True and out["stages"][2]["detail"] == "handshake ok (TLSv1.3)"
+
+
+def test_connectivity_ping_response_error(monkeypatch):
+    _net(monkeypatch, tls_error=PLAIN, anon=redis.exceptions.ResponseError("LOADING busy"))
+    assert connection.diagnose_connectivity(_cfg())["failed_stage"] == "ping"
+    _net(monkeypatch, tls_error=PLAIN, anon=redis.exceptions.ResponseError("NOPERM x"))
+    assert connection.diagnose_connectivity(_cfg(password=SECRET))["ok"] is True
+    _net(monkeypatch, tls_error=PLAIN, authed=redis.exceptions.ConnectionError("reset"), anon=None)
+    assert connection.diagnose_connectivity(_cfg(password=SECRET))["failed_stage"] == "auth"
+
+
+@pytest.mark.parametrize(
+    ("host", "kind"),
+    [
+        ("c.abc.serverless.use1.cache.amazonaws.com", "serverless"),
+        ("c.abc.clustercfg.use1.cache.amazonaws.com", "configuration"),
+        ("rg-0001-001.abc.0001.use1.cache.amazonaws.com", "node"),
+        ("rg-ro.abc.ng.0001.use1.cache.amazonaws.com", "reader"),
+        (PRIMARY, "primary"),
+        ("localhost", "unknown"),
+    ],
+)
+def test_endpoint_kind(host, kind):
+    assert connection.endpoint_kind(host) == kind
+
+
+def test_tls_context_and_scrub():
+    cfg = DataPlaneConfig(tls=True, tls_check_hostname=False)
+    assert connection._tls_context(cfg, verify=True).check_hostname is False
+    assert connection._tls_context(cfg, verify=False).verify_mode == ssl.CERT_NONE
+    assert connection._tls_context(DataPlaneConfig(tls_verify=False), verify=True).verify_mode == ssl.CERT_NONE
+    assert connection._scrub("a pw b", DataPlaneConfig(password="pw")) == "a *** b"
+    assert connection._is_private("not-an-ip") is False
+
+
+def test_plaintext_probe(monkeypatch):
+    monkeypatch.setattr(socket, "create_connection", lambda *a, **k: _FakeSock(b"-NOAUTH x\r\n"))
+    assert connection._plaintext_answers("h", 1, 1) is True
+    monkeypatch.setattr(socket, "create_connection", lambda *a, **k: _FakeSock(b"\x15\x03"))
+    assert connection._plaintext_answers("h", 1, 1) is False
+
+    def boom(*a, **k):
+        raise OSError("x")
+
+    monkeypatch.setattr(socket, "create_connection", boom)
+    assert connection._plaintext_answers("h", 1, 1) is False

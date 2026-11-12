@@ -117,6 +117,12 @@ MAX_PAGES = 50  # pages followed per list call; a stuck or endless token stops h
 COST_WINDOW_DAYS = 14
 COST_METRICS = ["DatabaseMemoryUsagePercentage", "EngineCPUUtilization", "GetTypeCmds"]
 COST_SERVERLESS_METRICS = ["ElastiCacheProcessingUnits", "BytesUsedForCache"]
+# Valkey savings hint: list-price discount versus the Redis OSS engine, as published by AWS. An estimate for
+# prioritising, not a quote; actual savings depend on region, node type and reservations.
+VALKEY_SAVINGS_NODE_PERCENT = 20
+VALKEY_SAVINGS_SERVERLESS_PERCENT = 33
+VALKEY_MIN_REDIS_VERSION = (5, 0, 6)  # in-place Redis OSS -> Valkey upgrade needs at least this version
+MAX_VALKEY_CANDIDATES = 5  # top candidates (by node count) listed in the valkey summary finding
 MAX_COST_GROUPS = 20  # GetMetricData calls per region in aws_cost_overview (one per group)
 MIN_COST_POINTS = 24  # hourly points needed before a 14-day peak means anything
 OVERSIZED_MEMORY_PEAK = 30.0  # peak DatabaseMemoryUsagePercentage under this: the node type is oversized
@@ -148,6 +154,8 @@ MAX_OVERVIEW_FINDINGS = 30
 FLEET_DEADLINE_SECONDS = 60.0  # shared budget for a multi-region fleet call; later regions/groups are skipped
 MAX_FLEET_FINDINGS = 60
 MAX_FLEET_GROUPS_PER_REGION = 20
+MAX_AUDIT_MATRIX_ROWS = 25  # rows of the aws_security_audit pass/fail matrix
+MAX_AUDIT_FINDINGS = 100
 _monotonic = time.monotonic  # patched by tests; never patch the time module itself
 MAX_OVERVIEW_SHARDS = 50
 OUTLIER_RATIO = 1.5
@@ -709,6 +717,119 @@ class ControlPlane:
 
         return self._guard(run)
 
+    # ------------------------------------------------------------ security audit
+    def security_audit_fan_out(self, region: str | None = None, top: int = MAX_AUDIT_MATRIX_ROWS) -> dict:
+        """``security_audit`` over every region in ELASTICACHE_REGIONS (or just ``region``).
+
+        Findings carry their ``region``; a region that fails lands in ``region_errors`` and never hides the others."""
+        targets = self._target_regions(region)
+        if len(targets) == 1:
+            return self.in_region(targets[0]).security_audit(top)
+        deadline = _monotonic() + FLEET_DEADLINE_SECONDS
+        findings: list[dict] = []
+        rows: list[dict] = []
+        notes: list[str] = []
+        failures: dict[str, dict] = {}
+        partial = False
+        for target in targets:
+            if _monotonic() >= deadline:
+                failures[str(target)] = _fleet_deadline_error()
+                continue
+            raw = self.in_region(target)._security_audit_raw()
+            if _fleet_failed(raw):
+                failures[str(target)] = raw
+                continue
+            partial = partial or bool(raw.get("partial"))
+            findings += [{**f, "region": target} for f in raw["findings"]]
+            rows += [{**r, "region": target} for r in raw["rows"]]
+            notes += [f"{target}: {n}" for n in raw.get("notes", [])]
+        out = _audit_report(findings, rows, notes, top, partial)
+        out["regions"] = [str(t) for t in targets]
+        if failures:
+            out["region_errors"] = failures
+        return out
+
+    def security_audit(self, top: int = MAX_AUDIT_MATRIX_ROWS) -> dict:
+        """Fleet-wide hardening roll-up from the Describe data other tools already read; no extra IAM actions."""
+        raw = self._security_audit_raw()
+        if _fleet_failed(raw):
+            return raw
+        return _audit_report(raw["findings"], raw["rows"], raw.get("notes", []), top, bool(raw.get("partial")))
+
+    def _security_audit_raw(self) -> dict:
+        def run() -> dict:
+            notes: list[str] = []
+            errors: list[dict] = []
+
+            def fetch(label: str, call: Callable[[], list[dict]]) -> list[dict] | None:
+                try:
+                    return call()
+                except ClientError as exc:
+                    err = exc.response.get("Error", {})
+                    errors.append(_error_result(err.get("Code", "ClientError"), err.get("Message", str(exc))))
+                    notes.append(f"{label} not audited: {err.get('Code', 'ClientError')}")
+                    return None
+
+            groups = fetch(
+                "replication groups", lambda: self._paginate("describe_replication_groups", "ReplicationGroups")
+            )
+            clusters = fetch("cache clusters", lambda: self._paginate("describe_cache_clusters", "CacheClusters"))
+            serverless = fetch(
+                "serverless caches", lambda: self._paginate_token("describe_serverless_caches", "ServerlessCaches")
+            )
+            users = fetch("users", lambda: self._paginate("describe_users", "Users"))
+            user_groups = fetch("user groups", lambda: self._paginate("describe_user_groups", "UserGroups"))
+            if len(errors) == 5:
+                return errors[0]
+            engines = {str(c.get("Engine", "")).lower() for c in clusters or []} | {
+                str(g.get("Engine", "")).lower() for g in groups or []
+            }
+            ctx = self._engine_context(engines, False) if engines - {""} else {"now": self._clock()}
+            versions = self._member_engine_versions(clusters or [])
+            if users is not None and user_groups is None:
+                notes.append("default-user attachment not checked: DescribeUserGroups failed")
+            entries: list[tuple[str, str, list[dict]]] = []  # (kind, resource id, raw findings)
+            for g in groups or []:
+                gid = str(g.get("ReplicationGroupId"))
+                found = _rg_findings(g, versions.get(gid), ctx)
+                found += _kms_findings(g)
+                entries.append(("replication_group", gid, found))
+            for c in clusters or []:
+                if c.get("ReplicationGroupId"):  # members are covered by their replication group
+                    continue
+                cid = str(c.get("CacheClusterId"))
+                engine = str(c.get("Engine") or "").lower()
+                found = _cluster_findings(c, ctx) + _kms_findings(c)
+                if engine == "memcached":
+                    found.append(
+                        finding(
+                            "warning",
+                            "memcached has no authentication or ACLs: anything that reaches the port can read and "
+                            "write; only the security group protects it",
+                        )
+                    )
+                entries.append(("memcached_cluster" if engine == "memcached" else "cache_cluster", cid, found))
+            for s in serverless or []:
+                entries.append(("serverless_cache", str(s.get("ServerlessCacheName")), _serverless_cache_findings(s)))
+            if users is not None:
+                for u in users:
+                    entries.append(("user", str(u.get("UserId")), []))
+                for f in _acl_user_findings(users, user_groups or []):
+                    _audit_attach(entries, "user", f)
+            if user_groups is not None:
+                for ug in user_groups:
+                    entries.append(("user_group", str(ug.get("UserGroupId")), []))
+                for f in _acl_group_findings(user_groups, users):
+                    _audit_attach(entries, "user_group", f)
+            findings, rows = _audit_classify(entries)
+            out: dict[str, Any] = {"findings": findings, "rows": rows}
+            if notes:
+                out["partial"] = True
+                out["notes"] = notes
+            return out
+
+        return self._guard(run)
+
     # ------------------------------------------------------------ cost overview
     def cost_overview_fan_out(self, region: str | None = None) -> dict:
         """``cost_overview`` over every region in ELASTICACHE_REGIONS (or just ``region``), one shared deadline."""
@@ -771,7 +892,8 @@ class ControlPlane:
                 if got is None:
                     notes.append(f"{label} not checked: the Describe call failed")
             held = _reserved_nodes_held(reserved or [])
-            versions = self._member_engine_versions()
+            clusters = self._member_clusters()
+            versions = self._member_engine_versions(clusters)
             rows: list[dict] = []
             findings: list[dict] = []
             for i, g in enumerate(groups):
@@ -805,6 +927,7 @@ class ControlPlane:
                 findings += found
             snap_row, snap_found = _cost_manual_snapshots(snaps or [], now)
             findings += snap_found
+            findings += _valkey_savings_findings(groups, clusters, caches or [], versions)
             ordered = _sorted_findings(findings)
             out: dict[str, Any] = {
                 "window_days": COST_WINDOW_DAYS,
@@ -2463,6 +2586,55 @@ def _cost_group(
     return row, out
 
 
+def _valkey_savings_findings(
+    groups: list[dict], clusters: list[dict], caches: list[dict], versions: dict[str, tuple[str, str]]
+) -> list[dict]:
+    """One info finding: redis-engine resources that could move to Valkey for a list-price discount.
+
+    Only the redis engine qualifies (never memcached or valkey) and only when the version is known and at least
+    VALKEY_MIN_REDIS_VERSION; unknown versions are skipped rather than guessed. Uses data already fetched."""
+    candidates: list[tuple[str, str, int, int]] = []  # (id, kind, nodes, percent)
+    for g in groups:
+        gid = str(g.get("ReplicationGroupId"))
+        engine, version = versions.get(gid, (str(g.get("Engine") or ""), ""))
+        if engine.lower() == "redis" and version and _version_tuple(version) >= VALKEY_MIN_REDIS_VERSION:
+            candidates.append((gid, "replication group", len(g.get("MemberClusters", [])), VALKEY_SAVINGS_NODE_PERCENT))
+    for c in clusters:
+        version = str(c.get("EngineVersion") or "")
+        if (
+            not c.get("ReplicationGroupId")
+            and str(c.get("Engine") or "").lower() == "redis"
+            and version
+            and _version_tuple(version) >= VALKEY_MIN_REDIS_VERSION
+        ):
+            candidates.append((str(c.get("CacheClusterId")), "cache cluster", 1, VALKEY_SAVINGS_NODE_PERCENT))
+    for sc in caches:
+        major = str(sc.get("MajorEngineVersion") or "")
+        if str(sc.get("Engine") or "").lower() == "redis" and (not major or _version_tuple(major) >= (5,)):
+            candidates.append(
+                (str(sc.get("ServerlessCacheName")), "serverless cache", 0, VALKEY_SAVINGS_SERVERLESS_PERCENT)
+            )
+    if not candidates:
+        return []
+    top = sorted(candidates, key=lambda c: (-c[2], c[0]))[:MAX_VALKEY_CANDIDATES]
+    return [
+        finding(
+            "info",
+            f"{len(candidates)} Redis OSS resource(s) could move to Valkey, which AWS prices lower at list price: about "
+            f"{VALKEY_SAVINGS_NODE_PERCENT}% for node-based and {VALKEY_SAVINGS_SERVERLESS_PERCENT}% for serverless. "
+            "Assumption: published list-price discount, not a quote; check your region and reservations",
+            category="cost",
+            hint="valkey-savings",
+            candidates_total=len(candidates),
+            assumed_savings_percent={
+                "node_based": VALKEY_SAVINGS_NODE_PERCENT,
+                "serverless": VALKEY_SAVINGS_SERVERLESS_PERCENT,
+            },
+            top_candidates=[{"id": i, "kind": k, "nodes": n, "assumed_savings_percent": pc} for i, k, n, pc in top],
+        )
+    ]
+
+
 def _cost_serverless(c: dict, summary: dict[str, dict]) -> tuple[dict, list[dict]]:
     name = str(c.get("ServerlessCacheName"))
     limits = c.get("CacheUsageLimits") or {}
@@ -3822,3 +3994,129 @@ def _jsonable(v: Any) -> Any:
     if isinstance(v, list):
         return [_jsonable(x) for x in v]
     return v
+
+
+# ------------------------------------------------------------------ security audit helpers
+
+AUDIT_CATEGORIES = (
+    "encryption in transit",
+    "encryption at rest and KMS",
+    "authentication",
+    "ACL",
+    "snapshots",
+    "patching",
+)
+# First matching pattern wins; findings that match none are not security findings and stay out of the audit.
+_AUDIT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (AUDIT_CATEGORIES[0], re.compile(r"encryption in transit|transit encryption", re.I)),
+    (AUDIT_CATEGORIES[1], re.compile(r"encryption at rest|KMS", re.I)),
+    (
+        AUDIT_CATEGORIES[2],
+        re.compile(r"no authentication|AUTH token|no user group attached|default user is active", re.I),
+    ),
+    (AUDIT_CATEGORIES[3], re.compile(r"user group|dangerous commands", re.I)),
+    (AUDIT_CATEGORIES[4], re.compile(r"snapshot", re.I)),
+    (
+        AUDIT_CATEGORIES[5],
+        re.compile(r"auto minor version|\(< 7\.0\)|end-of-life|retired|behind the newest", re.I),
+    ),
+)
+# Categories that do not apply to a resource kind (shown as n/a in the matrix).
+_AUDIT_NOT_APPLICABLE: dict[str, frozenset[str]] = {
+    "memcached_cluster": frozenset({AUDIT_CATEGORIES[1], AUDIT_CATEGORIES[3], AUDIT_CATEGORIES[4]}),
+    "user": frozenset(AUDIT_CATEGORIES) - {AUDIT_CATEGORIES[2], AUDIT_CATEGORIES[3]},
+    "user_group": frozenset(AUDIT_CATEGORIES) - {AUDIT_CATEGORIES[3]},
+    "serverless_cache": frozenset({AUDIT_CATEGORIES[0], AUDIT_CATEGORIES[1], AUDIT_CATEGORIES[5]}),
+}
+
+
+def _kms_findings(obj: dict) -> list[dict]:
+    if obj.get("AtRestEncryptionEnabled") is True and not obj.get("KmsKeyId"):
+        return [
+            finding(
+                "info",
+                "encryption at rest uses the AWS-owned key; no customer-managed KMS key (KmsKeyId) means no key "
+                "policy, rotation control or CloudTrail on key use",
+            )
+        ]
+    return []
+
+
+def _audit_attach(entries: list[tuple[str, str, list[dict]]], kind: str, f: dict) -> None:
+    for k, resource, found in entries:
+        if k == kind and resource == str(f.get("resource")):
+            found.append(f)
+            return
+
+
+def _audit_category(message: str) -> str | None:
+    return next((cat for cat, pattern in _AUDIT_PATTERNS if pattern.search(message)), None)
+
+
+def _audit_classify(entries: list[tuple[str, str, list[dict]]]) -> tuple[list[dict], list[dict]]:
+    """Tag findings with category/kind/resource and build one pass/fail row per resource."""
+    findings: list[dict] = []
+    rows: list[dict] = []
+    for kind, resource, found in entries:
+        checks = {
+            cat: "n/a" if cat in _AUDIT_NOT_APPLICABLE.get(kind, frozenset()) else "pass" for cat in AUDIT_CATEGORIES
+        }
+        worst = "ok"
+        for f in found:
+            category = _audit_category(f["message"])
+            if category is None:
+                continue
+            tagged = {**f, "category": category, "kind": kind, "resource": resource}
+            findings.append(tagged)
+            if _SEVERITY_ORDER.get(f["severity"], 9) < _SEVERITY_ORDER.get(worst, 9):
+                worst = f["severity"]
+            if f["severity"] == "info":
+                checks[category] = "note" if checks[category] == "pass" else checks[category]
+            else:
+                checks[category] = "fail"
+        rows.append(
+            {
+                "resource": resource,
+                "kind": kind,
+                "worst": worst,
+                "failed": sum(1 for v in checks.values() if v == "fail"),
+                "checks": checks,
+            }
+        )
+    return findings, rows
+
+
+def _audit_report(findings: list[dict], rows: list[dict], notes: list[str], top: int, partial: bool) -> dict:
+    """Findings first: severity counts, findings grouped by category (then worst first), capped pass/fail matrix."""
+    category_order = {cat: i for i, cat in enumerate(AUDIT_CATEGORIES)}
+    ordered = sorted(
+        findings,
+        key=lambda f: (category_order[f["category"]], _SEVERITY_ORDER.get(f["severity"], 9), str(f.get("resource"))),
+    )
+    by_severity: dict[str, int] = {}
+    for f in findings:
+        by_severity[f["severity"]] = by_severity.get(f["severity"], 0) + 1
+    by_severity = dict(sorted(by_severity.items(), key=lambda kv: _SEVERITY_ORDER.get(kv[0], 9)))
+    by_category = {cat: n for cat in AUDIT_CATEGORIES if (n := sum(1 for f in findings if f["category"] == cat))}
+    ranked = sorted(
+        rows, key=lambda r: (_SEVERITY_ORDER.get(r["worst"], 9), -r["failed"], r["kind"], str(r["resource"]))
+    )
+    failing = sum(1 for r in rows if r["failed"])
+    out: dict[str, Any] = {
+        "summary": {
+            "severity_counts": by_severity,
+            "category_counts": by_category,
+            "resources_audited": len(rows),
+            "resources_failing": failing,
+        },
+        "findings": ordered[:MAX_AUDIT_FINDINGS],
+        "findings_total": len(ordered),
+        "truncated": len(ordered) > MAX_AUDIT_FINDINGS,
+        "matrix": ranked[:top],
+        "matrix_total": len(ranked),
+        "matrix_truncated": len(ranked) > top,
+    }
+    if partial or notes:
+        out["partial"] = True
+        out["notes"] = notes
+    return out

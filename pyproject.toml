@@ -4,6 +4,16 @@ version = "0.1.0"
 description = "Read-only MCP server for Amazon ElastiCache (Redis OSS, Valkey, Memcached) operations and monitoring"
 readme = "README.md"
 license = "MIT"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Typing :: Typed",
+]
 keywords = ["mcp", "elasticache", "redis", "valkey", "memcached", "sre", "dbre"]
 authors = [
     { name = "João Rito", email = "16895040+ritojoao@users.noreply.github.com" }

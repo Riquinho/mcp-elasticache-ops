@@ -1964,3 +1964,91 @@ def test_iam_policy_lists_list_tags_for_resource():
     block = re.search(r"```json\n(\{\s*\"Version\".*?\})\n```", readme, flags=re.S)
     actions = [a for st in json.loads(block.group(1))["Statement"] for a in st["Action"]]
     assert "elasticache:ListTagsForResource" in actions
+
+
+# ------------------------------------------------------------------ aws_security_audit
+
+
+def _audit_plane(responses=None):
+    from .fakes import AwsAudit
+
+    fake = AwsAudit(responses)
+    return fake, ControlPlane(ControlPlaneConfig(region=REGION), session_factory=fake, clock=lambda: NOW)
+
+
+_WEAK_RG = {
+    "ReplicationGroupId": "weak-rg",
+    "Status": "available",
+    "Engine": "redis",
+    "TransitEncryptionEnabled": False,
+    "AtRestEncryptionEnabled": False,
+    "AuthTokenEnabled": False,
+    "UserGroupIds": ["default-only"],
+    "SnapshotRetentionLimit": 0,
+    "NodeGroups": [],
+    "MemberClusters": [],
+}
+
+
+def _fleet(**extra):
+    base = {
+        "DescribeReplicationGroups": {"ReplicationGroups": [_WEAK_RG]},
+        "DescribeUsers": {"Users": [{"UserId": "default", "UserName": "default", "Status": "active"}]},
+        "DescribeUserGroups": {
+            "UserGroups": [{"UserGroupId": "default-only", "UserIds": ["default"], "ReplicationGroups": ["weak-rg"]}]
+        },
+    }
+    base.update(extra)
+    return base
+
+
+def test_security_audit_categories_order_and_read_only():
+    fake, plane = _audit_plane(_fleet())
+    out = plane.security_audit()
+    cats = [f["category"] for f in out["findings"]]
+    from mcp_elasticache_ops.controlplane import AUDIT_CATEGORIES
+
+    assert cats == sorted(cats, key=AUDIT_CATEGORIES.index)
+    assert {"encryption in transit", "encryption at rest and KMS"} <= set(cats)
+    transit = [f for f in out["findings"] if f["category"] == "encryption in transit"]
+    assert transit[0]["resource"] == "weak-rg" and transit[0]["kind"] == "replication_group"
+    # memcached cluster from the default fixture has no auth
+    assert any(f["resource"] == "audit-mc" and f["category"] == "authentication" for f in out["findings"])
+    # default-user-only group is reported against the ACL/authentication categories
+    assert any(f["resource"] in ("default-only", "default") for f in out["findings"])
+    assert out["summary"]["resources_failing"] >= 2 and "severity_counts" in out["summary"]
+    assert list(out)[0] == "summary" and out["matrix"][0]["failed"] >= 1
+    assert all(op.startswith(("Describe", "List", "Get")) for _s, op in fake.operations)
+    assert "partial" not in out
+
+
+def test_security_audit_partial_on_access_denied_and_matrix_cap():
+    _fake, plane = _audit_plane(_fleet(DescribeUsers=("error", "AccessDenied")))
+    out = plane.security_audit(top=1)
+    assert out["partial"] is True and any("users not audited: AccessDenied" in n for n in out["notes"])
+    assert len(out["matrix"]) == 1 and out["matrix_truncated"] is True and out["matrix_total"] > 1
+    assert out["findings"]
+
+
+def test_security_audit_all_denied_returns_error():
+    denied = ("error", "AccessDenied")
+    _fake, plane = _audit_plane(
+        dict.fromkeys(
+            (
+                "DescribeReplicationGroups",
+                "DescribeCacheClusters",
+                "DescribeServerlessCaches",
+                "DescribeUsers",
+                "DescribeUserGroups",
+            ),
+            denied,
+        )
+    )
+    out = plane.security_audit()
+    assert out.get("error") or out.get("code") or "AccessDenied" in str(out)
+
+
+async def test_security_audit_tool_is_read_only_and_capped():
+    tools = {t.name: t for t in await server.mcp.list_tools()}
+    assert tools["aws_security_audit"].annotations.read_only_hint is True
+    assert getattr(tools["aws_security_audit"].fn, "__capped__", False)

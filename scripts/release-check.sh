@@ -45,3 +45,4 @@ if problems:
 print(f"release check ok: {len(registered)} tools")
 PY
 echo "release check ok: CHANGELOG has an entry for ${version} or Unreleased"
+bash scripts/check-artifacts.sh

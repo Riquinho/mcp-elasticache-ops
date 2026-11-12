@@ -46,6 +46,9 @@ jobs:
           uv build
           uv run --no-project --isolated --with dist/*.whl python -I -c 'import mcp_elasticache_ops'
           uv run --no-project --isolated --with dist/*.whl python -I -m mcp_elasticache_ops --help
+          uv run --no-project --isolated --with dist/*.whl mcp-elasticache-ops --help
+      - name: Artifact contents (no .env, .coverage, .lotes, keys; py.typed shipped)
+        run: bash scripts/check-artifacts.sh
 
   test:
     runs-on: ubuntu-latest

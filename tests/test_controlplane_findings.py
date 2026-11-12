@@ -1640,3 +1640,66 @@ def test_eol_finding_fires_only_for_redis_engine():
     assert any("end-of-life" in f["message"] for f in controlplane._version_findings("redis", "6.2.6", None, eol=True))
     assert not controlplane._version_findings("valkey", "6.2.6", None, eol=True)
     assert not controlplane._version_findings("redis", "7.1.0", None, eol=True)
+
+
+def _valkey_finding(out):
+    return [f for f in out["findings"] if f.get("hint") == "valkey-savings"]
+
+
+def test_cost_valkey_hint_summary_top_list_and_assumption():
+    extra = {
+        "describe_serverless_caches": {
+            "ServerlessCaches": [
+                {"ServerlessCacheName": "sc-redis", "Engine": "redis", "Status": "available"},
+                {"ServerlessCacheName": "sc-valkey", "Engine": "valkey", "Status": "available"},
+            ]
+        }
+    }
+    ec = _cost_ec(extra)
+    ec.responses["describe_cache_clusters"]["CacheClusters"].append(
+        {"CacheClusterId": "solo", "Engine": "redis", "EngineVersion": "6.2.6"}
+    )
+    out = plane(ec, Fake({"get_metric_data": _cost_metrics_for()})).cost_overview()
+    (f,) = _valkey_finding(out)
+    assert f["severity"] == "info" and f["category"] == "cost" and "resource" not in f
+    assert "not a quote" in f["message"] and "list-price" in f["message"]
+    assert f["candidates_total"] == 4  # big, fine, solo, sc-redis; the valkey serverless cache is excluded
+    assert f["assumed_savings_percent"] == {
+        "node_based": controlplane.VALKEY_SAVINGS_NODE_PERCENT,
+        "serverless": controlplane.VALKEY_SAVINGS_SERVERLESS_PERCENT,
+    }
+    top = f["top_candidates"]
+    assert [c["id"] for c in top] == ["big", "fine", "solo", "sc-redis"]  # by node count
+    assert {c["id"]: c["assumed_savings_percent"] for c in top}["sc-redis"] == 33
+    assert "sc-valkey" not in {c["id"] for c in top}
+
+
+def test_cost_valkey_hint_gates_and_caps():
+    # memcached, valkey and redis < 5.0.6 or of unknown version never get the hint
+    groups = [_cost_group("old", "cache.m7g.large"), _cost_group("val", "cache.m7g.large")]
+    clusters = [
+        {
+            "CacheClusterId": f"{g['ReplicationGroupId']}-00{i + 1}",
+            "ReplicationGroupId": g["ReplicationGroupId"],
+            "Engine": "redis" if g["ReplicationGroupId"] == "old" else "valkey",
+            "EngineVersion": "5.0.5" if g["ReplicationGroupId"] == "old" else "7.2",
+        }
+        for g in groups
+        for i in range(2)
+    ] + [
+        {"CacheClusterId": "mc", "Engine": "memcached", "EngineVersion": "1.6.21"},
+        {"CacheClusterId": "nover", "Engine": "redis"},
+    ]
+    ec = Fake(
+        {
+            "describe_replication_groups": {"ReplicationGroups": groups},
+            "describe_cache_clusters": {"CacheClusters": clusters},
+        }
+    )
+    out = plane(ec, Fake({"get_metric_data": metric_result({})})).cost_overview()
+    assert not _valkey_finding(out)
+    # exactly 5.0.6 qualifies; candidates list is capped
+    many = [{"CacheClusterId": f"c{i}", "Engine": "redis", "EngineVersion": "5.0.6"} for i in range(9)]
+    out = plane(Fake({"describe_cache_clusters": {"CacheClusters": many}}), Fake()).cost_overview()
+    (f,) = _valkey_finding(out)
+    assert f["candidates_total"] == 9 and len(f["top_candidates"]) == controlplane.MAX_VALKEY_CANDIDATES

@@ -205,8 +205,10 @@ AUDIT_AWS_RESPONSES: dict[str, dict[str, Any]] = {
 class AwsAudit:
     """boto3 session factory whose clients never touch the network and record every operation name."""
 
-    def __init__(self) -> None:
+    def __init__(self, responses: dict[str, Any] | None = None) -> None:
         self.operations: list[tuple[str, str]] = []  # (service, OperationName as sent to AWS)
+        # per-operation overrides of AUDIT_AWS_RESPONSES; ``("error", "AccessDenied")`` makes the call fail with it
+        self.responses = {**AUDIT_AWS_RESPONSES, **(responses or {})}
 
     def __call__(self) -> Any:
         audit = self
@@ -221,7 +223,11 @@ class AwsAudit:
                 def before_call(model, **_kwargs):
                     audit.operations.append((service, model.name))
                     http = AWSResponse("https://audit.invalid", 200, {}, None)
-                    return http, dict(AUDIT_AWS_RESPONSES.get(model.name, {}))
+                    reply = audit.responses.get(model.name, {})
+                    if isinstance(reply, tuple) and reply[0] == "error":
+                        denied = AWSResponse("https://audit.invalid", 403, {}, None)
+                        return denied, {"Error": {"Code": reply[1], "Message": "denied by the test"}}
+                    return http, dict(reply)
 
                 client.meta.events.register("before-call", before_call)
                 return client

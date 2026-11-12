@@ -21,7 +21,7 @@ from pydantic import Field
 
 from . import dataplane, memcached
 from .config import ControlPlaneConfig, DataPlaneConfig, MemcachedConfig, max_output_chars
-from .connection import build_client
+from .connection import build_client, diagnose_connectivity
 from .controlplane import REGION_PATTERN, ControlPlane, botocore_hint
 from .safe_client import SafeRedis
 
@@ -244,6 +244,14 @@ def node_health() -> dict:
     version, role, clients, hit ratio, memory vs maxmemory, fragmentation,
     evictions and a list of findings."""
     return dataplane.health_summary(redis_client(), _serverless())
+
+
+@read_tool
+def node_connectivity() -> dict:
+    """Why can't I connect: staged diagnosis of the configured endpoint, stopping at the first failure.
+    DNS (IPs, private or not, endpoint type), TCP, TLS (and plaintext fallback), PING, AUTH, each timed with a
+    verdict. Findings first, one hint per failure class. Socket probes and PING only; credentials never echoed."""
+    return diagnose_connectivity(DataPlaneConfig.from_env())
 
 
 @read_tool
@@ -755,6 +763,17 @@ def aws_cluster_overview(
     if replication_group_id:
         return _cp(region).cluster_overview(replication_group_id, minutes)
     return control_plane().cluster_overview_fan_out(None, minutes, region)
+
+
+@read_tool
+def aws_security_audit(
+    top: Annotated[int, Field(ge=1, le=200, description="Rows of the per-resource pass/fail matrix")] = 25,
+    region: Region = None,
+) -> dict:
+    """Fleet hardening roll-up from existing Describe data (no new IAM). Findings first: counts by severity,
+    findings grouped by category (transit, at rest/KMS, authentication, ACL, snapshots, patching) naming the
+    resource, then a pass/fail matrix capped to `top`. A denied call becomes a note and partial=true."""
+    return control_plane().security_audit_fan_out(region, top)
 
 
 @read_tool

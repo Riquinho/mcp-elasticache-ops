@@ -32,7 +32,7 @@ async def test_all_tools_read_only():
     async with Client(server.mcp) as c:
         tools = await c.list_tools()
     names = {t.name for t in tools}
-    assert len(tools) == 47
+    assert len(tools) == 49
     assert {
         "node_health",
         "node_info",
@@ -119,7 +119,7 @@ async def test_node_config_end_to_end(env):
 
 async def test_every_registered_tool_is_wrapped_with_the_output_cap():
     tools = await server.mcp.list_tools()
-    assert len(tools) == 47
+    assert len(tools) == 49
     unwrapped = [t.name for t in tools if not getattr(t.fn, "__capped__", False)]
     assert unwrapped == []
 
@@ -340,7 +340,7 @@ async def test_oncall_prompts_are_registered_and_do_not_change_the_tool_count():
     assert {p.name for p in prompts} == RUNBOOKS
     async with Client(server.mcp) as c:
         assert {p.name for p in await c.list_prompts()} == RUNBOOKS
-        assert len(await c.list_tools()) == 47  # prompts are not tools
+        assert len(await c.list_tools()) == 49  # prompts are not tools
 
 
 @pytest.mark.parametrize("name", sorted(RUNBOOKS))
@@ -423,6 +423,8 @@ AUDIT_CALLS: list[tuple[str, dict]] = [
     ("aws_cluster_overview", {}),  # fleet mode
     ("aws_cluster_overview", {"replication_group_id": "audit-rg"}),
     ("aws_cost_overview", {}),
+    ("aws_security_audit", {}),
+    ("node_connectivity", {}),
 ]
 
 
@@ -456,6 +458,37 @@ def audit(monkeypatch, tmp_path):
     monkeypatch.setattr(
         memcached, "socket", SimpleNamespace(create_connection=lambda *a, **k: AuditSocket(memcached_sent))
     )
+    # node_connectivity: no real DNS or sockets; PING goes through the recording Redis
+    import ssl
+
+    from mcp_elasticache_ops import connection
+
+    class _Sock(AuditSocket):
+        def close(self) -> None:
+            return None
+
+        def settimeout(self, _t: float) -> None:
+            return None
+
+        def recv(self, _size: int) -> bytes:
+            return b"+PONG\r\n"
+
+        def sendall(self, _data: bytes) -> None:
+            return None
+
+    class _PlainOnly:
+        def wrap_socket(self, *_a: object, **_k: object):
+            raise ssl.SSLError("plaintext server")
+
+    fake_socket = SimpleNamespace(
+        AF_INET=2,
+        SOCK_STREAM=1,
+        getaddrinfo=lambda host, port, **k: [(2, 1, 6, "", ("10.0.0.5", port))],
+        create_connection=lambda *a, **k: _Sock([]),
+    )
+    monkeypatch.setattr(connection, "socket", fake_socket)
+    monkeypatch.setattr(connection, "_tls_context", lambda cfg, verify: _PlainOnly())
+    monkeypatch.setattr(connection, "build_client", lambda *a, **k: redis_audit.build())
     return SimpleNamespace(aws=aws, redis=redis_audit, memcached=memcached_sent)
 
 
@@ -516,3 +549,25 @@ async def test_every_aws_tool_turns_botocore_connection_errors_into_error_and_hi
             data = res.data if isinstance(res.data, dict) else json.loads(res.content[0].text)
             assert isinstance(data, dict) and data.get("error"), (name, data)
             assert data.get("hint"), (name, data)
+
+
+# ------------------------------------------------------------------ node_connectivity registration
+
+
+async def test_node_connectivity_is_read_only_and_never_echoes_the_secret(monkeypatch):
+    import socket
+
+    def no_dns(*a, **k):
+        raise socket.gaierror(-2, "Name or service not known")
+
+    monkeypatch.setattr(socket, "getaddrinfo", no_dns)
+    monkeypatch.setenv("ELASTICACHE_HOST", "missing.example.invalid")
+    monkeypatch.setenv("ELASTICACHE_PASSWORD", "hunter2-secret")
+    tools = {t.name: t for t in await server.mcp.list_tools()}
+    assert tools["node_connectivity"].annotations.read_only_hint is True
+    assert getattr(tools["node_connectivity"].fn, "__capped__", False)
+    async with Client(server.mcp) as c:
+        out = await c.call_tool("node_connectivity", {})
+    data = _data(out)
+    assert data["failed_stage"] == "dns" and data["findings"]
+    assert "hunter2-secret" not in json.dumps(data)
