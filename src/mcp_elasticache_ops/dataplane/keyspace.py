@@ -10,7 +10,7 @@ from typing import Any
 
 import redis
 
-from ..safe_client import MAX_SCAN_COUNT
+from ..safe_client import MAX_SCAN_COUNT, reply_truncation
 from ._core import (
     LENGTH_COMMAND,
     _finding,
@@ -393,8 +393,10 @@ def keyspace_sample(
     lfu = "lfu" in policy
     keys: list[str] = []
     cursor = 0
+    reply_cut = False  # a SCAN batch cut by limit_reply means keys were lost: the report says so
     while True:
         cursor, batch = r.scan(cursor=cursor, match=match, count=scan_count)
+        reply_cut = reply_cut or reply_truncation(batch) is not None
         keys.extend(k.decode() if isinstance(k, bytes) else k for k in batch)
         if cursor == 0 or len(keys) >= sample_size:
             break
@@ -467,6 +469,7 @@ def keyspace_sample(
         "complete_scan": cursor == 0 and len(keys) < sample_size and not partial,
         "partial": partial,
         "partial_reason": partial_reason,
+        **({"truncated": True} if reply_cut else {}),
         "max_seconds": max_seconds,
         "elapsed_seconds": round(clock() - started, 3),
         "scope": "connected node only",

@@ -21,12 +21,13 @@ with several actions degrade to a partial answer when only some are denied.
 | `aws_engine_versions` | `elasticache:DescribeCacheEngineVersions` |
 | `aws_events` | `elasticache:DescribeEvents` |
 | `aws_failover_readiness` | `elasticache:DescribeCacheClusters`, `elasticache:DescribeReplicationGroups` |
+| `aws_global_datastore_failover_readiness` | `elasticache:DescribeGlobalReplicationGroups` |
 | `aws_global_replication_groups` | `elasticache:DescribeGlobalReplicationGroups` |
 | `aws_maintenance` | `elasticache:DescribeCacheClusters`, `elasticache:DescribeServiceUpdates`, `elasticache:DescribeUpdateActions` |
 | `aws_metrics` | `cloudwatch:GetMetricData`, `elasticache:DescribeCacheClusters`, `elasticache:DescribeReplicationGroups`, `elasticache:DescribeServerlessCaches` |
 | `aws_parameter_drift` | `elasticache:DescribeCacheParameterGroups`, `elasticache:DescribeCacheParameters` |
 | `aws_parameter_groups` | `elasticache:DescribeCacheClusters`, `elasticache:DescribeCacheEngineVersions`, `elasticache:DescribeCacheParameterGroups`, `elasticache:DescribeCacheParameters` |
-| `aws_parameters` | `elasticache:DescribeCacheParameters` |
+| `aws_parameters` | `elasticache:DescribeCacheParameterGroups`, `elasticache:DescribeCacheParameters`, `elasticache:DescribeEngineDefaultParameters` |
 | `aws_reader_endpoint_audit` | `elasticache:DescribeCacheClusters`, `elasticache:DescribeReplicationGroups` |
 | `aws_replication_group_audit` | `elasticache:DescribeCacheClusters`, `elasticache:DescribeReplicationGroups` |
 | `aws_replication_groups` | `elasticache:DescribeCacheClusters`, `elasticache:DescribeCacheEngineVersions`, `elasticache:DescribeReplicationGroups` |
@@ -57,11 +58,12 @@ with several actions degrade to a partial answer when only some are denied.
 | `cloudwatch:GetMetricData` | `aws_capacity_forecast`, `aws_cluster_overview`, `aws_cost_overview`, `aws_metrics`, `aws_scale_readiness`, `aws_serverless_triage`, `aws_shard_balance`, `aws_triage` |
 | `elasticache:DescribeCacheClusters` | `aws_alarms`, `aws_backup_audit`, `aws_cache_clusters`, `aws_capacity_forecast`, `aws_cluster_overview`, `aws_cost_overview`, `aws_failover_readiness`, `aws_maintenance`, `aws_metrics`, `aws_parameter_groups`, `aws_reader_endpoint_audit`, `aws_replication_group_audit`, `aws_replication_groups`, `aws_reserved_nodes`, `aws_reserved_offerings`, `aws_scale_readiness`, `aws_security_audit`, `aws_snapshot_restore_readiness`, `aws_triage`, `aws_upgrade_plan`, `aws_user_access_map`, `memcached_discovery` |
 | `elasticache:DescribeCacheEngineVersions` | `aws_cache_clusters`, `aws_engine_versions`, `aws_parameter_groups`, `aws_replication_groups`, `aws_security_audit`, `aws_triage`, `aws_upgrade_plan` |
-| `elasticache:DescribeCacheParameterGroups` | `aws_cache_clusters`, `aws_parameter_drift`, `aws_parameter_groups`, `aws_upgrade_plan` |
+| `elasticache:DescribeCacheParameterGroups` | `aws_cache_clusters`, `aws_parameter_drift`, `aws_parameter_groups`, `aws_parameters`, `aws_upgrade_plan` |
 | `elasticache:DescribeCacheParameters` | `aws_parameter_drift`, `aws_parameter_groups`, `aws_parameters` |
 | `elasticache:DescribeCacheSubnetGroups` | `aws_subnet_groups` |
+| `elasticache:DescribeEngineDefaultParameters` | `aws_parameters` |
 | `elasticache:DescribeEvents` | `aws_events`, `aws_serverless_triage`, `aws_triage` |
-| `elasticache:DescribeGlobalReplicationGroups` | `aws_global_replication_groups` |
+| `elasticache:DescribeGlobalReplicationGroups` | `aws_global_datastore_failover_readiness`, `aws_global_replication_groups` |
 | `elasticache:DescribeReplicationGroups` | `aws_alarms`, `aws_backup_audit`, `aws_capacity_forecast`, `aws_cluster_overview`, `aws_cost_overview`, `aws_failover_readiness`, `aws_metrics`, `aws_reader_endpoint_audit`, `aws_replication_group_audit`, `aws_replication_groups`, `aws_scale_readiness`, `aws_security_audit`, `aws_shard_balance`, `aws_snapshot_restore_readiness`, `aws_triage`, `aws_upgrade_plan`, `aws_user_access_map` |
 | `elasticache:DescribeReservedCacheNodes` | `aws_cost_overview`, `aws_reserved_nodes`, `aws_reserved_offerings` |
 | `elasticache:DescribeReservedCacheNodesOfferings` | `aws_reserved_offerings` |

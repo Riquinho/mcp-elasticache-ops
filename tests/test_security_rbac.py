@@ -211,3 +211,29 @@ def test_access_map_follows_pagination_over_100_users():
         stub.assert_no_pending_responses()
     assert boto3 and out["users"] == 101
     assert ("access string", "god") in _cats(out)
+
+
+def test_access_map_200_users_budget_and_trimmed_marker():
+    import json
+
+    users = [
+        _user(
+            f"u{i:03d}",
+            access="on ~* +@all" if i % 2 else "on ~k:* +get",
+            auth="no-password" if i % 3 == 0 else "password",
+        )
+        for i in range(200)
+    ]
+    groups = [_group("big", [u["UserId"] for u in users], rgs=["rg-big"])]
+    groups += [_group(f"g{j:02d}", [f"u{j * 5 + k:03d}" for k in range(5)], rgs=[f"rg{j}"]) for j in range(40)]
+    out, _ = _map(users, groups)
+    assert out["users"] == 200 and out["user_groups"] == 41
+    assert len(json.dumps(out, ensure_ascii=False)) < 54_000
+    assert out["partial"] is True
+    assert out["trimmed"]["findings"] > 0 and out["trimmed"]["map_rows"] == 41 - 15
+    assert any(n.startswith("trimmed ") and "finding(s)" in n for n in out["notes"])
+    assert len(out["findings"]) == 100
+    assert out["findings"][0]["severity"] == "critical"  # findings first, most severe on top
+    big = out["map"][0]
+    assert big["group"] == "big" and len(big["users"]) == 10 and big["users_more"] == 190
+    assert len(out["map"]) == 15

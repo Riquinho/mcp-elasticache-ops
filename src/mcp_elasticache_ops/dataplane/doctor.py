@@ -10,6 +10,7 @@ from typing import Any
 import redis
 
 from .. import quirks
+from ..safe_client import reply_truncation
 from ._core import (
     _finding,
     _num,
@@ -50,10 +51,13 @@ def _doctor_text(r: redis.Redis, *command: str) -> tuple[str | None, str | None]
     reply, err = _try(r.execute_command, *command)
     if err is not None:
         return None, err
+    cut = reply_truncation(reply)
     text = _s(reply) if isinstance(_s(reply), str) else ""
     text = text.strip()
     if len(text) > LATENCY_DOCTOR_CHARS:
         text = text[:LATENCY_DOCTOR_CHARS] + f"... [trimmed, {len(text) - LATENCY_DOCTOR_CHARS} more characters]"
+    if cut:  # the size guard cut the reply before it got here: the text must not look complete
+        text += f" [reply cut at {cut['total']} characters by the read-only client guard]"
     return text, None
 
 

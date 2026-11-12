@@ -172,11 +172,21 @@ def _cost_group(
     mem_peak, cpu_peak = peak("DatabaseMemoryUsagePercentage"), peak("EngineCPUUtilization")
     window = f"over {COST_WINDOW_DAYS} days"
     smaller = smaller_node_type(node_type)
+    covered = sum(1 for m in members if m in covered_ids)
+    # A downsize or delete does not release a reservation: the rightsizing advice must say so, never contradict it.
+    reserved_note = (
+        f"; {covered} of {nodes} {node_type} node(s) are under a reservation that keeps billing after a shrink or "
+        "delete, so check the reservation (aws_reserved_nodes) first"
+        if covered
+        else ""
+    )
     if mem_peak is not None and cpu_peak is not None and mem_peak < IDLE_MEMORY_PEAK and cpu_peak < IDLE_CPU_PEAK:
         add(
             "warning",
             f"{nodes} x {node_type} looks idle: peak memory {mem_peak:.0f}% and peak CPU {cpu_peak:.0f}% {window}; "
-            "confirm nothing uses it, then snapshot and delete it" + (f", or shrink to {smaller}" if smaller else ""),
+            "confirm nothing uses it, then snapshot and delete it"
+            + (f", or shrink to {smaller}" if smaller else "")
+            + reserved_note,
             hint="idle",
             suggested_node_type=smaller,
         )
@@ -189,7 +199,8 @@ def _cost_group(
         add(
             "warning" if nodes > 2 else "info",
             f"{nodes} x {node_type}: peak memory {mem_peak:.0f}% {window} (under {OVERSIZED_MEMORY_PEAK:.0f}%); "
-            + advice,
+            + advice
+            + reserved_note,
             hint="oversized",
             suggested_node_type=smaller,
         )
@@ -205,7 +216,6 @@ def _cost_group(
             "exist only as read capacity (keep one per shard for failover)",
             hint="idle-replicas",
         )
-    covered = sum(1 for m in members if m in covered_ids)
     if nodes and not covered:
         add(
             "info",

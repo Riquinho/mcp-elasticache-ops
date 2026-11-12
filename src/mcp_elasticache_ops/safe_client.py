@@ -8,6 +8,7 @@ it reaches the wire.
 
 from __future__ import annotations
 
+import itertools
 import re
 
 import redis
@@ -481,6 +482,13 @@ class TruncatedList(list):
     total = 0
 
 
+class TruncatedDict(dict):
+    """A mapping reply (parsed INFO, HGETALL) cut at MAX_REPLY_ITEMS entries. ``total`` is the original size."""
+
+    truncated = True
+    total = 0
+
+
 def limit_reply(reply):
     """Cap an oversized reply and mark it (``.truncated`` / ``.total``); other replies pass through unchanged."""
     if isinstance(reply, str) and len(reply) > MAX_REPLY_TEXT_CHARS:
@@ -491,12 +499,16 @@ def limit_reply(reply):
         lst = TruncatedList(reply[:MAX_REPLY_ITEMS])
         lst.total = len(reply)
         return lst
+    if isinstance(reply, dict) and len(reply) > MAX_REPLY_ITEMS:
+        mapping = TruncatedDict(itertools.islice(reply.items(), MAX_REPLY_ITEMS))
+        mapping.total = len(reply)
+        return mapping
     return reply
 
 
 def reply_truncation(reply) -> dict | None:
     """``{"truncated": True, "total": n}`` when ``limit_reply`` cut this reply, else None."""
-    if isinstance(reply, (TruncatedText, TruncatedList)):
+    if isinstance(reply, (TruncatedText, TruncatedList, TruncatedDict)):
         return {"truncated": True, "total": reply.total}
     return None
 
@@ -542,7 +554,8 @@ class SafePipeline(_BlockedHelpers, Pipeline):
     def execute(self, raise_on_error: bool = True):
         for args, _ in self.command_stack:
             check(args)  # refuse before any connection is opened
-        return super().execute(raise_on_error)
+        # Pipelined replies get the same size guard as single commands, so no consumer can bypass it.
+        return [limit_reply(item) for item in super().execute(raise_on_error)]
 
     def _execute_pipeline(self, connection, commands, raise_on_error):
         for args, _ in commands:

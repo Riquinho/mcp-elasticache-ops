@@ -8,6 +8,8 @@ from typing import Any
 
 import redis
 
+from ..safe_client import reply_truncation
+
 LENGTH_COMMAND = {
     "string": "STRLEN",
     "list": "LLEN",
@@ -118,7 +120,12 @@ def redact(value: Any) -> Any:
 def server_info(r: redis.Redis, section: str | None = None) -> dict:
     """Raw INFO, optionally a single section (server, clients, memory, stats, ...)."""
     data = r.info(section) if section else r.info()
-    return {"section": section or "default", "info": redact(data)}
+    cut = reply_truncation(data)  # read before redact() rebuilds the mapping and drops the marker
+    return {
+        "section": section or "default",
+        "info": redact(data),
+        **({"truncated": True, "total": cut["total"]} if cut else {}),
+    }
 
 
 INFO_SECTIONS = ("server", "clients", "memory", "persistence", "stats", "replication", "keyspace")

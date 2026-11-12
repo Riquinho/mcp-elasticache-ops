@@ -149,7 +149,8 @@ def _info_all(r: redis.Redis, serverless: bool) -> tuple[dict, list[str]]:
     """``INFO`` with a per-section fallback for endpoints that refuse the bare command."""
     info, err = _try(r.info)
     if info is not None:
-        return info, []
+        cut = reply_truncation(info)
+        return info, [f"INFO reply cut at {cut['total']} entries by the read-only client guard"] if cut else []
     merged: dict = {}
     notes = [_unsupported("INFO", err, serverless)]
     for section in INFO_SECTIONS:
@@ -358,7 +359,13 @@ def slowlog(r: redis.Redis, count: int = 25, include_args: bool = False, serverl
         key=lambda x: _num(x["total_us"]),
         reverse=True,
     )
-    return {"slowlog_len": total_len, "returned": len(out), "by_command": summary, "entries": out}
+    return {
+        "slowlog_len": total_len,
+        "returned": len(out),
+        "by_command": summary,
+        "entries": out,
+        **({"truncated": True} if reply_truncation(entries) else {}),
+    }
 
 
 def client_list(r: redis.Redis, top: int = 20) -> dict:
@@ -459,7 +466,7 @@ def command_tail(r: redis.Redis, serverless: bool = False) -> dict:
         (
             (str(k).removeprefix("cmdstat_"), _num((v or {}).get("usec")))
             for k, v in stats.items()
-            if isinstance(v, dict)
+            if isinstance(v, dict) and _num((v or {}).get("calls")) >= HISTOGRAM_MIN_CALLS
         ),
         key=lambda item: -item[1],
     )
@@ -654,6 +661,8 @@ def commandlog(r: redis.Redis, count: int = 10, serverless: bool = False, info_s
             continue
         total, _ = _try(r.execute_command, "COMMANDLOG", "LEN", kind)
         sections[kind] = _commandlog_section(kind, _commandlog_entries(reply), total)
+        if reply_truncation(reply):
+            sections[kind]["truncated"] = True  # the reply was cut by limit_reply: say so, never silently
     return {
         "findings": _sorted_findings(_commandlog_findings(sections)),
         "supported": bool(sections),

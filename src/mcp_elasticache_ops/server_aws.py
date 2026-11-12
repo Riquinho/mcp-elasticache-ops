@@ -123,6 +123,14 @@ def aws_global_replication_groups(region: Region = None) -> dict:
 
 
 @server.read_tool
+def aws_global_datastore_failover_readiness(region: Region = None) -> dict:
+    """Global datastore failover readiness from DescribeGlobalReplicationGroups and GlobalDatastoreReplicationLag.
+    Findings first, then per datastore: readiness (blocked, attention, ready), reasons, primary region, and each
+    secondary's status, node type, engine version and max replication lag."""
+    return server._cp(region).global_datastore_failover_readiness()
+
+
+@server.read_tool
 def aws_reserved_nodes(region: Region = None) -> dict:
     """DescribeReservedCacheNodes plus running nodes, findings first: reservations expiring in 30/90 days,
     reservations matching no node, nodes no reservation covers (node-hours billed on demand). All ELASTICACHE_REGIONS

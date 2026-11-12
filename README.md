@@ -10,7 +10,7 @@ written from scratch for ElastiCache.
 
 ## Tools
 
-All 64 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
+All 65 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 
 **Data plane** (redis-py, talks to the node endpoint)
 
@@ -70,6 +70,7 @@ All 64 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `aws_user_access_map` | `DescribeUsers`, `DescribeUserGroups` and the caches using each group: `~* +@all` users, unattached groups, enabled `default` user in a group, no-password users in live groups, Memcached groups, caches with no user group. Each finding has `resource`, `category`, `next` |
 | `aws_user_groups` | `DescribeUserGroups`: unattached groups, non-active status, groups holding only the `default` user |
 | `aws_global_replication_groups` | `DescribeGlobalReplicationGroups`: members per region, status, missing secondary. Per secondary region (max 6): `GlobalDatastoreReplicationLag` (> 1 s warning, > 10 s critical), node type or engine version that differs from the primary, members not `associated`/`available` |
+| `aws_global_datastore_failover_readiness` | `DescribeGlobalReplicationGroups`, `DescribeReplicationGroups`, `DescribeCacheClusters`, `GetMetricData` (`GlobalDatastoreReplicationLag`, last 60 min): per global datastore a verdict (`blocked`, `attention`, `ready`) with reasons, worst first. Blocked: not `available`, no secondary, a secondary not `associated`, lag > 10 s. Attention: lag > 1 s, node type or engine version differs from the primary. Findings first |
 | `aws_reserved_nodes` | `DescribeReservedCacheNodes` vs running nodes: coverage by exact node type and engine, unused reservations, reservations expiring with nodes still running; a failing cluster listing degrades to `partial` with the reservation list intact |
 | `aws_reserved_offerings` | `DescribeReservedCacheNodesOfferings` for a `node_type` and `engine` (opt-in, capped at 20): 1y/3y offerings, uncovered running nodes and the cheapest offering per term (upfront + hourly). Never purchases |
 | `aws_service_updates` | `DescribeServiceUpdates`: pending updates, past or near apply-by dates |

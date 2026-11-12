@@ -104,6 +104,8 @@ Conclude: recovery risk, newest restorable snapshot and its age, and the gaps to
 
 On data-tiered groups (r6gd) read DatabaseCapacityUsagePercentage, not memory percentage: it covers memory plus SSD.
 
+Note: a node-type change on a group that a reservation covers can strand the reservation. Check `aws_reserved_nodes` first: reservations ending within 30 days are warnings, within 90 days are notes, and nodes with no reservation are the uncovered boundary.
+
 Conclude: safe or not to scale in, whether to scale out, the risk of the node-type change and what to fix first.
 
 ## 7. Snapshot fork latency (latency spikes at backup time)

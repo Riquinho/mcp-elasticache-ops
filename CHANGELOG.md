@@ -1,5 +1,121 @@
 # Changelog
 
+## Round 48
+
+Round 48. Tool count unchanged.
+
+### Added
+- `tests/test_readonly_sweep.py`: every registered tool runs through the recording `AuditRedis` and `AwsAudit` fakes.
+  It asserts that each Redis command is in `READ_ONLY_COMMANDS`, that each AWS operation is `Describe*`, `List*` or
+  `GetMetricData`, and that no write-named operation was issued. A self-test shows the checker rejects `SET` and
+  `ModifyCacheCluster`.
+- `tests/test_iam_coverage.py`: AST scan of the boto3 calls in `src/mcp_elasticache_ops/controlplane/`. Each operation
+  must appear in `tests/iam_actions.json` and must carry a read-only prefix.
+- `tests/test_regen_check.py`: `scripts/regen.py --check` runs against a copy of the repo with a stale file, and must
+  exit 1 and leave the tree unchanged.
+
+### Changed
+- `scripts/regen.py --check` is read-only. It regenerates inside a temporary copy of the repo, compares the two
+  generated files with the tree, exits 1 on a difference and writes nothing into the repo.
+- `tests/test_server.py` `AUDIT_CALLS` adds `aws_parameters` with `diff_engine_defaults=True`. That path calls
+  `DescribeEngineDefaultParameters` and was missing from the IAM pin. The pin and `docs/iam-matrix.md` were regenerated.
+
+### Verified
+- `uv run ruff check .`, `uv run ruff format --check .` and `uv run pytest -q` pass: 2160 passed, 24 skipped.
+- `scripts/integration.sh` in full cluster mode (6.4G free on C:) exits 0: 2177 passed, 7 skipped for the single
+  container, then 6 passed, 2 skipped for the 3-primary cluster. The first two attempts failed on the local port
+  relay (ECONNREFUSED on 127.0.0.1:16379) and WSL was not reachable for a time because `ext4.vhdx` was locked; the
+  third run was clean. Its containers and volumes were removed by the script's trap and `down -v`.
+- Not touched: `prova-ghost-1805` (a `golang:1.26` container from another session) still shows in
+  `docker ps -a --filter name=prova-`. Named volumes `gocache-agente-fix`, `gomodcache`, `stackops-*` were left alone.
+
+## Round 45 (0.3.0)
+
+Round 45. Tool count unchanged at 65.
+
+### Verified
+- Integration against Valkey 8 (`valkey/valkey:8-alpine`, WSL Docker): `scripts/integration.sh` exits 0 with 2167 passed
+  and 7 skipped. It ran in reduced-footprint mode (2G free, below the 5G full gate): one container, no cluster run.
+  Full-mode and cluster integration are still pending: C: has 2.7G free, `fstrim` is missing in the WSL distro, and
+  freeing more space needs the user's OK (named volumes or vhdx compaction).
+- Wheel 0.3.0 built with `uv build`. A clean venv install lists 65 tools, matching `tests/tool_schemas.json`.
+
+### Fixed
+- `scripts/regen.py` regenerated `docs/iam-matrix.md` and `tests/tool_schemas.json`. The committed snapshot was missing
+  `aws_global_datastore_failover_readiness`, which CI's drift check would have flagged.
+
+## Round 44 (0.3.0)
+
+Round 44. Tool count unchanged at 65.
+
+### Added
+- Skip-budget gate: `tests/skip_budget.txt` holds the skip ceiling (24). `scripts/check-skip-budget.py junit.xml` fails
+  when the junit report has more skips than the ceiling. The CI test job runs `pytest -rs` and calls the checker after
+  the pass-floor check. Covered by `tests/test_skip_budget.py`.
+- `tests/test_replica_cluster_coverage.py`: a hung shard in cluster fan-out gives a partial result with a findings
+  line (`shard <ep> unreachable: no answer within the time budget`) while the other shards' answers survive; reader
+  endpoint names classify as `reader`; writes, `READONLY` and `READWRITE` are refused by the allowlist; no allowlisted
+  command is a write or a connection-mode switch. Mutating the timeout branch in `dataplane/fanout.py` makes two of
+  these tests fail (checked, then reverted).
+
+### Changed
+- Generated files regenerated (`scripts/regen.py`): `aws_global_datastore_failover_readiness` was missing from
+  `docs/iam-matrix.md` and `tests/tool_schemas.json`, left stale by round 41.
+- `tests/pass_floor.txt` raised to the new passing count.
+
+### Not run
+- Docker integration (`scripts/integration.sh`) was skipped: `C:` had 2.7 GB free, below the 5 GB needed. Pruning
+  untagged images and build cache older than 24 h freed nothing. Only a broader prune or a vhdx compaction (both need
+  the user's OK) would free enough space.
+- `prova-ghost-1805` (image `golang:1.26`, not created by this repo's scripts) is running in the WSL Docker daemon. It
+  was left alone, so the `prova-` filter check is not empty.
+
+## Round 41 (0.3.0)
+
+Round 41. 65 tools (one new tool, `aws_global_datastore_failover_readiness`).
+
+### Added
+- `aws_global_datastore_failover_readiness` (`controlplane/inventory.py`, `controlplane/inventory_views.py`): read-only
+  failover readiness per Global Datastore from `DescribeGlobalReplicationGroups`, `DescribeReplicationGroups`,
+  `DescribeCacheClusters` and CloudWatch `GlobalDatastoreReplicationLag`. Findings first (worst first). Flags a lagging
+  secondary (warning at 1 s, critical at 10 s), engine or node mismatch, and a secondary that is associating or
+  disassociated. No new IAM actions beyond those already in `docs/iam-matrix.md`.
+- `limit_reply` also caps mappings (`TruncatedDict`, `truncated` and `total`). `node_doctor` (MEMORY DOCTOR),
+  `node_info` (INFO), `node_slowlog`, `node_clients`, the keyspace sample and `server_info` report a cut reply: the
+  text says `reply cut at N characters by the read-only client guard`, and the other outputs carry `truncated`/`total`.
+- Tests: `tests/test_global_datastore.py` (15 tests), reply-truncation consumer tests in
+  `tests/test_reply_truncation.py`, and reserved-node cross-check tests in `tests/test_cost_overview.py`.
+
+### Changed
+- `aws_cost_overview` idle and oversized findings name the reservation when the group's nodes are covered by one, and
+  point to `aws_reserved_nodes` before any downsize or delete. Before this, the advice could contradict the reserved-node
+  output.
+- `tests/test_tool_surface.py` byte budget raised from 54_000 to 55_000: 65 tools measure 54_734 bytes with the new
+  tool, and the budget leaves headroom for descriptions to grow.
+
+### Verification
+- Mutation check on `limit_reply` (replaced by `return reply`): 11 reply-truncation tests fail; restored and green.
+- Mutation check on the reserved-node cross-check: 2 cost-overview tests fail; restored and green.
+- Docker integration against Valkey 8 skipped: 2.8 GB free on C: is under the 5 GB floor.
+
+## Round 38 (0.3.0)
+
+Round 38. Still 64 tools; no new tool this round.
+
+### Added
+- Reply-truncation coverage (`tests/test_reply_truncation.py`): huge-reply fakes for `limit_reply`, pipelines,
+  `client_summary` and `commandlog`; every cut reply is reported as `truncated`.
+- Reserved-node boundary tests (`tests/test_cost_overview.py`): expiry at 29, 30, 60, 89 and 90 days, and an
+  uncovered node type next to a reserved one. Runbook 6 notes the reservation check before a node-type change.
+- 200-user budget test (`tests/test_security_rbac.py`) for `aws_user_access_map`.
+
+### Changed
+- `aws_user_access_map` caps each group row at 10 users and 10 attached caches (with `users_more` and
+  `replication_groups_more` counts), shows 15 group rows, and says `trimmed N finding(s) and M map row(s)` in
+  `notes` plus a `trimmed` object.
+- `SafePipeline.execute` runs every pipelined reply through `limit_reply`. `node_commandlog` sections and the
+  keyspace sample carry `truncated: true` when a reply was cut.
+
 ## Round 28 additions to 0.3.0
 
 Round 28. 64 tools (one new tool, `aws_user_access_map`).

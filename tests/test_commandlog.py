@@ -172,6 +172,15 @@ def test_histogram_ignores_commands_with_few_calls():
     assert out["rows"] == [] and out["findings"] == []
 
 
+def test_histogram_few_expensive_calls_do_not_crowd_out_busy_commands():
+    stats = {f"cmdstat_slow{i}": {"calls": 2, "usec": 10_000_000} for i in range(10)}
+    stats["cmdstat_get"] = {"calls": 10_000, "usec": 100}
+    r = FakeRedis(infos={"commandstats": stats, **REDIS7})
+    r.commands["LATENCY HISTOGRAM get"] = {"get": _hist(10_000, 2, 8192)}
+    out = dataplane.command_tail(r)
+    assert [row["command"] for row in out["rows"]] == ["get"]
+
+
 def test_histogram_on_old_engine_is_a_note():
     infos = {"commandstats": {"cmdstat_get": {"calls": 500, "usec": 900}}, "server": {"redis_version": "6.2.6"}}
     out = dataplane.command_tail(FakeRedis(infos=infos))

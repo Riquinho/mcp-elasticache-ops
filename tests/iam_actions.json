@@ -45,6 +45,9 @@
   "elasticache:DescribeCacheClusters",
   "elasticache:DescribeReplicationGroups"
  ],
+ "aws_global_datastore_failover_readiness": [
+  "elasticache:DescribeGlobalReplicationGroups"
+ ],
  "aws_global_replication_groups": [
   "elasticache:DescribeGlobalReplicationGroups"
  ],
@@ -70,7 +73,9 @@
   "elasticache:DescribeCacheParameters"
  ],
  "aws_parameters": [
-  "elasticache:DescribeCacheParameters"
+  "elasticache:DescribeCacheParameterGroups",
+  "elasticache:DescribeCacheParameters",
+  "elasticache:DescribeEngineDefaultParameters"
  ],
  "aws_reader_endpoint_audit": [
   "elasticache:DescribeCacheClusters",

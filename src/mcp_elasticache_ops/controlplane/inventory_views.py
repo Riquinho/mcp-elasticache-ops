@@ -22,6 +22,9 @@ MAX_GLOBAL_SECONDARIES = 6  # secondary regions inspected per global datastore (
 
 HEALTHY_GLOBAL_MEMBER_STATUSES = frozenset({"associated", "available"})
 
+GLOBAL_LAG_WARN_SECONDS = 1.0  # same thresholds as the node-level replication rules in _core
+GLOBAL_LAG_CRITICAL_SECONDS = 10.0
+
 
 EVENT_SOURCE_TYPES = frozenset(
     {

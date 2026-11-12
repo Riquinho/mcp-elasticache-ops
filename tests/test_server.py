@@ -32,7 +32,7 @@ async def test_all_tools_read_only():
     async with Client(server.mcp) as c:
         tools = await c.list_tools()
     names = {t.name for t in tools}
-    assert len(tools) == 64
+    assert len(tools) == 65
     assert {
         "node_health",
         "node_info",
@@ -121,7 +121,7 @@ async def test_node_config_end_to_end(env):
 
 async def test_every_registered_tool_is_wrapped_with_the_output_cap():
     tools = await server.mcp.list_tools()
-    assert len(tools) == 64
+    assert len(tools) == 65
     unwrapped = [t.name for t in tools if not getattr(t.fn, "__capped__", False)]
     assert unwrapped == []
 
@@ -342,7 +342,7 @@ async def test_oncall_prompts_are_registered_and_do_not_change_the_tool_count():
     assert {p.name for p in prompts} == RUNBOOKS
     async with Client(server.mcp) as c:
         assert {p.name for p in await c.list_prompts()} == RUNBOOKS
-        assert len(await c.list_tools()) == 64  # prompts are not tools
+        assert len(await c.list_tools()) == 65  # prompts are not tools
 
 
 @pytest.mark.parametrize("name", sorted(RUNBOOKS))
@@ -411,12 +411,14 @@ AUDIT_CALLS: list[tuple[str, dict]] = [
     ("aws_serverless_caches", {}),
     ("aws_events", {"source_type": "replication-group", "source_identifier": "audit-rg"}),
     ("aws_parameters", {"parameter_group": "default.redis7"}),
+    ("aws_parameters", {"parameter_group": "default.redis7", "diff_engine_defaults": True}),
     ("aws_snapshots", {}),
     ("aws_serverless_snapshots", {}),
     ("aws_users", {}),
     ("aws_user_groups", {}),
     ("aws_user_access_map", {}),
     ("aws_global_replication_groups", {}),
+    ("aws_global_datastore_failover_readiness", {}),
     ("aws_reserved_nodes", {}),
     ("aws_reserved_offerings", {"node_type": "cache.r6g.large", "engine": "redis"}),
     ("aws_engine_versions", {"engine": "redis"}),

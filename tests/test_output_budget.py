@@ -64,6 +64,7 @@ TOOL_ARGS: dict[str, dict[str, Any]] = {
             "aws_user_groups",
             "aws_user_access_map",
             "aws_global_replication_groups",
+            "aws_global_datastore_failover_readiness",
             "aws_reserved_nodes",
             "aws_parameter_groups",
             "aws_service_updates",

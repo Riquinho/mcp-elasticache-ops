@@ -33,6 +33,8 @@ MAX_AUDIT_MATRIX_ROWS = 25  # rows of the aws_security_audit pass/fail matrix
 
 
 MAX_AUDIT_FINDINGS = 100
+MAX_ACCESS_MAP_ROWS = 15  # user groups shown by aws_user_access_map
+MAX_ACCESS_MAP_ITEMS = 10  # users (and attached caches) listed per group row; the rest is counted
 
 
 # aws_parameters --diff: values that deserve a finding.
@@ -518,6 +520,34 @@ def _map_finding(severity: str, message: str, resource: str, category: str, next
     return finding(severity, message, resource=resource, category=category, next=next_tool, **extra)
 
 
+def _access_map_row(g: dict, access: dict[str, dict]) -> dict:
+    """One group row of ``aws_user_access_map``: members and caches capped, with the full counts kept."""
+
+    def capped(items: list[Any]) -> tuple[list[Any], int]:
+        return items[:MAX_ACCESS_MAP_ITEMS], max(len(items) - MAX_ACCESS_MAP_ITEMS, 0)
+
+    members, members_more = capped(list(g.get("UserIds", [])))
+    rgs, rgs_more = capped(list(g.get("ReplicationGroups", [])))
+    serverless, serverless_more = capped(list(g.get("ServerlessCaches", [])))
+    return {
+        "group": g.get("UserGroupId"),
+        "status": g.get("Status"),
+        "users": [
+            {
+                "id": uid,
+                "name": (access.get(str(uid)) or {}).get("name"),
+                "authentication_type": (access.get(str(uid)) or {}).get("authentication_type"),
+            }
+            for uid in members
+        ],
+        "users_more": members_more,
+        "replication_groups": rgs,
+        "replication_groups_more": rgs_more,
+        "serverless_caches": serverless,
+        "serverless_caches_more": serverless_more,
+    }
+
+
 def _access_map_findings(
     users: list[dict],
     groups: list[dict],
@@ -893,32 +923,22 @@ class _SecurityMixin(_CostMixin):
                 if data is None
             ]
             access = {str(u.get("UserId")): _user_view(u) for u in users}
-            rows = [
-                {
-                    "group": g.get("UserGroupId"),
-                    "status": g.get("Status"),
-                    "users": [
-                        {
-                            "id": uid,
-                            "name": (access.get(str(uid)) or {}).get("name"),
-                            "authentication_type": (access.get(str(uid)) or {}).get("authentication_type"),
-                        }
-                        for uid in g.get("UserIds", [])
-                    ],
-                    "replication_groups": g.get("ReplicationGroups", []),
-                    "serverless_caches": g.get("ServerlessCaches", []),
-                }
-                for g in groups
-            ]
+            rows = [_access_map_row(g, access) for g in groups]
             out: dict[str, Any] = {
                 "users": len(users),
                 "user_groups": len(groups),
                 "findings": findings[:MAX_AUDIT_FINDINGS],
-                "map": rows[:MAX_AUDIT_MATRIX_ROWS],
+                "map": rows[:MAX_ACCESS_MAP_ROWS],
             }
-            if len(findings) > MAX_AUDIT_FINDINGS or len(rows) > MAX_AUDIT_MATRIX_ROWS:
+            trimmed_findings = len(findings) - MAX_AUDIT_FINDINGS
+            trimmed_rows = len(rows) - MAX_ACCESS_MAP_ROWS
+            if trimmed_findings > 0 or trimmed_rows > 0:
                 out["partial"] = True
-                notes.append("output capped; use aws_user_groups and aws_users for the full lists")
+                out["trimmed"] = {"findings": max(trimmed_findings, 0), "map_rows": max(trimmed_rows, 0)}
+                notes.append(
+                    f"trimmed {max(trimmed_findings, 0)} finding(s) and {max(trimmed_rows, 0)} map row(s): "
+                    "use aws_user_groups and aws_users for the full lists"
+                )
             if notes:
                 out["notes"] = notes
             return out

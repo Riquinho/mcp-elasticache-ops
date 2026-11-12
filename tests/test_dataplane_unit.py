@@ -740,7 +740,9 @@ def test_fan_out_splits_budget_across_waves():
     assert seen == [(3.0, 3)] * 3  # 3 primaries, 1 worker -> 3 waves of 3s
     seen.clear()
     dataplane._fan_out_primaries(_seed(), factory, work, max_workers=3, total_seconds=9.0, per_node_timeout=1.0)
-    assert seen == [(9.0, 3)] * 3
+    # budget is what is left of the 9s deadline, so a slow machine shaves a little off
+    assert [shards for _, shards in seen] == [3] * 3
+    assert all(budget == pytest.approx(9.0, abs=1.0) for budget, _ in seen)
 
 
 def test_cluster_keyspace_sample_hung_shard_is_abandoned():

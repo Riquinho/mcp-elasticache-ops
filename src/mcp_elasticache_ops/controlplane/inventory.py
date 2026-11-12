@@ -34,6 +34,8 @@ from .inventory_views import (  # noqa: F401
     _EVENTS_CRITICAL_WORDS,
     _EVENTS_WARNING_WORDS,
     EVENT_SOURCE_TYPES,
+    GLOBAL_LAG_CRITICAL_SECONDS,
+    GLOBAL_LAG_WARN_SECONDS,
     GLOBAL_LAG_WINDOW_MINUTES,
     HEALTHY_GLOBAL_MEMBER_STATUSES,
     MAX_EVENT_FINDINGS,
@@ -61,6 +63,65 @@ from .restore import (
 )
 
 MAX_AUDITED_GROUPS = 25  # DescribeCacheParameters calls made by aws_parameter_groups
+
+
+_READINESS_RANK = {"blocked": 0, "attention": 1, "ready": 2}
+
+
+def _datastore_readiness(view: dict) -> dict:
+    """Failover verdict for one global datastore built from its ``global_replication_groups`` view.
+
+    ``blocked``: a failover to a secondary would lose or stall (not available, no secondary, a secondary not
+    associated, or lag above the critical threshold). ``attention``: it would work but land on different hardware
+    or with lag above the warning threshold. ``ready`` otherwise. Unread secondaries (no regional data) are not
+    counted against them."""
+    members = view.get("members", [])
+    primary = next((m for m in members if m.get("role") == "PRIMARY"), None)
+    secondaries = [m for m in members if m.get("role") == "SECONDARY"]
+    blocked: list[str] = []
+    attention: list[str] = []
+    if view.get("status") not in (None, "available"):
+        blocked.append(f"global datastore status is {view.get('status')}")
+    if not secondaries:
+        blocked.append("no secondary region")
+    primary_type, primary_version = view.get("node_type"), view.get("engine_version")
+    rows = []
+    for m in secondaries:
+        label = f"{m.get('replication_group_id')} ({m.get('region')})"
+        lag = (m.get("replication_lag") or {}).get("max")
+        if m.get("status") not in HEALTHY_GLOBAL_MEMBER_STATUSES | {None}:
+            blocked.append(f"{label} is {m.get('status')}")
+        if lag is not None and lag > GLOBAL_LAG_CRITICAL_SECONDS:
+            blocked.append(f"{label} replication lag {lag:.1f} s is above {GLOBAL_LAG_CRITICAL_SECONDS:g} s")
+        elif lag is not None and lag > GLOBAL_LAG_WARN_SECONDS:
+            attention.append(f"{label} replication lag {lag:.1f} s is above {GLOBAL_LAG_WARN_SECONDS:g} s")
+        if m.get("node_type") and primary_type and m["node_type"] != primary_type:
+            attention.append(f"{label} node type {m['node_type']} differs from the primary ({primary_type})")
+        if m.get("engine_version") and primary_version and m["engine_version"] != primary_version:
+            attention.append(
+                f"{label} engine version {m['engine_version']} differs from the primary ({primary_version})"
+            )
+        rows.append(
+            {
+                "replication_group_id": m.get("replication_group_id"),
+                "region": m.get("region"),
+                "status": m.get("status"),
+                "node_type": m.get("node_type"),
+                "engine_version": m.get("engine_version"),
+                "replication_lag_max": lag,
+            }
+        )
+    level = "blocked" if blocked else "attention" if attention else "ready"
+    return {
+        "id": view.get("id"),
+        "primary_region": primary.get("region") if primary else None,
+        "status": view.get("status"),
+        "engine_version": primary_version,
+        "node_type": primary_type,
+        "readiness": level,
+        "reasons": blocked + attention,
+        "secondaries": rows,
+    }
 
 
 class _InventoryMixin(_CoreMixin):
@@ -527,6 +588,25 @@ class _InventoryMixin(_CoreMixin):
                         )
                 findings += self._secondary_readiness(g, members)
             return {"count": len(views), "findings": _sorted_findings(findings), "global_replication_groups": views}
+
+        return self._guard(run)
+
+    def global_datastore_failover_readiness(self) -> dict:
+        """Failover readiness per global datastore, from ``global_replication_groups`` (same Describe calls and
+        GlobalDatastoreReplicationLag reads). Findings first, then one verdict per datastore, worst first."""
+
+        def run() -> dict:
+            base = self.global_replication_groups()
+            if "global_replication_groups" not in base:
+                return base
+            datastores = sorted(
+                (_datastore_readiness(v) for v in base["global_replication_groups"]),
+                key=lambda d: _READINESS_RANK[d["readiness"]],
+            )
+            findings = list(base["findings"])
+            if not datastores:
+                findings.append(finding("info", "no global datastores in this region"))
+            return {"count": len(datastores), "findings": _sorted_findings(findings), "datastores": datastores}
 
         return self._guard(run)
 
