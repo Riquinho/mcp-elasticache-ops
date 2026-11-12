@@ -1336,3 +1336,126 @@ def test_fleet_stops_when_the_shared_deadline_is_used_up(monkeypatch):
     out = cp.cluster_overview_fan_out(None)
     assert out["region_errors"]["eu-west-1"]["error"] == "DeadlineExceeded"
     assert [g["region"] for g in out["groups"]] == [REGION]
+
+
+# ------------------------------------------------------------------ round 11: aws_maintenance
+
+
+def _action(name, apply_by, cluster="m-001", sev="important"):
+    return {
+        "ReplicationGroupId": "m",
+        "CacheClusterId": cluster,
+        "ServiceUpdateName": name,
+        "ServiceUpdateSeverity": sev,
+        "ServiceUpdateType": "security-update",
+        "UpdateActionStatus": "not-applied",
+        "ServiceUpdateRecommendedApplyByDate": apply_by,
+    }
+
+
+def _maint_cluster(cid="m-001", window="sun:05:00-sun:06:00", snap="05:30-06:30", engine="redis", version="7.1.0"):
+    return {
+        "CacheClusterId": cid,
+        "ReplicationGroupId": "m",
+        "Engine": engine,
+        "EngineVersion": version,
+        "PreferredMaintenanceWindow": window,
+        "SnapshotWindow": snap,
+    }
+
+
+def test_maintenance_flags_overdue_update_overlap_and_eol():
+    ec = Fake(
+        {
+            "describe_update_actions": {
+                "UpdateActions": [
+                    _action("su-old", NOW - dt.timedelta(days=3)),
+                    _action("su-old", NOW - dt.timedelta(days=3), cluster="m-002"),
+                    _action("su-future", NOW + dt.timedelta(days=30), sev="low"),
+                ]
+            },
+            "describe_service_updates": {"ServiceUpdates": []},
+            "describe_cache_clusters": {"CacheClusters": [_maint_cluster(version="6.2.6")]},
+        }
+    )
+    out = plane(ec).maintenance()
+    msgs = [(f["severity"], f["message"]) for f in out["findings"]]
+    assert out["findings"][0]["severity"] == "critical"
+    assert any(s == "critical" and "su-old" in m and "2 target(s)" in m for s, m in msgs)
+    assert not any("su-future" in m for _, m in msgs)
+    assert any("overlaps snapshot window" in m for _, m in msgs)
+    assert any("end-of-life" in m for _, m in msgs)
+    assert [u["name"] for u in out["pending_updates"]] == ["su-old", "su-future"]
+    assert out["pending_updates"][0]["overdue"] is True
+    assert "partial" not in out
+    assert {op for op, _ in ec.calls} == {
+        "describe_update_actions",
+        "describe_service_updates",
+        "describe_cache_clusters",
+    }
+
+
+def test_maintenance_windows_that_do_not_overlap_are_quiet():
+    ec = Fake({"describe_cache_clusters": {"CacheClusters": [_maint_cluster(snap="02:00-03:00")]}})
+    out = plane(ec).maintenance()
+    assert out["findings"] == []
+    # a maintenance window spanning the week boundary overlaps a daily snapshot on the wrapped side
+    assert controlplane._windows_overlap("sat:23:30-sun:00:30", "00:00-01:00")
+    assert not controlplane._windows_overlap("sat:22:00-sat:23:00", "00:00-01:00")
+
+
+def test_maintenance_with_group_id_scopes_the_calls():
+    ec = Fake(
+        {
+            "describe_cache_clusters": {
+                "CacheClusters": [_maint_cluster(), {**_maint_cluster("x-001"), "ReplicationGroupId": "x"}]
+            }
+        }
+    )
+    out = plane(ec).maintenance("m")
+    assert [w["cluster"] for w in out["windows"]] == ["m-001"]
+    update_kwargs = next(kw for op, kw in ec.calls if op == "describe_update_actions")
+    assert update_kwargs["ReplicationGroupIds"] == ["m"]
+    assert all(op != "describe_service_updates" for op, _ in ec.calls)
+
+
+def test_maintenance_access_denied_is_partial_not_fatal():
+    ec = Fake(
+        {
+            "describe_update_actions": denied("DescribeUpdateActions"),
+            "describe_service_updates": {"ServiceUpdates": []},
+            "describe_cache_clusters": {"CacheClusters": [_maint_cluster(version="6.0.5")]},
+        }
+    )
+    out = plane(ec).maintenance()
+    assert out["partial"] is True
+    assert any("DescribeUpdateActions failed (AccessDenied)" in f["message"] for f in out["findings"])
+    assert any("end-of-life" in f["message"] for f in out["findings"])  # other sections still ran
+
+
+def test_maintenance_fan_out_tags_regions_and_isolates_a_denied_region():
+    ok = Fake(
+        {
+            "describe_update_actions": {"UpdateActions": [_action("su-old", NOW - dt.timedelta(days=1))]},
+            "describe_cache_clusters": {"CacheClusters": [_maint_cluster()]},
+        }
+    )
+    broken = Fake(
+        {
+            "describe_update_actions": denied("DescribeUpdateActions"),
+            "describe_service_updates": denied("DescribeServiceUpdates"),
+            "describe_cache_clusters": denied("DescribeCacheClusters"),
+        }
+    )
+    out = _fleet_plane({REGION: (ok, Fake()), "eu-west-1": (broken, Fake())}).maintenance_fan_out()
+    assert out["regions"] == [REGION, "eu-west-1"]
+    assert all(f["region"] in {REGION, "eu-west-1"} for f in out["findings"])
+    assert any(f["region"] == REGION and f["severity"] == "critical" for f in out["findings"])
+    assert out["partial"] is True
+    assert all(u["region"] == REGION for u in out["pending_updates"])
+
+
+def test_maintenance_never_calls_a_write_api():
+    ec = Fake({"describe_cache_clusters": {"CacheClusters": []}})
+    plane(ec).maintenance()
+    assert all(op.startswith("describe_") for op, _ in ec.calls)

@@ -109,7 +109,9 @@ class FakeRedis:
     def slowlog_len(self):
         return len(self.slowlog_entries)
 
-    def client_list(self):
+    def client_list(self, _type=None):
+        if _type:
+            return [c for c in self.clients if c.get("flags") == "P" or c.get("type") == _type]
         return self.clients
 
     def memory_stats(self):
@@ -128,6 +130,8 @@ class FakeRedis:
         value = self.commands[key]
         if isinstance(value, Exception):
             raise value
+        if callable(value):
+            return value()
         return value
 
 
@@ -227,6 +231,13 @@ def _audit_reply(args: tuple) -> Any:
         }
     if name == "SCAN":
         return (0, [b"audit:key"])
+    if name.startswith("PUBSUB"):
+        sub = name.split(" ", 1)[1] if " " in name else str(args[1]).upper()
+        if sub in {"CHANNELS", "SHARDCHANNELS"}:
+            return [b"audit:chan"]
+        if sub == "NUMSUB":
+            return [(b"audit:chan", 1)]
+        return 0
     return {
         "PING": True,
         "DBSIZE": 1,

@@ -1,0 +1,57 @@
+<#
+.SYNOPSIS
+  Disk-gated integration run: checks free space, brings up the throwaway cluster, runs `pytest -m integration`,
+  and always tears everything down (`down -v`, `image prune -f`, fstrim). Never uses `prune -a`.
+
+.EXAMPLE
+  powershell -ExecutionPolicy Bypass -File scripts/integration.ps1
+  powershell -ExecutionPolicy Bypass -File scripts/integration.ps1 -MinFreeGB 8 -Wsl:$false
+#>
+param(
+    [int]$MinFreeGB = 5,
+    [string]$Drive = 'C',
+    [string]$ComposeFile = 'tests/docker-compose.cluster.yml',
+    [string]$Distro = 'Ubuntu',
+    [bool]$Wsl = $true
+)
+
+$ErrorActionPreference = 'Stop'
+$root = Split-Path -Parent $PSScriptRoot
+
+function Invoke-Docker {
+    if ($Wsl) { & wsl -d $Distro -e docker @args } else { & docker @args }
+}
+
+$free = [math]::Round((Get-PSDrive -Name $Drive).Free / 1GB, 1)
+if ($free -lt $MinFreeGB) {
+    Write-Host "disk gate: ${free}G free on ${Drive}: (< ${MinFreeGB}G); skipping integration, run the unit suite only"
+    exit 0
+}
+Write-Host "disk gate: ${free}G free on ${Drive}:, running integration"
+
+if ($Wsl) {
+    $winPath = (Join-Path $root $ComposeFile)
+    $file = (& wsl -d $Distro -e wslpath -a ($winPath -replace '\\', '/')).Trim()
+} else {
+    $file = Join-Path $root $ComposeFile
+}
+
+$code = 1
+try {
+    Invoke-Docker compose -f $file up -d --wait --wait-timeout 90
+    if ($LASTEXITCODE -ne 0) { throw 'docker compose up failed' }
+    $env:CLUSTER_TEST_HOST = '127.0.0.1'
+    $env:CLUSTER_TEST_PORT = '7001'
+    Push-Location $root
+    try {
+        uv run pytest -q -m integration tests/test_dataplane_integration.py
+        $code = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+} finally {
+    Invoke-Docker compose -f $file down -v --remove-orphans 2>&1 | Out-Null
+    Invoke-Docker image prune -f 2>&1 | Out-Null
+    if ($Wsl) { & wsl -d $Distro -u root -e fstrim -v / 2>&1 | Out-Null }
+}
+exit $code

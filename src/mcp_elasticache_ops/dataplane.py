@@ -23,7 +23,7 @@ from typing import Any
 
 import redis
 
-from .safe_client import CONFIG_GET_EXACT, CONFIG_GET_PREFIXES, MAX_SCAN_COUNT
+from .safe_client import CONFIG_GET_EXACT, CONFIG_GET_PREFIXES, MAX_PUBSUB_NUMSUB_CHANNELS, MAX_SCAN_COUNT
 
 LENGTH_COMMAND = {
     "string": "STRLEN",
@@ -513,7 +513,18 @@ def client_list(r: redis.Redis, top: int = 20) -> dict:
 
     top_mem = sorted(clients, key=heavy, reverse=True)[: max(1, int(top))]
     fields = ("id", "addr", "name", "user", "age", "idle", "db", "cmd", "qbuf", "omem", "tot-mem", "flags")
+    over_1h = sum(1 for i in idle if i > 3600)
+    findings = []
+    if over_1h >= IDLE_CLIENTS_WARN:
+        findings.append(
+            _finding(
+                "info" if over_1h < 10 * IDLE_CLIENTS_WARN else "warning",
+                f"{over_1h} of {len(clients)} clients have been idle for over an hour "
+                "(connection leak, or timeout 0 with no idle reaping)",
+            )
+        )
     return {
+        "findings": findings,
         "total": len(clients),
         "by_source_ip": by_ip.most_common(top),
         "by_name": by_name.most_common(top),
@@ -522,7 +533,7 @@ def client_list(r: redis.Redis, top: int = 20) -> dict:
         "idle_seconds": {
             "max": max(idle) if idle else 0,
             "median": statistics.median(idle) if idle else 0,
-            "over_1h": sum(1 for i in idle if i > 3600),
+            "over_1h": over_1h,
         },
         "top_by_buffer_memory": [{k: c.get(k) for k in fields} for c in top_mem],
     }
@@ -797,6 +808,13 @@ PREFIX_PRESSURE_RATIO = 0.8  # memory share of maxmemory at which a no-TTL prefi
 PREFIX_SHARE_PCT = 10.0  # a prefix must hold at least this share of sampled memory to be flagged
 PREFIX_NO_TTL_PCT = 90.0
 
+TTL_BUCKETS = ("no_ttl", "lt_1m", "lt_1h", "lt_1d", "gte_1d")
+NO_TTL_DOMINANT_PCT = 90.0  # share of sampled keys without expiry that counts as dominant ...
+NO_TTL_MIN_KEYS = 20  # ... once at least this many keys with a known TTL were sampled
+HIT_RATE_WARN = 0.80  # keyspace_hits / (hits + misses) below this is a warning
+HIT_RATE_CRIT = 0.50  # ... and below this a critical
+HIT_RATE_MIN_LOOKUPS = 1000  # ignore the ratio on a barely used node
+
 _KEY_SEPARATORS = re.compile(r"([:/.])")
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 _HEX_ID = re.compile(r"[0-9a-fA-F]{8,}")
@@ -822,6 +840,80 @@ def normalize_key(key: Any) -> str:
     return "".join(out)
 
 
+def ttl_bucket(ttl_ms: Any) -> str | None:
+    """Histogram bucket of a PTTL reply; ``None`` for keys that vanished (-2) or could not be read."""
+    if not isinstance(ttl_ms, int) or ttl_ms == -2:
+        return None
+    if ttl_ms < 0:
+        return "no_ttl"
+    if ttl_ms < 60_000:
+        return "lt_1m"
+    if ttl_ms < 3_600_000:
+        return "lt_1h"
+    if ttl_ms < 86_400_000:
+        return "lt_1d"
+    return "gte_1d"
+
+
+def _empty_histogram() -> dict[str, int]:
+    return dict.fromkeys(TTL_BUCKETS, 0)
+
+
+def _add_histograms(into: dict[str, int], other: dict[str, int]) -> None:
+    for bucket in TTL_BUCKETS:
+        into[bucket] += other.get(bucket, 0)
+
+
+def _ttl_histograms(rows: list[dict]) -> dict[str, Any]:
+    """Overall and per-type TTL histograms from the PTTL values already fetched (no extra commands)."""
+    overall = _empty_histogram()
+    by_type: dict[str, dict[str, int]] = {}
+    for row in rows:
+        bucket = ttl_bucket(row["ttl_ms"])
+        if bucket is None:
+            continue
+        overall[bucket] += 1
+        by_type.setdefault(row["type"], _empty_histogram())[bucket] += 1
+    return {"overall": overall, "by_type": dict(sorted(by_type.items()))}
+
+
+def hit_rate(hits: Any, misses: Any) -> float | None:
+    """keyspace_hits / (hits + misses), or ``None`` without enough lookups to mean anything."""
+    total = _num(hits) + _num(misses)
+    if total < HIT_RATE_MIN_LOOKUPS:
+        return None
+    return round(_num(hits) / total, 4)
+
+
+def _ttl_findings(overall: dict[str, int], policy: str, rate: float | None) -> list[dict]:
+    """Findings from the sampled TTL mix (expiry-less keys under an eviction policy) and the hit rate."""
+    findings: list[dict] = []
+    known = sum(overall.values())
+    if policy and policy != "noeviction" and known >= NO_TTL_MIN_KEYS:
+        pct = 100 * overall["no_ttl"] / known
+        if pct >= NO_TTL_DOMINANT_PCT:
+            volatile = policy.startswith("volatile-")
+            findings.append(
+                _finding(
+                    "warning" if volatile else "info",
+                    f"{pct:.0f}% of sampled keys have no TTL on a cache with maxmemory-policy {policy}"
+                    + (
+                        ": volatile-* policies can only evict keys with an expiry, so memory will not be reclaimed"
+                        if volatile
+                        else ": nothing ages out, so eviction alone decides what stays"
+                    ),
+                )
+            )
+    if rate is not None and rate < HIT_RATE_WARN:
+        findings.append(
+            _finding(
+                "critical" if rate < HIT_RATE_CRIT else "warning",
+                f"keyspace hit rate is {rate:.0%} (INFO keyspace_hits/keyspace_misses), below {HIT_RATE_WARN:.0%}",
+            )
+        )
+    return findings
+
+
 def _prefix_entries(rows: list[dict], dbsize: int) -> list[dict]:
     """Aggregate sampled rows by normalised prefix; bytes and key counts are scaled up to ``dbsize``."""
     scale = dbsize / len(rows) if rows and dbsize > len(rows) else 1.0
@@ -829,8 +921,17 @@ def _prefix_entries(rows: list[dict], dbsize: int) -> list[dict]:
     for row in rows:
         entry = agg.setdefault(
             normalize_key(row["key"]),
-            {"sampled_keys": 0, "sampled_bytes": 0, "no_ttl_keys": 0, "types": Counter()},
+            {
+                "sampled_keys": 0,
+                "sampled_bytes": 0,
+                "no_ttl_keys": 0,
+                "types": Counter(),
+                "ttl_histogram": _empty_histogram(),
+            },
         )
+        bucket = ttl_bucket(row["ttl_ms"])
+        if bucket is not None:
+            entry["ttl_histogram"][bucket] += 1
         entry["sampled_keys"] += 1
         entry["sampled_bytes"] += row["bytes"] or 0
         entry["no_ttl_keys"] += 1 if row["ttl_ms"] == -1 else 0
@@ -843,6 +944,7 @@ def _prefix_entries(rows: list[dict], dbsize: int) -> list[dict]:
             "est_bytes": round(e["sampled_bytes"] * scale),
             "no_ttl_keys": e["no_ttl_keys"],
             "types": dict(e["types"]),
+            "ttl_histogram": e["ttl_histogram"],
         }
         for prefix, e in agg.items()
     ]
@@ -862,8 +964,10 @@ def _merge_prefix_entries(groups: list[list[dict]]) -> list[dict]:
                     "est_bytes": 0,
                     "no_ttl_keys": 0,
                     "types": {},
+                    "ttl_histogram": _empty_histogram(),
                 },
             )
+            _add_histograms(m["ttl_histogram"], e.get("ttl_histogram", {}))
             for field_name in ("sampled_keys", "est_keys", "est_bytes", "no_ttl_keys"):
                 m[field_name] += e[field_name]
             for t, n in e["types"].items():
@@ -889,6 +993,7 @@ def _prefix_report(
             "no_ttl_keys": e["no_ttl_keys"],
             "no_ttl_pct": round(100 * e["no_ttl_keys"] / e["sampled_keys"], 1) if e["sampled_keys"] else 0.0,
             "types": dict(sorted(e["types"].items())),
+            "ttl_histogram": e["ttl_histogram"],
         }
 
     rows = [view(e) for e in ranked]
@@ -941,7 +1046,7 @@ def keyspace_sample(
     started = clock()
     deadline = started + max_seconds
     partial_reason: str | None = None
-    mem_info = r.info("memory")
+    mem_info = r.info()  # default INFO carries memory, stats and cluster: one round trip for all three
     policy = str(mem_info.get("maxmemory_policy", ""))
     lfu = "lfu" in policy
     keys: list[str] = []
@@ -1003,6 +1108,9 @@ def keyspace_sample(
     maxmemory = _num(mem_info.get("maxmemory"))
     usage = round(_num(mem_info.get("used_memory")) / maxmemory, 4) if maxmemory else None
     prefix_report = _prefix_report(_prefix_entries(rows, dbsize), top_prefixes, policy, usage)
+    ttl_histogram = _ttl_histograms(rows)
+    rate = hit_rate(mem_info.get("keyspace_hits"), mem_info.get("keyspace_misses"))
+    prefix_report["findings"] += _ttl_findings(ttl_histogram["overall"], policy, rate)
     result: dict[str, Any] = {
         "sampled_keys": len(rows),
         "dbsize": dbsize,
@@ -1015,6 +1123,10 @@ def keyspace_sample(
         "maxmemory_policy": policy,
         "by_type": dict(by_type),
         "keys_without_ttl": no_ttl,
+        "ttl_histogram": ttl_histogram,
+        "keyspace_hits": int(_num(mem_info.get("keyspace_hits"))),
+        "keyspace_misses": int(_num(mem_info.get("keyspace_misses"))),
+        "keyspace_hit_rate": rate,
         "usage_of_maxmemory": usage,
         **prefix_report,
         "big_keys_by_bytes": sorted(rows, key=lambda x: x["bytes"] or 0, reverse=True)[:top],
@@ -1787,12 +1899,20 @@ def cluster_keyspace_sample(
     prefix_groups: list[list[dict]] = []
     prefix_total = 0
     usage: float | None = None
+    ttl_overall = _empty_histogram()
+    ttl_by_type: dict[str, dict[str, int]] = {}
+    hits = misses = 0
     for ep, o in outcomes.items():
         if o["status"] == "unreachable":
             per_shard[ep] = o
             continue
         d = o["data"]
         policy = policy or d["maxmemory_policy"]
+        _add_histograms(ttl_overall, d["ttl_histogram"]["overall"])
+        for t, hist in d["ttl_histogram"]["by_type"].items():
+            _add_histograms(ttl_by_type.setdefault(t, _empty_histogram()), hist)
+        hits += d["keyspace_hits"]
+        misses += d["keyspace_misses"]
         prefix_groups.append(d["prefixes"])
         prefix_total += d["prefixes_summary"]["est_bytes_total"]
         if d["usage_of_maxmemory"] is not None:
@@ -1819,6 +1939,8 @@ def cluster_keyspace_sample(
         findings += [_finding("warning", f) for f in topo["findings"]]
     prefix_report = _prefix_report(_merge_prefix_entries(prefix_groups), top_prefixes, policy, usage, prefix_total)
     findings += prefix_report.pop("findings")
+    rate = hit_rate(hits, misses)
+    findings += _ttl_findings(ttl_overall, policy, rate)
     counts = _shard_counts(outcomes)
     result: dict[str, Any] = {
         "cluster_enabled": True,
@@ -1831,6 +1953,8 @@ def cluster_keyspace_sample(
         "maxmemory_policy": policy,
         **totals,
         "by_type": dict(by_type),
+        "ttl_histogram": {"overall": ttl_overall, "by_type": dict(sorted(ttl_by_type.items()))},
+        "keyspace_hit_rate": rate,
         **prefix_report,
         "big_keys_by_bytes": sorted(merged["big_keys_by_bytes"], key=lambda x: x["bytes"] or 0, reverse=True)[:top],
         "big_keys_by_length": sorted(merged["big_keys_by_length"], key=lambda x: x["length"] or 0, reverse=True)[:top],
@@ -2081,6 +2205,203 @@ def acl_log(r: redis.Redis, count: int = 25) -> dict:
     }
 
 
+# ------------------------------------------------------------------------- pub/sub
+
+PUBSUB_PATTERNS_WARN = 100  # every PUBLISH is matched against each pattern subscription: O(patterns) per message
+PUBSUB_PATTERNS_CRIT = 1000
+PUBSUB_MAX_CHANNELS_COUNTED = 1000  # PUBSUB NUMSUB is asked for at most this many channels (100 per call)
+PUBSUB_OMEM_WARN_BYTES = 8 * 1024 * 1024  # a subscriber whose output buffer holds this much is falling behind
+PUBSUB_OMEM_CRIT_BYTES = 32 * 1024 * 1024  # default client-output-buffer-limit pubsub hard limit: close to a disconnect
+PUBSUB_TOP_CLIENTS = 5
+
+
+def _numsub(raw: Any) -> dict[str, int]:
+    """PUBSUB NUMSUB reply as ``{channel: subscribers}`` whether redis-py paired it or not."""
+    if isinstance(raw, dict):
+        pairs: Any = raw.items()
+    elif isinstance(raw, (list, tuple)) and raw and isinstance(raw[0], (list, tuple)):
+        pairs = raw
+    elif isinstance(raw, (list, tuple)):
+        pairs = zip(raw[0::2], raw[1::2], strict=False)
+    else:
+        return {}
+    return {str(_s(channel)): int(_num(count)) for channel, count in pairs}
+
+
+def _names(raw: Any) -> list[str]:
+    return [str(_s(c)) for c in raw] if isinstance(raw, (list, tuple)) else []
+
+
+def pubsub_report(r: redis.Redis, top: int = 10, pattern: str | None = None) -> dict:
+    """Pub/Sub pressure of the connected node: channels, pattern subscriptions and subscriber output buffers.
+
+    Uses PUBSUB CHANNELS, NUMSUB (batches of 100 channels, at most ``PUBSUB_MAX_CHANNELS_COUNTED``), NUMPAT,
+    SHARDCHANNELS and CLIENT LIST TYPE pubsub. Counts only: message payloads are never read.
+    """
+    top = max(1, min(int(top), 100))
+    channel_args = ("PUBSUB CHANNELS", pattern) if pattern else ("PUBSUB CHANNELS",)
+    raw_channels, channels_err = _try(r.execute_command, *channel_args)
+    channels = _names(raw_channels)
+    inspected = channels[:PUBSUB_MAX_CHANNELS_COUNTED]
+    subscribers: dict[str, int] = {}
+    for i in range(0, len(inspected), MAX_PUBSUB_NUMSUB_CHANNELS):
+        raw, _ = _try(r.execute_command, "PUBSUB NUMSUB", *inspected[i : i + MAX_PUBSUB_NUMSUB_CHANNELS])
+        subscribers.update(_numsub(raw))
+    numpat, numpat_err = _try(r.execute_command, "PUBSUB NUMPAT")
+    patterns = int(_num(numpat))
+    raw_shard, shard_err = _try(r.execute_command, "PUBSUB SHARDCHANNELS", *((pattern,) if pattern else ()))
+    shard_channels = _names(raw_shard)
+    raw_clients, clients_err = _try(r.client_list, _type="pubsub")
+    clients = raw_clients if isinstance(raw_clients, list) else []
+
+    notes = [
+        f"{what}: unavailable ({err})"
+        for what, err in (
+            ("PUBSUB CHANNELS", channels_err),
+            ("PUBSUB NUMPAT", numpat_err),
+            ("CLIENT LIST TYPE pubsub", clients_err),
+        )
+        if err
+    ]
+    if shard_err:
+        notes.append(f"PUBSUB SHARDCHANNELS: unavailable ({shard_err}); needs Redis OSS 7.0+ or Valkey")
+    if len(channels) > len(inspected):
+        notes.append(
+            f"subscriber counts cover the first {len(inspected)} of {len(channels)} channels; narrow with `pattern`"
+        )
+
+    findings: list[dict] = []
+    if patterns >= PUBSUB_PATTERNS_WARN:
+        findings.append(
+            _finding(
+                "critical" if patterns >= PUBSUB_PATTERNS_CRIT else "warning",
+                f"{patterns} pattern subscriptions (PSUBSCRIBE): each published message is matched against all of "
+                "them, which costs CPU on the main thread",
+                pattern_subscriptions=patterns,
+            )
+        )
+
+    def omem(c: dict) -> int:
+        return int(_num(c.get("omem")))
+
+    heavy = sorted((c for c in clients if omem(c) >= PUBSUB_OMEM_WARN_BYTES), key=omem, reverse=True)
+    for c in heavy[:PUBSUB_TOP_CLIENTS]:
+        findings.append(
+            _finding(
+                "critical" if omem(c) >= PUBSUB_OMEM_CRIT_BYTES else "warning",
+                f"pubsub client id={c.get('id')} ({c.get('addr')}, name={c.get('name') or '-'}) holds {omem(c)} bytes "
+                "of output buffer: a slow subscriber that the server will disconnect at its output buffer limit",
+                client_id=c.get("id"),
+            )
+        )
+    if len(heavy) > PUBSUB_TOP_CLIENTS:
+        findings.append(
+            _finding(
+                "warning", f"{len(heavy) - PUBSUB_TOP_CLIENTS} more pubsub clients above the output buffer warning"
+            )
+        )
+    idle_subscribers = sum(1 for c in clients if _num(c.get("idle")) > 3600)
+    if idle_subscribers >= IDLE_CLIENTS_WARN:
+        findings.append(
+            _finding(
+                "info",
+                f"{idle_subscribers} pubsub clients have received nothing for over an hour "
+                "(abandoned subscribers keep their buffers and channel state)",
+            )
+        )
+
+    top_channels = sorted(subscribers.items(), key=lambda kv: (-kv[1], kv[0]))[:top]
+    return {
+        "channels": len(channels),
+        "channels_with_subscriber_counts": len(subscribers),
+        "pattern_subscriptions": patterns,
+        "shard_channels": len(shard_channels) if raw_shard is not None else None,
+        "pubsub_clients": len(clients),
+        "top_channels_by_subscribers": [{"channel": name, "subscribers": n} for name, n in top_channels],
+        "top_pubsub_clients_by_output_buffer": [
+            {k: c.get(k) for k in ("id", "addr", "name", "user", "idle", "omem", "sub", "psub", "ssub")}
+            for c in sorted(clients, key=omem, reverse=True)[:PUBSUB_TOP_CLIENTS]
+        ],
+        "findings": _sorted_findings(findings),
+        **({"notes": notes} if notes else {}),
+    }
+
+
+def cluster_pubsub(
+    r: redis.Redis,
+    client_factory: ClientFactory,
+    top: int = 10,
+    pattern: str | None = None,
+    max_workers: int = 8,
+    per_node_timeout: float = 5.0,
+    max_seconds: float = 10.0,
+) -> dict:
+    """``pubsub_report`` on the connected node, or on every shard primary when cluster mode is on.
+
+    Cluster mode sums channel and pattern counts and subscribers per channel across the primaries,
+    labels findings with their shard and reports a dead shard as a finding. Subscribers attached
+    to replicas are not visible from here; connect to a replica to inspect it.
+    """
+    top = max(1, min(int(top), 100))
+    started = time.monotonic()
+    topo, outcomes = _fan_out_primaries(
+        r,
+        client_factory,
+        lambda client, budget, shards: pubsub_report(client, 100, pattern),
+        max_workers,
+        max_seconds,
+        per_node_timeout,
+    )
+    if not outcomes:
+        if topo.get("cluster_enabled") is False:
+            return {**pubsub_report(r, top, pattern), "cluster_enabled": False, "note": "cluster mode disabled"}
+        return topo
+    findings = _unreachable_findings(outcomes)
+    per_shard: dict[str, dict] = {}
+    merged: Counter[str] = Counter()
+    channels = patterns = pubsub_clients = shard_channels = 0
+    for ep, o in outcomes.items():
+        if o["status"] == "unreachable":
+            per_shard[ep] = o
+            continue
+        d = o["data"]
+        channels += d["channels"]
+        patterns += d["pattern_subscriptions"]
+        pubsub_clients += d["pubsub_clients"]
+        shard_channels += d["shard_channels"] or 0
+        for row in d["top_channels_by_subscribers"]:
+            merged[row["channel"]] += row["subscribers"]
+        findings += [{**f, "shard": ep} for f in d["findings"]]
+        per_shard[ep] = {
+            "status": o["status"],
+            "channels": d["channels"],
+            "pattern_subscriptions": d["pattern_subscriptions"],
+            "pubsub_clients": d["pubsub_clients"],
+            **({"notes": d["notes"]} if d.get("notes") else {}),
+        }
+    findings += _skew_findings(
+        {ep: float(s["pattern_subscriptions"]) for ep, s in per_shard.items() if "pattern_subscriptions" in s},
+        "pattern subscriptions",
+    )
+    counts = _shard_counts(outcomes)
+    top_channels = sorted(merged.items(), key=lambda kv: (-kv[1], kv[0]))[:top]
+    return {
+        "cluster_enabled": True,
+        "scope": "all shard primaries (subscribers on replicas are not included)",
+        **counts,
+        "partial": counts["shards_total"] != counts["shards_ok"],
+        "partial_nodes": _partial_nodes(outcomes),
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "channels": channels,
+        "pattern_subscriptions": patterns,
+        "shard_channels": shard_channels,
+        "pubsub_clients": pubsub_clients,
+        "top_channels_by_subscribers": [{"channel": name, "subscribers": n} for name, n in top_channels],
+        "per_shard": per_shard,
+        "findings": _sorted_findings(findings),
+    }
+
+
 # ------------------------------------------------------------------------- triage
 
 TRIAGE_MAX_FINDINGS = 30
@@ -2264,4 +2585,109 @@ def triage(
         "findings_total": total,
         **({"findings_omitted": total - TRIAGE_MAX_FINDINGS} if total > TRIAGE_MAX_FINDINGS else {}),
         "sections": sections,
+    }
+
+
+# ------------------------------------------------------------- cluster-wide triage
+
+CLUSTER_TRIAGE_MAX_FINDINGS = 40
+
+
+def _node_triage_work(client: redis.Redis, budget: float, shards: int) -> dict:
+    """One shard's on-call snapshot: the regular triage sections plus the pub/sub section."""
+    snapshot = triage(client, None)
+    pubsub = pubsub_report(client, 5)
+    return {"triage": snapshot, "pubsub": pubsub}
+
+
+def cluster_triage(
+    r: redis.Redis,
+    client_factory: ClientFactory,
+    max_workers: int = 8,
+    per_node_timeout: float = 5.0,
+    max_seconds: float = 20.0,
+    serverless: bool = False,
+) -> dict:
+    """``triage`` (plus pub/sub pressure) on every shard primary with one ranked, deduplicated finding list.
+
+    The shards share one wall-clock budget (``max_seconds``, split by worker waves) and a dead or stuck shard
+    becomes a critical finding instead of failing the call. Findings carry ``node`` and ``shard``; identical
+    findings from several nodes are merged into one that lists them in ``nodes``. Worst nodes (most critical, then
+    warning findings) come first, and the list is capped at ``CLUSTER_TRIAGE_MAX_FINDINGS``.
+    """
+    started = time.monotonic()
+    topo, outcomes = _fan_out_primaries(
+        r, client_factory, _node_triage_work, max_workers, max_seconds, per_node_timeout
+    )
+    if not outcomes:
+        if topo.get("cluster_enabled") is False:
+            return {**triage(r, client_factory, serverless), "cluster_enabled": False, "note": "cluster mode disabled"}
+        return topo
+    shard_names = {s["primary"]: f"shard-{i + 1}" for i, s in enumerate(topo.get("shards", []))}
+    per_node: dict[str, dict] = {}
+    raw: list[dict] = []
+    for ep, o in outcomes.items():
+        shard = shard_names.get(ep, "?")
+        if o["status"] == "unreachable":
+            per_node[ep] = {"status": "unreachable", "shard": shard, "error": o["error"]}
+            raw.append(
+                {
+                    **_finding("critical", f"node {ep} unreachable: {o['error']}", section="cluster"),
+                    "node": ep,
+                    "shard": shard,
+                }
+            )
+            continue
+        data = o["data"]
+        snapshot, pubsub = data["triage"], data["pubsub"]
+        found = [{**f, "node": ep} for f in snapshot["findings"] if f.get("section") != "triage"]
+        found += [{**f, "section": "pubsub", "node": ep} for f in pubsub["findings"]]
+        raw += [{**f, "shard": shard} for f in found]
+        per_node[ep] = {
+            "status": snapshot["status"],
+            "shard": shard,
+            "findings": len(found),
+            "sections": {name: s["status"] for name, s in snapshot["sections"].items()},
+        }
+
+    def severity_rank(f: dict) -> int:
+        return _SEVERITY_RANK.get(f["severity"], 3)
+
+    tally: dict[str, tuple[int, int]] = {}
+    for ep in per_node:
+        mine = [f for f in raw if f["node"] == ep]
+        tally[ep] = (sum(f["severity"] == "critical" for f in mine), sum(f["severity"] == "warning" for f in mine))
+    node_order = sorted(per_node, key=lambda ep: (-tally[ep][0], -tally[ep][1], ep))
+    rank = {ep: i for i, ep in enumerate(node_order)}
+    for ep in node_order:
+        per_node[ep]["critical"], per_node[ep]["warning"] = tally[ep]
+
+    merged: dict[tuple[str, str, str], dict] = {}
+    for f in sorted(raw, key=lambda f: (severity_rank(f), rank[f["node"]])):
+        key = (f["severity"], f["message"], f.get("section", ""))
+        if key in merged:
+            merged[key]["nodes"].append(f["node"])
+            merged[key]["shards"].append(f["shard"])
+        else:
+            merged[key] = {**f, "nodes": [f["node"]], "shards": [f["shard"]]}
+    findings = list(merged.values())
+    for f in findings:
+        f["count"] = len(f["nodes"])
+    total = len(findings)
+    counts = _shard_counts(outcomes)
+    if not findings:
+        findings = [_finding("info", "no issues detected on any shard primary", section="cluster")]
+    return {
+        "cluster_enabled": True,
+        "scope": "all shard primaries",
+        **counts,
+        "partial": counts["shards_total"] != counts["shards_ok"]
+        or any(n["status"] not in ("ok", "unreachable") for n in per_node.values()),
+        "partial_nodes": _partial_nodes(outcomes),
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "worst_node": node_order[0] if node_order and tally[node_order[0]] != (0, 0) else None,
+        "findings": findings[:CLUSTER_TRIAGE_MAX_FINDINGS],
+        "findings_total": total,
+        **({"findings_omitted": total - CLUSTER_TRIAGE_MAX_FINDINGS} if total > CLUSTER_TRIAGE_MAX_FINDINGS else {}),
+        "per_node": {ep: per_node[ep] for ep in node_order},
     }

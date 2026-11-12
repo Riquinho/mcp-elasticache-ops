@@ -3,6 +3,21 @@
 ## Unreleased
 
 ### Added
+- Round 11: `node_pubsub` (`PUBSUB CHANNELS`/`NUMSUB`/`NUMPAT`/`SHARDCHANNELS` added to the `SafeRedis` allowlist with
+  bounds: one glob of at most 128 chars, at most 100 channels per `NUMSUB`) reports channel and pattern-subscription
+  counts, top channels by subscribers and findings for many patterns, large pubsub output buffers and idle
+  subscribers, aggregated across shards in cluster mode. `node_clients` flags clients idle over an hour.
+- Round 11: `node_keyspace_sample` / `node_cluster_keyspace_sample` return a TTL histogram (no TTL, < 1m, < 1h, < 1d,
+  >= 1d) per prefix and per type plus the keyspace hit rate, from the existing sample and `INFO` reply (no extra
+  round trips); findings for no-TTL dominance under an eviction policy and for a low hit rate.
+- Round 11: `aws_maintenance` (`DescribeUpdateActions`, `DescribeServiceUpdates`, `DescribeCacheClusters`, no new IAM
+  actions) flags overdue required updates, maintenance windows overlapping the snapshot window and end-of-life
+  engines, with region fan-out like `aws_alarms`.
+- Round 11: `node_cluster_triage` fans `node_triage` plus pub/sub out over every shard primary under one shared
+  deadline, with per-node error isolation and one ranked, deduplicated findings list naming node and shard. Tool count
+  is now 45.
+- Round 11: `scripts/integration.ps1`, a disk-gated integration run (>= 5G free) that always ends with `down -v`,
+  `image prune -f` and fstrim (never `prune -a`).
 - Round 09: optional `region` argument on every `aws_*` tool (validated against a region pattern) and
   `ELASTICACHE_REGIONS` fan-out for `aws_replication_groups` / `aws_triage`; global datastore findings
   (`GlobalDatastoreReplicationLag`, secondary node type / engine version mismatch, member status); sustained-vs-spike

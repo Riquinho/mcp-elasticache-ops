@@ -408,6 +408,35 @@ def node_cluster_memory(
 
 
 @read_tool
+def node_pubsub(
+    top: Annotated[int, Field(ge=1, le=100, description="Channels to list by subscriber count")] = 10,
+    pattern: Annotated[str | None, Field(max_length=128, description="PUBSUB CHANNELS glob filter")] = None,
+    max_workers: Annotated[int, Field(ge=1, le=32, description="Concurrent shard probes (cluster mode)")] = 8,
+    per_node_timeout: Annotated[float, Field(gt=0, le=60, description="Seconds to wait per node")] = 5.0,
+) -> dict:
+    """Pub/Sub pressure from PUBSUB CHANNELS/NUMSUB/NUMPAT/SHARDCHANNELS and CLIENT LIST TYPE pubsub: channel
+    and pattern-subscription counts, top channels by subscribers, subscribers with large output buffers.
+    Counts only, never messages. Cluster mode aggregates every shard primary and labels findings by shard."""
+    return dataplane.cluster_pubsub(redis_client(), _node_client, top, pattern, max_workers, per_node_timeout)
+
+
+@read_tool
+def node_cluster_triage(
+    max_workers: Annotated[int, Field(ge=1, le=32, description="Concurrent shard probes")] = 8,
+    per_node_timeout: Annotated[float, Field(gt=0, le=60, description="Extra seconds to wait for a stuck shard")] = 5.0,
+    max_seconds: Annotated[
+        float, Field(gt=0, le=60, description="Total wall-clock budget, split across shards")
+    ] = 20.0,
+) -> dict:
+    """node_triage plus pub/sub pressure on every shard primary under one shared deadline: one ranked, deduplicated
+    findings list naming node and shard, worst node first (max 40). A dead shard is a critical finding, never
+    fatal. Use it first on a cluster-mode group instead of calling each node."""
+    return dataplane.cluster_triage(
+        redis_client(), _node_client, max_workers, per_node_timeout, max_seconds, _serverless()
+    )
+
+
+@read_tool
 def memcached_stats(
     group: Annotated[
         Literal["", "settings", "slabs", "items", "conns"], Field(description="stats group; empty for general")
@@ -654,6 +683,21 @@ def aws_alarms(
     if replication_group_id:
         return _cp(region).alarms(replication_group_id)
     return control_plane().alarms_fan_out(None, region)
+
+
+@read_tool
+def aws_maintenance(
+    replication_group_id: Annotated[
+        str | None,
+        Field(description="Limit to one replication group; omit to check every cluster of every configured region"),
+    ] = None,
+    region: Region = None,
+) -> dict:
+    """Maintenance urgency (DescribeUpdateActions, ServiceUpdates, CacheClusters; read-only). Findings first:
+    required updates past their apply-by date, maintenance windows overlapping the snapshot window, end-of-life
+    engines. partial=true if a Describe call is denied. Without a group id it covers every region in
+    ELASTICACHE_REGIONS (findings carry `region`, failures in region_errors)."""
+    return control_plane().maintenance_fan_out(replication_group_id, region)
 
 
 @read_tool

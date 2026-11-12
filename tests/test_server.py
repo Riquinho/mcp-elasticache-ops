@@ -32,7 +32,7 @@ async def test_all_tools_read_only():
     async with Client(server.mcp) as c:
         tools = await c.list_tools()
     names = {t.name for t in tools}
-    assert len(tools) == 42
+    assert len(tools) == 45
     assert {
         "node_health",
         "node_info",
@@ -73,6 +73,7 @@ async def test_all_tools_read_only():
     } <= names  # round 03
     assert {"node_triage", "aws_alarms", "memcached_cluster_stats"} <= names  # round 04
     assert {"aws_engine_versions", "aws_parameter_groups"} <= names  # round 06
+    assert {"node_pubsub", "node_cluster_triage", "aws_maintenance"} <= names  # round 11
     for t in tools:
         assert t.annotations.read_only_hint is True, t.name
         assert t.annotations.destructive_hint is False, t.name
@@ -117,7 +118,7 @@ async def test_node_config_end_to_end(env):
 
 async def test_every_registered_tool_is_wrapped_with_the_output_cap():
     tools = await server.mcp.list_tools()
-    assert len(tools) == 42
+    assert len(tools) == 45
     unwrapped = [t.name for t in tools if not getattr(t.fn, "__capped__", False)]
     assert unwrapped == []
 
@@ -338,7 +339,7 @@ async def test_oncall_prompts_are_registered_and_do_not_change_the_tool_count():
     assert {p.name for p in prompts} == RUNBOOKS
     async with Client(server.mcp) as c:
         assert {p.name for p in await c.list_prompts()} == RUNBOOKS
-        assert len(await c.list_tools()) == 42  # prompts are not tools
+        assert len(await c.list_tools()) == 45  # prompts are not tools
 
 
 @pytest.mark.parametrize("name", sorted(RUNBOOKS))
@@ -370,6 +371,10 @@ async def test_oncall_high_cpu_runs_the_documented_sequence():
 AUDIT_CALLS: list[tuple[str, dict]] = [
     ("node_health", {}),
     ("node_triage", {}),
+    ("node_cluster_triage", {}),
+    ("node_pubsub", {}),
+    ("aws_maintenance", {}),
+    ("aws_maintenance", {"replication_group_id": "audit-rg"}),
     ("node_info", {}),
     ("node_memory", {}),
     ("node_config", {}),
@@ -477,5 +482,9 @@ async def test_every_tool_only_issues_read_operations(audit):
     assert audit.redis.violations == []
     assert audit.redis.commands, "no Redis command was recorded at all"
     assert set(audit.redis.commands) <= READ_ONLY_COMMANDS
+    assert {"PUBSUB CHANNELS", "PUBSUB NUMSUB", "PUBSUB NUMPAT"} <= set(audit.redis.commands)
+    assert {"DescribeUpdateActions", "DescribeServiceUpdates", "DescribeCacheClusters"} <= {
+        op for _, op in audit.aws.operations
+    }
     assert audit.memcached, "no memcached command was recorded at all"
     assert set(audit.memcached) <= memcached.ALLOWED_COMMANDS

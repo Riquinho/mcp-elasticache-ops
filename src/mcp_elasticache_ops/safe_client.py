@@ -14,7 +14,7 @@ import redis
 from redis.client import Pipeline
 
 # Commands that carry a subcommand we must inspect.
-_CONTAINERS = {"ACL", "CLIENT", "CLUSTER", "COMMAND", "CONFIG", "LATENCY", "MEMORY", "OBJECT", "SLOWLOG"}
+_CONTAINERS = {"ACL", "CLIENT", "CLUSTER", "COMMAND", "CONFIG", "LATENCY", "MEMORY", "OBJECT", "PUBSUB", "SLOWLOG"}
 
 READ_ONLY_COMMANDS: frozenset[str] = frozenset(
     {
@@ -49,6 +49,11 @@ READ_ONLY_COMMANDS: frozenset[str] = frozenset(
         "CLUSTER NODES",
         "CLUSTER MYID",
         "CONFIG GET",
+        # pub/sub introspection: counts only, never message payloads
+        "PUBSUB CHANNELS",
+        "PUBSUB NUMSUB",
+        "PUBSUB NUMPAT",
+        "PUBSUB SHARDCHANNELS",
         "COMMAND COUNT",
         "COMMAND DOCS",
         # keyspace sampling (metadata only, never values)
@@ -183,6 +188,8 @@ MAX_SCAN_COUNT = 1000
 MAX_MEMORY_USAGE_SAMPLES = 100
 MAX_CLIENT_LIST_IDS = 100
 MAX_ACL_LOG_COUNT = 128
+MAX_PUBSUB_PATTERN_LEN = 128
+MAX_PUBSUB_NUMSUB_CHANNELS = 100
 
 _CLIENT_LIST_TYPES = frozenset({"NORMAL", "MASTER", "REPLICA", "SLAVE", "PUBSUB"})
 _SCAN_OPTIONS = frozenset({"MATCH", "COUNT", "TYPE"})
@@ -258,6 +265,24 @@ def _check_client_list(rest: tuple) -> None:
         raise ReadOnlyViolation("CLIENT LIST only accepts TYPE <type> or ID <id> [id ...]")
 
 
+def _check_pubsub(sub: str, rest: tuple) -> None:
+    if sub in ("CHANNELS", "SHARDCHANNELS"):
+        if len(rest) > 1:
+            raise ReadOnlyViolation(f"PUBSUB {sub} takes at most one pattern")
+        if rest:
+            pattern = _text(rest[0], f"PUBSUB {sub} pattern")
+            if len(pattern) > MAX_PUBSUB_PATTERN_LEN:
+                raise ReadOnlyViolation(f"PUBSUB {sub} pattern is capped at {MAX_PUBSUB_PATTERN_LEN} characters")
+    elif sub == "NUMSUB":
+        if len(rest) > MAX_PUBSUB_NUMSUB_CHANNELS:
+            raise ReadOnlyViolation(f"PUBSUB NUMSUB accepts at most {MAX_PUBSUB_NUMSUB_CHANNELS} channels")
+        for channel in rest:
+            if len(_text(channel, "PUBSUB NUMSUB channel")) > MAX_PUBSUB_PATTERN_LEN:
+                raise ReadOnlyViolation(f"PUBSUB NUMSUB channel is capped at {MAX_PUBSUB_PATTERN_LEN} characters")
+    elif rest:  # NUMPAT
+        raise ReadOnlyViolation("PUBSUB NUMPAT takes no arguments")
+
+
 def _check_single_key(key: str, rest: tuple) -> None:
     if len(rest) > 1:
         raise ReadOnlyViolation(f"{key} takes a single key")
@@ -282,6 +307,8 @@ def check(args: tuple) -> None:
         _check_client_list(rest)
     elif key == "COMMAND DOCS" and not rest:
         raise ReadOnlyViolation("COMMAND DOCS needs at least one command name (the full dump is large)")
+    elif name == "PUBSUB":
+        _check_pubsub(sub, rest)
     elif key.startswith("OBJECT "):
         _check_single_key(key, rest)
 
@@ -299,7 +326,7 @@ FORBIDDEN_COMMANDS: frozenset[str] = frozenset(
         "CLIENT PAUSE", "CLIENT UNPAUSE", "CLIENT REPLY", "CLIENT TRACKING", "DEBUG", "EVAL", "EVALSHA",
         "FCALL", "SCRIPT", "SCRIPT LOAD", "SCRIPT FLUSH", "FUNCTION", "ACL", "ACL LIST", "ACL GETUSER",
         "ACL SETUSER", "ACL DELUSER", "ACL LOG RESET", "MONITOR", "SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE",
-                "PUBLISH", "XREAD", "XREADGROUP",
+                "PUBLISH", "PUBSUB", "PUBSUB HELP", "PUBSUB SHARDNUMSUB", "XREAD", "XREADGROUP",
         "XRANGE", "MULTI", "EXEC", "WATCH", "SHUTDOWN", "SLAVEOF", "REPLICAOF", "FAILOVER", "SAVE", "BGSAVE",
         "BGREWRITEAOF", "SLOWLOG RESET", "CLUSTER FAILOVER", "CLUSTER RESET", "MIGRATE", "RESTORE", "DUMP",
         "MODULE LOAD", "SYNC", "PSYNC", "SORT", "OBJECT HELP", "MEMORY PURGE", "LATENCY RESET", "AUTH", "HELLO",

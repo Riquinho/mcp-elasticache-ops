@@ -501,3 +501,46 @@ def test_info_errorstats_and_latencystats_sections_are_allowed(section):
     check(("INFO", section))
     check((b"INFO", section.encode()))
     assert command_key(("INFO", section)) == "INFO"
+
+
+# ------------------------------------------------------------------ round 11: PUBSUB introspection
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("PUBSUB CHANNELS",),
+        ("PUBSUB", "CHANNELS", "news.*"),
+        ("PUBSUB SHARDCHANNELS", "orders:*"),
+        ("PUBSUB NUMSUB",),
+        ("PUBSUB NUMSUB", "a", "b"),
+        ("PUBSUB", "numpat"),
+    ],
+)
+def test_pubsub_introspection_is_allowed(args):
+    check(args)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("PUBSUB",),
+        ("PUBSUB HELP",),
+        ("PUBSUB SHARDNUMSUB", "a"),
+        ("PUBSUB CHANNELS", "a*", "b*"),
+        ("PUBSUB CHANNELS", "x" * 129),
+        ("PUBSUB NUMSUB", *[f"c{i}" for i in range(101)]),
+        ("PUBSUB NUMSUB", "x" * 129),
+        ("PUBSUB NUMPAT", "extra"),
+        ("PUBLISH", "chan", "msg"),
+        ("SUBSCRIBE", "chan"),
+        ("PSUBSCRIBE", "chan*"),
+    ],
+)
+def test_pubsub_unbounded_or_writing_forms_are_blocked(args):
+    with pytest.raises(ReadOnlyViolation):
+        check(args)
+
+
+def test_pubsub_numsub_accepts_exactly_the_bound():
+    check(("PUBSUB NUMSUB", *[f"c{i}" for i in range(100)]))

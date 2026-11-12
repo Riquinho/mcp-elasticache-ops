@@ -1441,3 +1441,217 @@ def test_triage_includes_errorstats_findings():
     infos = _stats_infos(errorstats={"errorstat_OOM": {"count": 7}})
     out = dataplane.triage(FakeRedis(infos=infos), None)
     assert any(f["section"] == "commandstats" and "OOM" in f["message"] for f in out["findings"])
+
+
+# ------------------------------------------------------------------ round 11: pub/sub, TTL histogram, cluster triage
+
+
+def _pubsub_fake(channels=None, patterns=0, clients=None, shard=None, infos=None):
+    fake = FakeRedis(infos=infos or {"memory": _mem_info()})
+    names = channels or {}
+    fake.commands["PUBSUB CHANNELS"] = [c.encode() for c in names]
+    fake.commands["PUBSUB NUMPAT"] = patterns
+    fake.commands["PUBSUB SHARDCHANNELS"] = shard or []
+    fake.clients = clients or []
+    keys = list(names)
+    for i in range(0, len(keys), 100):
+        batch = keys[i : i + 100]
+        fake.commands["PUBSUB NUMSUB " + " ".join(batch)] = [x for c in batch for x in (c.encode(), names[c])]
+    return fake
+
+
+def _psub_client(cid, omem=0, idle=0):
+    return {
+        "id": str(cid),
+        "addr": f"10.0.0.{cid}:5000",
+        "name": "",
+        "user": "default",
+        "idle": str(idle),
+        "omem": str(omem),
+        "sub": "1",
+        "psub": "0",
+        "ssub": "0",
+        "flags": "P",
+        "type": "pubsub",
+    }
+
+
+def test_pubsub_report_counts_top_channels_and_flags_pressure():
+    fake = _pubsub_fake(
+        channels={"a": 5, "b": 50, "c": 1},
+        patterns=150,
+        clients=[_psub_client(1, omem=40 * 1024 * 1024), _psub_client(2, omem=9 * 1024 * 1024), _psub_client(3)]
+        + [_psub_client(10 + i, idle=7200) for i in range(20)],
+        shard=["s1"],
+    )
+    out = dataplane.pubsub_report(fake, top=2)
+    assert out["channels"] == 3 and out["pattern_subscriptions"] == 150 and out["shard_channels"] == 1
+    assert out["top_channels_by_subscribers"] == [
+        {"channel": "b", "subscribers": 50},
+        {"channel": "a", "subscribers": 5},
+    ]
+    msgs = {(f["severity"], f["message"]) for f in out["findings"]}
+    assert any(s == "warning" and "150 pattern subscriptions" in m for s, m in msgs)
+    assert any(s == "critical" and "id=1" in m for s, m in msgs)
+    assert any(s == "warning" and "id=2" in m for s, m in msgs)
+    assert any(s == "info" and "20 pubsub clients" in m for s, m in msgs)
+    assert out["findings"][0]["severity"] == "critical"
+
+
+def test_pubsub_report_critical_patterns_and_quiet_node():
+    assert dataplane.pubsub_report(_pubsub_fake(patterns=2000))["findings"][0]["severity"] == "critical"
+    quiet = dataplane.pubsub_report(_pubsub_fake(channels={"a": 1}, patterns=1))
+    assert quiet["findings"] == [] and "notes" not in quiet
+
+
+def test_pubsub_report_degrades_when_commands_are_unavailable():
+    fake = FakeRedis(infos={"memory": _mem_info()})  # every PUBSUB command is an unknown command
+    out = dataplane.pubsub_report(fake)
+    assert out["channels"] == 0 and out["pattern_subscriptions"] == 0 and out["shard_channels"] is None
+    assert any("PUBSUB CHANNELS: unavailable" in n for n in out["notes"])
+
+
+def test_pubsub_report_batches_numsub_in_calls_of_100():
+    names = {f"c{i:03d}": i for i in range(150)}
+    out = dataplane.pubsub_report(_pubsub_fake(channels=names), top=3)
+    assert out["channels_with_subscriber_counts"] == 150
+    assert out["top_channels_by_subscribers"][0] == {"channel": "c149", "subscribers": 149}
+
+
+def test_cluster_pubsub_sums_shards_and_labels_findings():
+    clients = {
+        "10.0.0.1:6379": _pubsub_fake(channels={"a": 2}, patterns=120),
+        "10.0.0.2:6379": _pubsub_fake(channels={"a": 3, "b": 1}, patterns=0),
+        "10.0.0.3:6379": redis.ConnectionError("refused"),
+    }
+    factory, opened = _fan_factory(clients)
+    out = dataplane.cluster_pubsub(_seed(), factory, top=5)
+    assert out["cluster_enabled"] is True and out["partial"] is True
+    assert (out["shards_ok"], out["shards_unreachable"]) == (2, 1)
+    assert out["channels"] == 3 and out["pattern_subscriptions"] == 120
+    assert out["top_channels_by_subscribers"][0] == {"channel": "a", "subscribers": 5}
+    labelled = [f for f in out["findings"] if "pattern subscriptions" in f["message"]]
+    assert labelled and labelled[0]["shard"] == "10.0.0.1:6379"
+    assert out["findings"][0]["severity"] == "critical"  # the dead shard
+    assert all(c.closed for c in opened)
+
+
+def test_cluster_pubsub_on_a_standalone_node_reports_that_node():
+    seed = _pubsub_fake(channels={"a": 1})
+    seed.infos["cluster"] = {"cluster_enabled": 0}
+    out = dataplane.cluster_pubsub(seed, lambda h, p: seed)
+    assert out["cluster_enabled"] is False and out["channels"] == 1
+
+
+def _ttl_fake(rows, hits=0, misses=0, policy="allkeys-lru"):
+    data = {f"u:{i}:s": ("string", 10, pttl, 1) for i, pttl in enumerate(rows)}
+    infos = {"memory": _mem_info(maxmemory_policy=policy), "stats": {"keyspace_hits": hits, "keyspace_misses": misses}}
+    return FakeRedis(infos=infos, data=data, scan_batch=1000)
+
+
+def test_keyspace_sample_ttl_histogram_buckets():
+    rows = [-1] * 3 + [30_000, 30_000, 7_200_000, 3_600_000 * 24 * 3]
+    out = dataplane.keyspace_sample(_ttl_fake(rows), sample_size=100)
+    hist = out["ttl_histogram"]
+    overall = hist["overall"]
+    assert overall["no_ttl"] == 3 and overall["lt_1m"] == 2 and overall["lt_1d"] == 1 and overall["gte_1d"] == 1
+    assert sum(overall.values()) == len(rows)
+
+
+def test_keyspace_sample_call_count_unchanged_by_ttl_histogram():
+    fake = _ttl_fake([-1] * 40)
+    dataplane.keyspace_sample(fake, sample_size=100)
+    assert fake.scan_calls == 1  # the histogram reuses the PTTL already in the pipeline
+    assert fake.pipeline_runs == 2  # types/TTL/size pipeline and the element-count pipeline, as before
+
+
+def test_keyspace_sample_flags_no_ttl_dominance_and_low_hit_rate():
+    out = dataplane.keyspace_sample(_ttl_fake([-1] * 30, hits=200, misses=1800, policy="volatile-lru"), sample_size=100)
+    msgs = [(f["severity"], f["message"]) for f in out["findings"]]
+    assert any(s == "warning" and "TTL" in m for s, m in msgs)
+    assert any(s == "critical" and "hit rate" in m for s, m in msgs)
+    assert out["keyspace_hit_rate"] == pytest.approx(0.1)
+
+
+def test_keyspace_sample_quiet_for_healthy_ttl_mix_and_hit_rate():
+    out = dataplane.keyspace_sample(_ttl_fake([-1] * 5 + [30_000] * 25, hits=9500, misses=500), sample_size=100)
+    assert not any("hit rate" in f["message"] or "without a TTL" in f["message"] for f in out["findings"])
+    tiny = dataplane.keyspace_sample(_ttl_fake([-1] * 30, hits=1, misses=9), sample_size=100)
+    assert not any("hit rate" in f["message"] for f in tiny["findings"])  # too few lookups
+
+
+def test_client_list_flags_clients_idle_over_an_hour():
+    fake = FakeRedis(infos={"clients": {"connected_clients": 25}})
+    fake.clients = [
+        {
+            "id": str(i),
+            "addr": f"10.0.0.{i}:1",
+            "name": "",
+            "user": "default",
+            "idle": "9000",
+            "cmd": "get",
+            "omem": "0",
+            "qbuf": "0",
+            "age": "9000",
+        }
+        for i in range(25)
+    ]
+    out = dataplane.client_list(fake)
+    assert any("idle" in f["message"] for f in out["findings"])
+
+
+def _triage_node(**mem):
+    info = {
+        "memory": _mem_info(**mem),
+        "clients": {"connected_clients": 1},
+        "stats": {},
+        "commandstats": {},
+        "replication": {"role": "master", "connected_slaves": 1},
+    }
+    return _pubsub_fake(infos=info)
+
+
+def test_cluster_triage_ranks_worst_node_first_and_isolates_a_dead_shard():
+    clients = {
+        "10.0.0.1:6379": _triage_node(),
+        "10.0.0.2:6379": _triage_node(used_memory=980, maxmemory=1000),
+        "10.0.0.3:6379": redis.ConnectionError("refused"),
+    }
+    factory, opened = _fan_factory(clients)
+    out = dataplane.cluster_triage(_seed(), factory)
+    assert out["cluster_enabled"] is True and out["partial"] is True
+    assert (out["shards_ok"], out["shards_unreachable"]) == (2, 1)
+    assert out["worst_node"] in {"10.0.0.2:6379", "10.0.0.3:6379"}
+    assert list(out["per_node"])[0] == out["worst_node"]
+    assert out["findings"][0]["severity"] == "critical"
+    assert all("node" in f for f in out["findings"])
+    assert any(f["node"] == "10.0.0.3:6379" and "unreachable" in f["message"] for f in out["findings"])
+    mem = [f for f in out["findings"] if f.get("nodes") == ["10.0.0.2:6379"] and "memory" in f["message"].lower()]
+    assert mem and mem[0]["shard"] == "shard-2"
+    assert all(c.closed for c in opened)
+
+
+def test_cluster_triage_merges_identical_findings_across_nodes():
+    clients = {f"10.0.0.{i}:6379": _triage_node(used_memory=980, maxmemory=1000) for i in (1, 2, 3)}
+    factory, _ = _fan_factory(clients)
+    out = dataplane.cluster_triage(_seed(), factory)
+    merged = [f for f in out["findings"] if f.get("count") == 3]
+    assert merged and sorted(merged[0]["nodes"]) == sorted(clients)
+    assert out["findings_total"] == len(out["findings"])
+
+
+def test_cluster_triage_healthy_cluster_raises_nothing_above_info():
+    clients = {f"10.0.0.{i}:6379": _triage_node() for i in (1, 2, 3)}
+    factory, _ = _fan_factory(clients)
+    healthy = dataplane.cluster_triage(_seed(), factory)
+    assert healthy["partial"] is False and healthy["shards_ok"] == 3
+    assert all(f["severity"] == "info" for f in healthy["findings"])
+    assert all(n["critical"] == 0 and n["warning"] == 0 for n in healthy["per_node"].values())
+    assert len(healthy["findings"]) <= dataplane.CLUSTER_TRIAGE_MAX_FINDINGS
+
+
+def test_cluster_triage_on_a_standalone_node_falls_back_to_plain_triage():
+    seed = _triage_node()
+    seed.infos["cluster"] = {"cluster_enabled": 0}
+    out = dataplane.cluster_triage(seed, lambda h, p: seed)
+    assert out["cluster_enabled"] is False and "sections" in out

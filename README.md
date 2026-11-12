@@ -10,7 +10,7 @@ written from scratch for ElastiCache.
 
 ## Tools
 
-All 42 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
+All 45 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 
 **Data plane** (redis-py, talks to the node endpoint)
 
@@ -18,6 +18,8 @@ All 42 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 |---|---|
 | `node_health` | One-shot summary: engine/version, role, memory, clients, hit ratio, evictions, findings |
 | `node_triage` | On-call snapshot in one call: health, memory, replication, clients, failed/rejected commandstats, top-5 slowlog and latency. Findings merged worst-first (max 30) with a per-section summary; a failing section is `unavailable`, the rest still run. No extra Redis commands |
+| `node_cluster_triage` | `node_triage` plus pub/sub pressure on every shard primary of a cluster-mode group under one shared deadline (`max_seconds`, split by worker waves). One ranked, deduplicated findings list (max 40) where each finding names `node` and `shard`; identical findings from several nodes are merged with a `nodes` list. Worst node first. A dead or stuck shard is a critical finding, never fatal. Standalone endpoints answer with the plain triage |
+| `node_pubsub` | Pub/Sub pressure from `PUBSUB CHANNELS`, `NUMSUB` (batches of 100), `NUMPAT`, `SHARDCHANNELS` and `CLIENT LIST TYPE pubsub`: channel count, pattern subscriptions, top channels by subscribers (`top`, default 10, max 100; optional glob `pattern` of at most 128 chars). Findings: many `PSUBSCRIBE` patterns (>= 100 warning, >= 1000 critical), pubsub clients with output buffers >= 8 MiB (warning) or >= 32 MiB (critical), and clients idle over an hour. Counts only, never messages. Cluster mode aggregates every primary, labels findings with their shard and reports a dead shard as a finding |
 | `node_info` | Raw `INFO`, optionally one section; password-like fields (`masterauth`, `requirepass`, ...) are redacted |
 | `node_memory` | used/RSS/peak/dataset/overhead, maxmemory + policy, fragmentation verdict, `findings` (memory > 90%, `noeviction` near full, fragmentation, evictions), `MEMORY STATS/DOCTOR` |
 | `node_config` | Allowlisted `CONFIG GET` values (never secrets) with findings: `noeviction` with a maxmemory limit, `timeout 0` with idle clients, AOF, slowlog and latency monitor off, broad keyspace events. Points at `aws_parameters` when the endpoint refuses `CONFIG` |
@@ -25,7 +27,7 @@ All 42 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `node_clients` | `CLIENT LIST` aggregated by IP, name, user and last command; idle and buffer outliers |
 | `node_latency` | Client-side PING RTT percentiles + `LATENCY LATEST` |
 | `node_commandstats` | Commands ranked by total CPU time (`INFO commandstats`) |
-| `node_keyspace_sample` | Bounded `SCAN` sample: big keys by bytes and by element count, hot keys (LFU) or coldest keys, TTL coverage, and `prefixes` (keys grouped by normalised prefix such as `user:*:cart`, with estimated bytes scaled to dbsize, % without TTL; large no-TTL prefixes are flagged under `noeviction` or memory pressure; `top_prefixes`, default 10, max 50). Stops at `max_seconds` (default 10, hard cap 60) and returns `partial=true` |
+| `node_keyspace_sample` | Bounded `SCAN` sample: big keys by bytes and by element count, hot keys (LFU) or coldest keys, TTL coverage, `ttl_histogram` (no TTL, < 1m, < 1h, < 1d, >= 1d; overall, per prefix and per type, from the same sample so no extra round trips) with `keyspace_hit_rate` from the one `INFO` reply, and `prefixes` (keys grouped by normalised prefix such as `user:*:cart`, with estimated bytes scaled to dbsize, % without TTL; large no-TTL prefixes are flagged under `noeviction` or memory pressure; `top_prefixes`, default 10, max 50). Stops at `max_seconds` (default 10, hard cap 60) and returns `partial=true` |
 | `node_replication` | Role, replicas with byte lag, link status, backlog; findings for lagging or link-down replicas, offset gap vs the primary, `replica-read-only`, `min-replicas-to-write`, `cluster-allow-reads-when-down`. Engine-version quirks (no `CLUSTER SHARDS` before 7.0, ...) come back as `notes`, not errors |
 | `node_cluster` | Cluster mode: `CLUSTER INFO`, slots per primary, `CLUSTER SHARDS` |
 | `node_cluster_nodes` | `CLUSTER NODES` parsed into shards (primary, replicas, slots, failing nodes) and per-shard endpoints |
@@ -60,6 +62,7 @@ All 42 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `aws_serverless_triage` | One call per serverless cache: status and usage limits, snapshot health, 6h `ThrottledCmds`, ECPU and storage against the limits. Worst-first findings (max 30); a failing section (for example `AccessDenied`) is reported `unavailable`. Describe/GetMetricData calls only |
 | `aws_cluster_overview` | One findings-first call per replication group: shards, replicas per shard, AZ spread, failover, engine version joined with per-node CloudWatch (EngineCPU, memory %, ReplicationLag, Evictions, CurrConnections, NewConnections). Flags nodes above 1.5x the peer median, reader endpoint gaps and right-sizing (memory p95 < 30% and CPU p95 < 20%; data tiering for r6gd). Worst-first, bounded; `GetMetricData` denied gives `status: partial` |
 | `aws_alarms` | `DescribeAlarms` (AWS/ElastiCache, paginated, optional `replication_group_id`): alarms in ALARM, INSUFFICIENT_DATA or with actions disabled, and members with no alarm on EngineCPUUtilization, DatabaseMemoryUsagePercentage, Evictions, ReplicationLag, CurrConnections, SwapUsage (plus ThrottledCmds on Serverless). Denied `DescribeAlarms` gives `partial: true`. Without `replication_group_id` it fans out over every configured region with per-region error isolation (`region_errors`) and a shared deadline |
+| `aws_maintenance` | `DescribeUpdateActions`, `DescribeServiceUpdates` and `DescribeCacheClusters` (read-only, optional `replication_group_id`): pending service-update actions grouped per update, required updates past their apply-by date (critical), a `PreferredMaintenanceWindow` that overlaps the `SnapshotWindow` of the same node, and end-of-life engines (Redis OSS <= 6.x, Memcached < 1.6). A denied call gives `partial: true`. Without a group id it fans out over every configured region with per-region error isolation (`region_errors`) |
 | `aws_engine_versions` | `DescribeCacheEngineVersions` for `redis`, `valkey` or `memcached` (optional `version_prefix`): versions with parameter group family and upgrade targets (latest minor of each major, latest Valkey for Redis OSS) |
 | `aws_parameter_groups` | `DescribeCacheParameterGroups` joined with running clusters: family, users of each group, unused custom groups (info), family differing from the running engine (warning) |
 | `aws_parameter_drift` | Diff of two parameter groups: only modified parameters whose values differ, family mismatch, important parameters flagged |
@@ -150,6 +153,13 @@ and `node_memory` emit:
 | Log delivery | Redis/Valkey without an active `slow-log` delivery (warning) or `engine-log` (info); a delivery in `error` or `disabling` (warning) | warning / info |
 | Transit encryption mode | `TransitEncryptionEnabled` with `TransitEncryptionMode` `preferred` (plaintext still accepted) | warning |
 | AUTH token age | `AuthTokenLastModifiedDate` older than 365 days | info |
+| Pub/Sub pattern subscriptions | `PUBSUB NUMPAT` >= 100 (warning), >= 1000 (critical) in `node_pubsub` | warning / critical |
+| Pub/Sub subscriber buffers | pubsub client `omem` >= 8 MiB (warning), >= 32 MiB (critical) in `node_pubsub` | warning / critical |
+| Idle clients | 20 or more clients idle over an hour in `node_clients` / `node_pubsub` | info |
+| No-TTL dominance | >= 90% of at least 20 sampled keys without TTL under an eviction policy (`volatile-*` warning, others info) in `node_keyspace_sample` | warning / info |
+| Low hit rate | `keyspace_hits / (hits + misses)` < 80% (warning), < 50% (critical) over at least 1000 lookups in `node_keyspace_sample` | warning / critical |
+| Overdue required update | `ServiceUpdateRecommendedApplyByDate` in the past for a pending update in `aws_maintenance` | critical |
+| Window overlap | `PreferredMaintenanceWindow` overlaps `SnapshotWindow` in `aws_maintenance` | warning |
 | Engine version | Redis OSS <= 6.x, Memcached < 1.6 (end-of-life), a Memcached version missing from `DescribeCacheEngineVersions` (retired) | warning |
 
 ## Safety model
@@ -177,10 +187,10 @@ and `node_memory` emit:
 Generated from `safe_client.py`; the tests fail if this drifts from the code.
 
 <!-- allowlist:start -->
-- Allowed commands (43): `ACL LOG`, `ACL WHOAMI`, `CLIENT GETNAME`, `CLIENT ID`, `CLIENT INFO`, `CLIENT LIST`, `CLUSTER INFO`, `CLUSTER MYID`, `CLUSTER NODES`, `CLUSTER SHARDS`, `CLUSTER SLOTS`, `COMMAND COUNT`, `COMMAND DOCS`, `CONFIG GET`, `DBSIZE`, `EXISTS`, `HLEN`, `INFO`, `LASTSAVE`, `LATENCY DOCTOR`, `LATENCY HISTORY`, `LATENCY LATEST`, `LLEN`, `MEMORY DOCTOR`, `MEMORY STATS`, `MEMORY USAGE`, `OBJECT ENCODING`, `OBJECT FREQ`, `OBJECT IDLETIME`, `PFCOUNT`, `PING`, `PTTL`, `ROLE`, `SCAN`, `SCARD`, `SLOWLOG GET`, `SLOWLOG LEN`, `STRLEN`, `TIME`, `TTL`, `TYPE`, `XLEN`, `ZCARD`
+- Allowed commands (47): `ACL LOG`, `ACL WHOAMI`, `CLIENT GETNAME`, `CLIENT ID`, `CLIENT INFO`, `CLIENT LIST`, `CLUSTER INFO`, `CLUSTER MYID`, `CLUSTER NODES`, `CLUSTER SHARDS`, `CLUSTER SLOTS`, `COMMAND COUNT`, `COMMAND DOCS`, `CONFIG GET`, `DBSIZE`, `EXISTS`, `HLEN`, `INFO`, `LASTSAVE`, `LATENCY DOCTOR`, `LATENCY HISTORY`, `LATENCY LATEST`, `LLEN`, `MEMORY DOCTOR`, `MEMORY STATS`, `MEMORY USAGE`, `OBJECT ENCODING`, `OBJECT FREQ`, `OBJECT IDLETIME`, `PFCOUNT`, `PING`, `PTTL`, `PUBSUB CHANNELS`, `PUBSUB NUMPAT`, `PUBSUB NUMSUB`, `PUBSUB SHARDCHANNELS`, `ROLE`, `SCAN`, `SCARD`, `SLOWLOG GET`, `SLOWLOG LEN`, `STRLEN`, `TIME`, `TTL`, `TYPE`, `XLEN`, `ZCARD`
 - `CONFIG GET` exact names: `appendfsync`, `appendonly`, `client-query-buffer-limit`, `cluster-allow-reads-when-down`, `cluster-enabled`, `cluster-node-timeout`, `cluster-require-full-coverage`, `databases`, `dynamic-hz`, `hz`, `io-threads`, `lfu-decay-time`, `lfu-log-factor`, `maxclients`, `min-replicas-max-lag`, `min-replicas-to-write`, `notify-keyspace-events`, `proto-max-bulk-len`, `rdbcompression`, `repl-backlog-size`, `repl-backlog-ttl`, `repl-diskless-sync`, `replica-read-only`, `save`, `tcp-keepalive`, `timeout`
 - `CONFIG GET` prefixes: `maxmemory*`, `slowlog-*`, `latency-*`, `activedefrag*`, `active-defrag-*`, `lazyfree-*`, `hash-max-*`, `list-max-*`, `set-max-*`, `zset-max-*`, `client-output-buffer-limit*`
-- Always refused (self-tested never to be allowed): `ACL`, `ACL DELUSER`, `ACL GETUSER`, `ACL LIST`, `ACL LOG RESET`, `ACL SETUSER`, `AUTH`, `BGREWRITEAOF`, `BGSAVE`, `CLIENT KILL`, `CLIENT PAUSE`, `CLIENT REPLY`, `CLIENT TRACKING`, `CLIENT UNPAUSE`, `CLUSTER FAILOVER`, `CLUSTER RESET`, `CONFIG RESETSTAT`, `CONFIG REWRITE`, `CONFIG SET`, `DEBUG`, `DEL`, `DUMP`, `EVAL`, `EVALSHA`, `EXEC`, `EXPIRE`, `FAILOVER`, `FCALL`, `FLUSHALL`, `FLUSHDB`, `FUNCTION`, `GET`, `HELLO`, `HGET`, `HGETALL`, `KEYS`, `LATENCY RESET`, `LRANGE`, `MEMORY PURGE`, `MGET`, `MIGRATE`, `MODULE LOAD`, `MONITOR`, `MULTI`, `OBJECT HELP`, `PSUBSCRIBE`, `PSYNC`, `PUBLISH`, `REPLICAOF`, `RESTORE`, `SAVE`, `SCRIPT`, `SCRIPT FLUSH`, `SCRIPT LOAD`, `SET`, `SHUTDOWN`, `SLAVEOF`, `SLOWLOG RESET`, `SMEMBERS`, `SORT`, `SSUBSCRIBE`, `SUBSCRIBE`, `SYNC`, `UNLINK`, `WATCH`, `XRANGE`, `XREAD`, `XREADGROUP`, `ZRANGE`
+- Always refused (self-tested never to be allowed): `ACL`, `ACL DELUSER`, `ACL GETUSER`, `ACL LIST`, `ACL LOG RESET`, `ACL SETUSER`, `AUTH`, `BGREWRITEAOF`, `BGSAVE`, `CLIENT KILL`, `CLIENT PAUSE`, `CLIENT REPLY`, `CLIENT TRACKING`, `CLIENT UNPAUSE`, `CLUSTER FAILOVER`, `CLUSTER RESET`, `CONFIG RESETSTAT`, `CONFIG REWRITE`, `CONFIG SET`, `DEBUG`, `DEL`, `DUMP`, `EVAL`, `EVALSHA`, `EXEC`, `EXPIRE`, `FAILOVER`, `FCALL`, `FLUSHALL`, `FLUSHDB`, `FUNCTION`, `GET`, `HELLO`, `HGET`, `HGETALL`, `KEYS`, `LATENCY RESET`, `LRANGE`, `MEMORY PURGE`, `MGET`, `MIGRATE`, `MODULE LOAD`, `MONITOR`, `MULTI`, `OBJECT HELP`, `PSUBSCRIBE`, `PSYNC`, `PUBLISH`, `PUBSUB`, `PUBSUB HELP`, `PUBSUB SHARDNUMSUB`, `REPLICAOF`, `RESTORE`, `SAVE`, `SCRIPT`, `SCRIPT FLUSH`, `SCRIPT LOAD`, `SET`, `SHUTDOWN`, `SLAVEOF`, `SLOWLOG RESET`, `SMEMBERS`, `SORT`, `SSUBSCRIBE`, `SUBSCRIBE`, `SYNC`, `UNLINK`, `WATCH`, `XRANGE`, `XREAD`, `XREADGROUP`, `ZRANGE`
 - Memcached: only `stats`, `stats settings|slabs|items|conns` and `version`.
 - AWS: operation names must start with `describe_`, `list_` or `get_metric_data`.
 <!-- allowlist:end -->
@@ -288,8 +298,12 @@ uv run pytest -q                 # unit tests; control plane uses moto + botocor
 uv run pytest -q --cov=mcp_elasticache_ops   # 80% coverage gate (about 93% without a live server)
 scripts/integration.sh           # starts valkey/valkey:8-alpine (--rm, removed on exit) and runs everything
 IMAGE=redis:7-alpine scripts/integration.sh
+scripts/integration.ps1          # Windows: disk gate (>= 5G free), cluster up, `pytest -m integration`, then `down -v`, `image prune -f`, fstrim
 scripts/cluster-integration.sh   # 3-node valkey cluster via tests/docker-compose.cluster.yml, torn down with `down -v`
 ```
+
+`scripts/integration.ps1` (`-MinFreeGB`, `-Wsl:$false` for a native Docker) skips itself below the gate and always tears down in a
+`finally` block; it never runs `prune -a`.
 
 Disk gate: the integration scripts pull images and grow the WSL vhdx, so run them only with at least 5G free on the
 system drive (`df -h /c`). Below that, skip integration and rely on the unit suite. CI runs the integration job
