@@ -21,8 +21,10 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           python-version: "3.12"
       - name: No build artifacts or env files tracked
@@ -79,8 +81,10 @@ jobs:
       MEMCACHED_TEST_PORT: "11211"
       AWS_EC2_METADATA_DISABLED: "true"
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           python-version: ${{ matrix.python }}
       - run: uv sync --locked
@@ -99,8 +103,10 @@ jobs:
     env:
       COMPOSE: docker compose -f tests/docker-compose.cluster.yml
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           python-version: "3.12"
       - run: uv sync --locked
@@ -115,3 +121,23 @@ jobs:
       - name: Tear down
         if: always()
         run: $COMPOSE down -v --remove-orphans
+
+  secrets:
+    # scans the full git history for committed secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: gitleaks (pinned release, checksum verified)
+        shell: bash
+        run: |
+          v=8.28.0
+          curl -sSfL -o g.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${v}/gitleaks_${v}_linux_x64.tar.gz"
+          curl -sSfL -o g.sum "https://github.com/gitleaks/gitleaks/releases/download/v${v}/gitleaks_${v}_checksums.txt"
+          want=$(awk -v f="gitleaks_${v}_linux_x64.tar.gz" '$2 == f { print $1 }' g.sum)
+          test -n "$want"
+          echo "$want  g.tgz" | sha256sum -c -
+          tar -xzf g.tgz gitleaks
+          ./gitleaks git --no-banner --redact --exit-code 1 .

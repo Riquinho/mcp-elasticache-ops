@@ -23,5 +23,10 @@ Tests enforcing this: `tests/test_safe_client.py`, `tests/test_controlplane_tool
 
 ## Reporting a vulnerability
 
-Open a private security advisory on the GitHub repository, or email the maintainer listed in `pyproject.toml`.
-Please do not file public issues for bypasses of the read-only guard.
+Use GitHub private vulnerability reporting:
+<https://github.com/Riquinho/mcp-elasticache-ops/security/advisories/new>.
+Please do not file public issues for bypasses of the read-only guard. Expect an acknowledgement within a few days.
+
+## Supported versions
+
+Only the latest release receives security fixes.

@@ -10,3 +10,4 @@ build/
 .env.*
 .lotes/
 .coverage
+.hypothesis/
