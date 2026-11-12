@@ -176,6 +176,20 @@ def _p95(values: list[float]) -> float | None:
     return ordered[min(len(ordered) - 1, int(0.95 * len(ordered)))]
 
 
+# r6gd data-tiering nodes keep cold values on SSD; DatabaseMemoryUsagePercentage then covers memory only, and
+# DatabaseCapacityUsagePercentage (memory plus SSD) is the saturation signal. Requested for tiered groups only.
+DATA_TIERING_METRIC = "DatabaseCapacityUsagePercentage"
+DATA_TIERING_METRICS = [DATA_TIERING_METRIC]
+CAPACITY_WARN_PCT = 80.0
+CAPACITY_CRITICAL_PCT = 90.0
+TIERING_MEMORY_LOW_PCT = 50.0  # memory percentage under this while capacity is above CAPACITY_WARN_PCT
+
+
+def is_data_tiered(group: dict) -> bool:
+    """True when a replication group has data tiering on (the API returns ``enabled``/``disabled``)."""
+    return str(group.get("DataTiering", "")).lower() in {"enabled", "true"}
+
+
 def is_burstable(node_type: str | None) -> bool:
     """True for burstable node types (``cache.t2``, ``cache.t3``, ``cache.t4g``)."""
     return bool(node_type) and str(node_type).startswith("cache.t")

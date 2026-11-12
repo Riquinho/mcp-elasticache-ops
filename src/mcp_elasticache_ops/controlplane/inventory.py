@@ -48,7 +48,16 @@ from .inventory_views import (  # noqa: F401
     _rg_view,
     _version_key,
 )
-from .restore import MAX_RESTORE_SNAPSHOTS, RESTORE_STALE_HOURS, group_restore_findings, serverless_restore_findings
+from .restore import (
+    BACKUP_AUDIT_MANUAL_DAYS,
+    BACKUP_AUDIT_MAX_FINDINGS,
+    BACKUP_AUDIT_STALE_HOURS,
+    MAX_RESTORE_SNAPSHOTS,
+    RESTORE_STALE_HOURS,
+    backup_audit_findings,
+    group_restore_findings,
+    serverless_restore_findings,
+)
 
 MAX_AUDITED_GROUPS = 25  # DescribeCacheParameters calls made by aws_parameter_groups
 
@@ -360,6 +369,65 @@ class _InventoryMixin(_CoreMixin):
                 "snapshot_count": len(views),
                 "snapshots": newest[:MAX_RESTORE_SNAPSHOTS],
                 "snapshots_truncated": len(newest) > MAX_RESTORE_SNAPSHOTS,
+            }
+
+        return self._guard(run)
+
+    def backup_audit(
+        self, stale_hours: int = BACKUP_AUDIT_STALE_HOURS, manual_days: int = BACKUP_AUDIT_MANUAL_DAYS
+    ) -> dict:
+        """Snapshot retention and freshness across every group and standalone cluster. Findings first.
+
+        DescribeReplicationGroups, DescribeCacheClusters and DescribeSnapshots (all paginated and bounded);
+        a failing DescribeSnapshots degrades to retention-only findings with ``partial``."""
+        if not 1 <= int(stale_hours) <= 24 * 30 or not 1 <= int(manual_days) <= 3650:
+            return {
+                "error": "InvalidArgument",
+                "message": "stale_hours must be 1-720 and manual_days 1-3650",
+            }
+
+        def run() -> dict:
+            now = self._clock()
+            groups = self._paginate("describe_replication_groups", "ReplicationGroups")
+            clusters = self._paginate("describe_cache_clusters", "CacheClusters")
+            sources: dict[str, int | None] = {
+                str(g["ReplicationGroupId"]): g.get("SnapshotRetentionLimit") for g in groups
+            }
+            members: set[str] = set()
+            for c in clusters:
+                cid = str(c.get("CacheClusterId"))
+                if c.get("ReplicationGroupId"):
+                    members.add(cid)
+                elif str(c.get("Engine", "")).lower() in ("redis", "valkey"):
+                    sources[cid] = c.get("SnapshotRetentionLimit")
+            for g in groups:
+                members.update(str(m) for m in g.get("MemberClusters", []))
+            notes: list[str] = []
+            try:
+                views = [_snapshot_view(s, now) for s in self._paginate("describe_snapshots", "Snapshots")]
+            except (BotoCoreError, ClientError) as exc:
+                views = []
+                notes.append(f"DescribeSnapshots failed ({_error_code(exc)}); only retention was checked")
+            if notes:
+                found = [
+                    finding(
+                        "warning",
+                        f"{k}: SnapshotRetentionLimit is 0, automatic backups are off",
+                        resource=k,
+                        category="retention-off",
+                    )
+                    for k, v in sorted(sources.items())
+                    if v == 0
+                ]
+            else:
+                found = backup_audit_findings(sources, views, stale_hours, manual_days, members)
+            ordered = _sorted_findings(found)
+            return {
+                "sources_checked": len(sources),
+                "snapshots_checked": len(views),
+                "findings": ordered[:BACKUP_AUDIT_MAX_FINDINGS],
+                **({"findings_truncated": len(ordered)} if len(ordered) > BACKUP_AUDIT_MAX_FINDINGS else {}),
+                **({"partial": True, "notes": notes} if notes else {}),
             }
 
         return self._guard(run)

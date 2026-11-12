@@ -21,9 +21,13 @@ from botocore.exceptions import (
 from ..config import REGION_PATTERN, ControlPlaneConfig
 from ._shared import (
     AUTH_FAILURE_METRICS,
+    CAPACITY_CRITICAL_PCT,
+    CAPACITY_WARN_PCT,
+    DATA_TIERING_METRIC,
     GLOBAL_LAG_METRIC,
     NETWORK_ALLOWANCE_LIMITS,
     NETWORK_ALLOWANCE_METRICS,
+    TIERING_MEMORY_LOW_PCT,
     _credit_findings,
     _error_result,
     _memory_trend,
@@ -94,6 +98,7 @@ def _sustain_thresholds() -> dict[str, float]:
     return {
         "EngineCPUUtilization": 80.0,
         "DatabaseMemoryUsagePercentage": 80.0,
+        DATA_TIERING_METRIC: CAPACITY_WARN_PCT,
         "CurrConnections": 0.8 * MAXCLIENTS_DEFAULT,
         **dict.fromkeys(AUTH_FAILURE_METRICS, 0.0),  # any failure counts; sustained = in half the periods
     }
@@ -137,6 +142,40 @@ def _breach(summary: dict, severity: str) -> tuple[str, str]:
         return severity, f"; sustained (>=50% of points): {fraction:.0%} of points above {summary['threshold']:g}"
     above, total = summary.get("points_above_threshold", 0), summary["points"]
     return "info", f"; transient spike: {above} of {total} points above {summary['threshold']:g}, not sustained"
+
+
+def _capacity_findings(resource: str, summary: dict[str, dict]) -> list[dict]:
+    """Data-tiering saturation: DatabaseCapacityUsagePercentage (memory plus SSD) against the memory percentage."""
+    cap = summary.get(DATA_TIERING_METRIC) or {}
+    if not cap.get("points"):
+        return []
+    peak = cap["max"]
+    out: list[dict] = []
+    if peak > CAPACITY_WARN_PCT:
+        sev, how = _breach(cap, "critical" if peak > CAPACITY_CRITICAL_PCT else "warning")
+        limit = 90 if peak > CAPACITY_CRITICAL_PCT else 80
+        out.append(
+            finding(
+                sev,
+                f"{DATA_TIERING_METRIC} max {peak:.0f}% above {limit}%{how}; on data-tiering nodes this "
+                "(memory plus SSD) is the real fullness, add shards or a larger node type before it evicts",
+                resource=resource,
+                category="data-tiering",
+            )
+        )
+        mem = summary.get("DatabaseMemoryUsagePercentage") or {}
+        if mem.get("points") and mem["max"] < TIERING_MEMORY_LOW_PCT:
+            out.append(
+                finding(
+                    "warning",
+                    f"DatabaseMemoryUsagePercentage max {mem['max']:.0f}% looks healthy but "
+                    f"{DATA_TIERING_METRIC} is {peak:.0f}%: data-tiering nodes hold cold values on SSD, so memory "
+                    "percentage understates how full the node is; alarm on capacity instead",
+                    resource=resource,
+                    category="data-tiering",
+                )
+            )
+    return out
 
 
 def _metric_findings(resource: str, summary: dict[str, dict]) -> list[dict]:
@@ -209,6 +248,7 @@ def _metric_findings(resource: str, summary: dict[str, dict]) -> list[dict]:
                 "token or an ACL that is too tight, `node_acl_log` shows the user, command and client",
             )
     out += _credit_findings(resource, summary)
+    out += _capacity_findings(resource, summary)
     return out
 
 
@@ -414,8 +454,13 @@ class _CoreMixin:
         node_id: str | None,
         serverless: bool,
         rightsizing: bool = True,
+        extra_names: dict[str, list[str]] | None = None,
     ) -> tuple[dict[str, dict[str, dict]], dict[str, dict[str, dict]], list[dict]]:
-        """GetMetricData for every target/metric; returns (summary, series, findings) keyed by target."""
+        """GetMetricData for every target/metric; returns (summary, series, findings) keyed by target.
+
+        ``extra_names`` adds metrics for single targets (for example the data-tiering capacity metric, which
+        only tiered groups have) inside the same request batch."""
+        extra_names = extra_names or {}
         end = self._clock()
         start = end - dt.timedelta(minutes=int(minutes))
         queries, idx = [], 0
@@ -426,7 +471,7 @@ class _CoreMixin:
                 dims = [{"Name": "CacheClusterId", "Value": target}]
                 if node_id:
                     dims.append({"Name": "CacheNodeId", "Value": node_id})
-            for name in names:
+            for name in [*names, *(n for n in extra_names.get(target, []) if n not in names)]:
                 queries.append(
                     {
                         "Id": f"m{idx}",
@@ -458,7 +503,7 @@ class _CoreMixin:
         findings: list[dict] = []
         for target in targets:
             series[target], summary[target] = {}, {}
-            for name in names:
+            for name in [*names, *(n for n in extra_names.get(target, []) if n not in names)]:
                 pts = sorted(points[target][name], key=lambda p: p[0])  # CloudWatch default is newest first
                 series[target][name] = {
                     "timestamps": [t.isoformat() for t, _ in pts],

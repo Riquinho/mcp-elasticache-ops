@@ -237,3 +237,105 @@ def serverless_restore_findings(cache: dict, snaps: list[dict], views: list[dict
                 )
             )
     return out
+
+
+# --- fleet backup audit ------------------------------------------------------------------------------------------
+
+BACKUP_AUDIT_STALE_HOURS = 48  # twice the daily snapshot window
+BACKUP_AUDIT_MANUAL_DAYS = 30
+BACKUP_AUDIT_MAX_FINDINGS = 40
+
+
+def _names(items: list[str], limit: int = 3) -> str:
+    items = sorted(items)
+    return ", ".join(items[:limit]) + (f" (+{len(items) - limit} more)" if len(items) > limit else "")
+
+
+def backup_audit_findings(
+    sources: dict[str, int | None],
+    views: list[dict],
+    stale_hours: int = BACKUP_AUDIT_STALE_HOURS,
+    manual_days: int = BACKUP_AUDIT_MANUAL_DAYS,
+    known_ids: set[str] | None = None,
+) -> list[dict]:
+    """Fleet-wide snapshot hygiene.
+
+    ``sources`` maps each backup-capable group or standalone cluster to its SnapshotRetentionLimit; ``views`` are
+    ``_snapshot_view`` rows for every snapshot in the region; ``known_ids`` adds ids (member clusters) that are not
+    orphans even though they are not keys of ``sources``."""
+    out: list[dict] = []
+    by_source: dict[str, list[dict]] = {}
+    for v in views:
+        by_source.setdefault(str(v["source_id"]), []).append(v)
+    for name, retention in sorted(sources.items()):
+        mine = by_source.get(name, [])
+        if retention == 0:
+            out.append(
+                finding(
+                    "warning",
+                    f"{name}: SnapshotRetentionLimit is 0, automatic backups are off",
+                    resource=name,
+                    category="retention-off",
+                )
+            )
+        else:
+            fresh = [
+                v
+                for v in mine
+                if v["automatic"] and v["status"] == "available" and (v["age_hours"] or 1e9) <= stale_hours
+            ]
+            if not fresh:
+                autos = [v["age_hours"] for v in mine if v["automatic"] and v["age_hours"] is not None]
+                detail = f"newest is {min(autos):.0f}h old" if autos else "none exists"
+                out.append(
+                    finding(
+                        "warning",
+                        f"{name}: no automatic snapshot in the last {stale_hours}h ({detail})",
+                        resource=name,
+                        category="stale",
+                    )
+                )
+        if mine:
+            latest = max(mine, key=lambda v: -(v["age_hours"] or 0))
+            if _is(latest["status"], "failed"):
+                out.append(
+                    finding(
+                        "warning",
+                        f"{name}: latest snapshot {latest['name']} failed",
+                        resource=name,
+                        category="latest-failed",
+                    )
+                )
+    old: dict[str, list[dict]] = {}
+    for v in views:
+        if v["source"] == "manual" and v["age_hours"] is not None and v["age_hours"] > manual_days * 24:
+            old.setdefault(str(v["source_id"]), []).append(v)
+    for name, items in sorted(old.items()):
+        total = sum(v["size_bytes"] or 0 for v in items)
+        size = f", about {_human_bytes(total)} billed" if total else ""
+        out.append(
+            finding(
+                "info",
+                f"{name}: {len(items)} manual snapshot(s) older than {manual_days} days{size}: "
+                f"{_names([str(v['name']) for v in items])}",
+                resource=name,
+                category="manual-old",
+                count=len(items),
+            )
+        )
+    known = set(sources) | (known_ids or set())
+    orphans = {k: v for k, v in by_source.items() if k not in known}
+    for name, items in sorted(orphans.items()):
+        total = sum(v["size_bytes"] or 0 for v in items)
+        size = f", about {_human_bytes(total)} billed" if total else ""
+        out.append(
+            finding(
+                "warning" if any(v["automatic"] for v in items) else "info",
+                f"{name} no longer exists but {len(items)} snapshot(s) remain{size}: "
+                f"{_names([str(v['name']) for v in items])}",
+                resource=name,
+                category="orphan",
+                count=len(items),
+            )
+        )
+    return out

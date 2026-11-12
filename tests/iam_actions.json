@@ -5,6 +5,11 @@
   "elasticache:DescribeReplicationGroups",
   "elasticache:DescribeServerlessCaches"
  ],
+ "aws_backup_audit": [
+  "elasticache:DescribeCacheClusters",
+  "elasticache:DescribeReplicationGroups",
+  "elasticache:DescribeSnapshots"
+ ],
  "aws_cache_clusters": [
   "elasticache:DescribeCacheClusters",
   "elasticache:DescribeCacheEngineVersions",

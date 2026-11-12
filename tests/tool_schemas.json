@@ -31,6 +31,40 @@
   },
   "type": "object"
  },
+ "aws_backup_audit": {
+  "additionalProperties": false,
+  "properties": {
+   "manual_days": {
+    "default": 30,
+    "description": "Flag manual snapshots older than this (cost)",
+    "maximum": 3650,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "stale_hours": {
+    "default": 48,
+    "description": "Flag when no automatic snapshot is newer",
+    "maximum": 720,
+    "minimum": 1,
+    "type": "integer"
+   }
+  },
+  "type": "object"
+ },
  "aws_cache_clusters": {
   "additionalProperties": false,
   "properties": {

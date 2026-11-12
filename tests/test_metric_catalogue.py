@@ -52,6 +52,7 @@ AVERAGE = {
     "EngineCPUUtilization",
     "CPUUtilization",
     "DatabaseMemoryUsagePercentage",
+    "DatabaseCapacityUsagePercentage",
     "BytesUsedForCache",
     "BytesUsedForCacheItems",
     "CurrConnections",
@@ -73,6 +74,7 @@ NODE_ONLY = {
     "EngineCPUUtilization",
     "CPUUtilization",
     "DatabaseMemoryUsagePercentage",
+    "DatabaseCapacityUsagePercentage",
     "ReplicationLag",
     "GlobalDatastoreReplicationLag",
     "ReplicationBytes",
@@ -105,6 +107,7 @@ CATALOGUE_LISTS = (
     "SHARD_METRICS",
     "SCALE_PRIMARY_METRICS",
     "SCALE_REPLICA_METRICS",
+    "DATA_TIERING_METRICS",
 )
 
 

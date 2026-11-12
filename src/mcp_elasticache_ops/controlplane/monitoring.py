@@ -14,11 +14,14 @@ from botocore.exceptions import (
 from ._shared import (
     _PENDING_ACTION_STATUSES,
     AUTH_FAILURE_METRICS,
+    AUTH_TOKEN_MAX_AGE_DAYS,
+    DATA_TIERING_METRICS,
     FLEET_DEADLINE_SECONDS,
     MAX_FLEET_FINDINGS,
     MEMCACHED_METRICS,
     NETWORK_ALLOWANCE_METRICS,
     SERVERLESS_METRICS,
+    _auth_token_age_days,
     _fleet_deadline_error,
     _fleet_failed,
     _jsonable,
@@ -30,7 +33,9 @@ from ._shared import (
     _version_findings,
     finding,
     is_burstable,
+    is_data_tiered,
 )
+from .alarm_quality import alarm_quality_findings, unscoped_dimension_findings
 from .inventory import _InventoryMixin
 from .restore import _node_memory_bytes
 
@@ -183,6 +188,44 @@ def _memcached_findings(target: str, summary: dict[str, dict], node_type: str | 
     return out
 
 
+def _transport_hygiene_findings(clusters: list[dict], now: Any) -> list[dict]:
+    """TLS and AUTH-token hygiene from DescribeCacheClusters, one finding per replication group or standalone node.
+
+    The ElastiCache API exposes no certificate authority or certificate expiry field, so a CA check is not
+    possible from describe data; only the two fields it does return are judged."""
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for c in clusters:
+        owner = str(c.get("ReplicationGroupId") or c.get("CacheClusterId"))
+        what = "replication group" if c.get("ReplicationGroupId") else "cluster"
+        if c.get("TransitEncryptionEnabled") is False and (owner, "tls") not in seen:
+            seen.add((owner, "tls"))
+            out.append(
+                finding(
+                    "warning",
+                    f"{what} {owner}: TransitEncryptionEnabled is false, traffic (and the AUTH token) crosses the "
+                    "network in plaintext; encryption in transit can only be turned on for an existing group "
+                    "through a migration (preferred mode, then required)",
+                    resource=owner,
+                    category="tls-hygiene",
+                )
+            )
+        age = _auth_token_age_days(c, {"now": now})
+        stale = bool(c.get("AuthTokenEnabled")) and age is not None and age > AUTH_TOKEN_MAX_AGE_DAYS
+        if stale and (owner, "token") not in seen:
+            seen.add((owner, "token"))
+            out.append(
+                finding(
+                    "info",
+                    f"{what} {owner}: AUTH token last modified {age} days ago (over {AUTH_TOKEN_MAX_AGE_DAYS}); "
+                    "rotate it (SET strategy then ROTATE) or move to RBAC users",
+                    resource=owner,
+                    category="auth-token-rotation",
+                )
+            )
+    return out
+
+
 class _MonitoringMixin(_InventoryMixin):
     def alarms_fan_out(self, replication_group_id: str | None = None, region: str | None = None) -> dict:
         """``alarms`` per region in ELASTICACHE_REGIONS when no group is named (fleet mode).
@@ -277,6 +320,7 @@ class _MonitoringMixin(_InventoryMixin):
                 {
                     "id": g.get("ReplicationGroupId"),
                     "kind": "replication-group",
+                    "engine": str(g.get("Engine") or "redis").lower(),
                     "members": members,
                     "metrics": [m for m in RECOMMENDED_ALARMS if m != "ReplicationLag" or len(members) > 1]
                     + (["CPUCreditBalance"] if is_burstable(g.get("CacheNodeType")) else []),
@@ -294,6 +338,7 @@ class _MonitoringMixin(_InventoryMixin):
                 {
                     "id": cid,
                     "kind": "cache-cluster",
+                    "engine": str(c.get("Engine", "")).lower(),
                     "members": [cid],
                     "metrics": [
                         m
@@ -358,6 +403,12 @@ class _MonitoringMixin(_InventoryMixin):
                 scoped = [(a, {d.get("Name"): d.get("Value") for d in a.get("Dimensions", [])}) for a in found]
             findings: list[dict] = []
             views = []
+            if not replication_group_id:
+                in_scope = {id(a) for a, _ in scoped}
+                for a in found:
+                    if id(a) not in in_scope:
+                        findings += unscoped_dimension_findings(a)
+            by_ref = {m: t for t in targets for m in [*t["members"], str(t["id"])]}
             for a, dims in scoped:
                 ref = dims.get("CacheClusterId") or dims.get("ReplicationGroupId") or dims.get("clusterId")
                 state = a.get("StateValue")
@@ -383,6 +434,7 @@ class _MonitoringMixin(_InventoryMixin):
                             "warning", f"alarm {name} is INSUFFICIENT_DATA: it cannot fire", resource=ref, alarm=name
                         )
                     )
+                findings += alarm_quality_findings(a, dims, by_ref.get(str(ref)))
                 if not a.get("ActionsEnabled"):
                     findings.append(
                         finding(
@@ -561,6 +613,7 @@ class _MonitoringMixin(_InventoryMixin):
                 for f in _version_findings(engine, version, None, eol=True):
                     if "end-of-life" in f["message"]:
                         findings.append({**f, "resource": cid})
+            findings += _transport_hygiene_findings(clusters or [], now)
             ordered = _sorted_findings(findings)
             out: dict[str, Any] = {
                 "generated_at": now.isoformat(),
@@ -608,17 +661,21 @@ class _MonitoringMixin(_InventoryMixin):
                 names, engine_note, node_type = self._default_metric_names(str(cache_cluster_id))
             else:
                 names = REDIS_METRICS
+            extra_names: dict[str, list[str]] = {}
             if replication_group_id and not serverless:
                 groups = self._paginate(
                     "describe_replication_groups", "ReplicationGroups", ReplicationGroupId=replication_group_id
                 )
                 targets = [m for g in groups for m in g.get("MemberClusters", [])]
+                if not metrics:
+                    tiered = [m for g in groups if is_data_tiered(g) for m in g.get("MemberClusters", [])]
+                    extra_names = {str(m): DATA_TIERING_METRICS for m in tiered}
                 if not targets:
                     return {"error": "NoMembers", "message": f"replication group {replication_group_id} has no members"}
             else:
                 targets = [str(cache_cluster_id)]
             summary, series, findings = self._collect_metrics(
-                targets, names, minutes, period_seconds, node_id, serverless
+                targets, names, minutes, period_seconds, node_id, serverless, extra_names=extra_names
             )
             limits: dict[str, dict] = {}
             if serverless:

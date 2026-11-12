@@ -239,6 +239,17 @@ def aws_shard_balance(
 
 
 @server.read_tool
+def aws_backup_audit(
+    stale_hours: Annotated[int, Field(ge=1, le=720, description="Flag when no automatic snapshot is newer")] = 48,
+    manual_days: Annotated[int, Field(ge=1, le=3650, description="Flag manual snapshots older than this (cost)")] = 30,
+    region: Region = None,
+) -> dict:
+    """Fleet backup hygiene (DescribeSnapshots plus groups/clusters). Findings first: retention 0, no recent
+    automatic snapshot, latest failed, old manual snapshots, snapshots of deleted groups."""
+    return server._cp(region).backup_audit(stale_hours, manual_days)
+
+
+@server.read_tool
 def aws_snapshot_restore_readiness(
     replication_group_id: Annotated[str | None, Field(description="Replication group to check")] = None,
     serverless_cache_name: Annotated[str | None, Field(description="Serverless cache to check instead")] = None,

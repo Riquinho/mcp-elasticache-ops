@@ -103,7 +103,8 @@ def _triage_memory(d: dict) -> tuple[dict, list[dict]]:
     if "used_memory" not in d:
         return {"status": "unavailable", "notes": d.get("notes", [])}, []
     keys = ("used_memory", "maxmemory", "usage_of_maxmemory", "mem_fragmentation_ratio", "fragmentation_verdict")
-    return {k: d[k] for k in keys}, []  # usage, eviction and fragmentation findings come from the health section
+    # usage, eviction and fragmentation findings come from the health section, the breakdown line from the doctor
+    return {k: d[k] for k in keys}, []
 
 
 def _triage_replication(d: dict) -> tuple[dict, list[dict]]:

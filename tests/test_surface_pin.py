@@ -73,3 +73,12 @@ async def test_readme_and_changelog_tool_counts_match_the_registry():
     newest = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8").split("\n## ", 2)[1]
     claimed = re.findall(r"\b(\d+) tools\b", newest)
     assert all(int(n) == count for n in claimed[:1]), f"newest CHANGELOG entry says {claimed}, registry has {count}"
+
+
+async def test_tool_schema_snapshot_and_iam_matrix_cover_every_registered_tool():
+    names = set(await _registry())
+    snapshot = json.loads((ROOT / "tests" / "tool_schemas.json").read_text(encoding="utf-8"))
+    assert set(snapshot) == names
+    matrix = (ROOT / "docs" / "iam-matrix.md").read_text(encoding="utf-8")
+    for name in (n for n in names if n.startswith("aws_")):
+        assert f"`{name}`" in matrix, f"{name} missing from docs/iam-matrix.md"

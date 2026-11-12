@@ -107,7 +107,18 @@ def _dangerous_grants(tokens: list[str]) -> list[str]:
     return sorted(name for name, granted in state.items() if granted)
 
 
-def _acl_user_findings(users: list[dict], groups: list[dict]) -> list[dict]:
+def _grants_all(tokens: list[str]) -> bool:
+    """True when ``+@all``/``allcommands`` is still in force after the whole access string (last rule wins)."""
+    state = False
+    for token in tokens:
+        if token in ("+@all", "allcommands"):
+            state = True
+        elif token in ("-@all", "nocommands"):
+            state = False
+    return state
+
+
+def _acl_user_findings(users: list[dict], groups: list[dict], no_tls: set[str] | None = None) -> list[dict]:
     """Cross-reference users with the user groups attached to replication groups or serverless caches."""
     attached: dict[str, list[str]] = defaultdict(list)  # user id -> caches reached through its groups
     group_ids: dict[str, list[str]] = defaultdict(list)
@@ -137,6 +148,37 @@ def _acl_user_findings(users: list[dict], groups: list[dict]) -> list[dict]:
                     replication_groups=caches,
                 )
             )
+        is_default = str(u.get("UserName", "")).lower() == "default"
+        if not is_default and "on" in tokens and _grants_all(tokens):
+            out.append(
+                finding(
+                    "warning",
+                    "user has full access (+@all) and can run dangerous commands (FLUSHALL, CONFIG and every other "
+                    "command) with its credentials; give it a least-privilege access string",
+                    resource=uid,
+                    replication_groups=caches,
+                )
+            )
+        if "on" in tokens and not group_ids.get(uid):
+            out.append(
+                finding(
+                    "info",
+                    "user is not a member of any user group: it cannot reach any cache; attach it to a group or "
+                    "delete it",
+                    resource=uid,
+                )
+            )
+        exposed = sorted(set(caches) & (no_tls or set()))
+        if auth.get("Type") == "iam" and exposed:
+            out.append(
+                finding(
+                    "warning",
+                    f"IAM-authenticated user reaches caches without in-transit encryption ({', '.join(exposed)}): "
+                    "the IAM token travels in clear text; enable TLS on those caches",
+                    resource=uid,
+                    replication_groups=exposed,
+                )
+            )
         grants = _dangerous_grants(tokens)
         if grants and "on" in tokens and "+@all" not in tokens:
             label = " ".join([*caches, *group_ids.get(uid, [])])
@@ -160,6 +202,15 @@ def _acl_group_findings(groups: list[dict], users: list[dict] | None) -> list[di
     out = []
     for g in groups:
         ids = [str(i) for i in g.get("UserIds", [])]
+        if not g.get("ReplicationGroups") and not g.get("ServerlessCaches"):
+            out.append(
+                finding(
+                    "info",
+                    "user group is not attached to any replication group or serverless cache: it grants nothing; "
+                    "attach it or delete it",
+                    resource=g.get("UserGroupId"),
+                )
+            )
         if ids and all(names.get(i, i.lower()) == "default" for i in ids):
             out.append(
                 finding(
@@ -574,7 +625,15 @@ class _SecurityMixin(_CostMixin):
             if users is not None:
                 for u in users:
                     entries.append(("user", str(u.get("UserId")), []))
-                for f in _acl_user_findings(users, user_groups or []):
+                no_tls = {
+                    str(g.get("ReplicationGroupId")) for g in groups or [] if g.get("TransitEncryptionEnabled") is False
+                }
+                no_tls |= {
+                    str(c.get("ReplicationGroupId") or c.get("CacheClusterId"))
+                    for c in clusters or []
+                    if c.get("TransitEncryptionEnabled") is False
+                }
+                for f in _acl_user_findings(users, user_groups or [], no_tls):
                     _audit_attach(entries, "user", f)
             if user_groups is not None:
                 for ug in user_groups:

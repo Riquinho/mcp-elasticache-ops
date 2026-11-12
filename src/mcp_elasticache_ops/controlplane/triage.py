@@ -14,6 +14,7 @@ from botocore.exceptions import (
 
 from ._shared import (
     _PENDING_ACTION_STATUSES,
+    DATA_TIERING_METRICS,
     FLEET_DEADLINE_SECONDS,
     MAX_FLEET_FINDINGS,
     SERVERLESS_METRICS,
@@ -35,6 +36,7 @@ from ._shared import (
     _validate_window,
     finding,
     is_burstable,
+    is_data_tiered,
 )
 from .failover import failover_readiness_findings, reader_endpoint_findings
 from .scale import LAG_RISK_SECONDS, _pick
@@ -449,6 +451,7 @@ class _TriageMixin(_SecurityMixin):
             section = self._section_runner(replication_group_id, sections, findings)
             long_events: list[dict] = []
             series_box: list[dict[str, dict[str, dict]]] = []
+            tiered: list[str] = []
 
             def rg_section() -> tuple[str, list[dict]]:
                 groups = self._paginate(
@@ -460,6 +463,8 @@ class _TriageMixin(_SecurityMixin):
                 rg_arn.append(g.get("ARN"))
                 members.extend(g.get("MemberClusters", []))
                 node_types.append(g.get("CacheNodeType"))
+                if is_data_tiered(g):
+                    tiered.extend(str(m) for m in g.get("MemberClusters", []))
                 found = _triage_rg_findings(g)
                 summary = (
                     f"status {g.get('Status')}, multi-az {g.get('MultiAZ')}, failover {g.get('AutomaticFailover')}, "
@@ -500,7 +505,14 @@ class _TriageMixin(_SecurityMixin):
                     raise _TriageEmpty("no member clusters known (replication group section failed)")
                 names = TRIAGE_METRICS + (BURSTABLE_METRICS if any(is_burstable(t) for t in node_types) else [])
                 summary, series, found = self._collect_metrics(
-                    members, names, TRIAGE_WINDOW_HOURS * 60, 300, None, False, rightsizing=False
+                    members,
+                    names,
+                    TRIAGE_WINDOW_HOURS * 60,
+                    300,
+                    None,
+                    False,
+                    rightsizing=False,
+                    extra_names=dict.fromkeys(tiered, DATA_TIERING_METRICS),
                 )
                 series_box.append(series)
                 peaks = _triage_peaks(summary)

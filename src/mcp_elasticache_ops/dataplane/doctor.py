@@ -22,6 +22,7 @@ from ._core import (
 )
 from .clients import client_findings_if_cheap
 from .health import commandlog
+from .memory_breakdown import memory_breakdown_findings
 
 LATENCY_EVENTS_HISTORY = 3  # events whose LATENCY HISTORY is fetched (highest max first)
 
@@ -305,6 +306,8 @@ def _doctor_stages(r: redis.Redis, serverless: bool, findings: list, notes: list
     if isinstance(full_info, dict):
         findings += engine_quirk_findings({**(info_server or {}), **full_info})
         findings += client_findings_if_cheap(r, full_info)  # only up to CLIENT_DOCTOR_MAX connections
+        mem_stats, _ = _try(r.memory_stats)  # refused on some managed nodes: INFO fields stand in
+        findings += memory_breakdown_findings(full_info, mem_stats)
     for key, label, command in (
         ("memory_doctor", "MEMORY DOCTOR", ("MEMORY", "DOCTOR")),
         ("latency_doctor", "LATENCY DOCTOR", ("LATENCY", "DOCTOR")),

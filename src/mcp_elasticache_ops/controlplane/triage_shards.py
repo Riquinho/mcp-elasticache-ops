@@ -12,6 +12,7 @@ SHARD_METRICS = [
     "NetworkBytesIn",
     "NetworkBytesOut",
     "CurrItems",
+    "ReplicationLag",
 ]
 
 
@@ -48,6 +49,15 @@ SHARD_ITEMS_RATIO = 2.0
 SHARD_TRAFFIC_RATIO = 3.0
 
 
+SHARD_LAG_RATIO = 3.0  # a replica whose max ReplicationLag is this multiple of the median replica ...
+
+
+SHARD_LAG_SECONDS = 1.0  # ... and above this many seconds is a lagging-replica outlier
+
+
+MAX_LAG_OUTLIERS = 3
+
+
 # ------------------------------------------------------------------ shard balance
 
 
@@ -73,6 +83,7 @@ def _shard_stats(shard: dict, summary: dict[str, dict[str, dict]]) -> dict:
         return s.get(key) if s.get("points") else None
 
     replica_cpu = [pick(m, "EngineCPUUtilization", "max") for m in members[1:]]
+    replica_lag = {m: pick(m, "ReplicationLag", "max") for m in members[1:]}
     return {
         "shard": shard["shard"],
         "primary": primary if shard["has_primary"] else None,
@@ -86,6 +97,7 @@ def _shard_stats(shard: dict, summary: dict[str, dict[str, dict]]) -> dict:
         "network_out_avg_bytes": pick(primary, "NetworkBytesOut", "avg"),
         "curr_items": pick(primary, "CurrItems", "latest"),
         "replica_cpu_max": max((v for v in replica_cpu if v is not None), default=None),
+        "replica_lag_max": {m: v for m, v in replica_lag.items() if v is not None},
     }
 
 
@@ -187,4 +199,19 @@ def _shard_balance_findings(stats: list[dict]) -> list[dict]:
                         shard=x["shard"],
                     )
                 )
+    lags = [(m, v) for x in stats for m, v in x["replica_lag_max"].items()]
+    if len(lags) >= 2:
+        median = _median([v for _, v in lags])
+        outliers = [(m, v) for m, v in lags if v > SHARD_LAG_SECONDS and v > SHARD_LAG_RATIO * median]
+        for member, value in sorted(outliers, key=lambda mv: -mv[1])[:MAX_LAG_OUTLIERS]:
+            out.append(
+                finding(
+                    "critical" if value > 10 else "warning",
+                    f"lagging replica {member}: ReplicationLag max {value:.1f}s against a median of {median:.1f}s "
+                    "across replicas; a group average hides it and reads from this replica are stale. Check its "
+                    "node load and network, and the primary's output buffer",
+                    category="replica-lag-outlier",
+                    resource=member,
+                )
+            )
     return out

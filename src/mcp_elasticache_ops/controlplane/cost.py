@@ -12,6 +12,8 @@ from botocore.exceptions import (
 )
 
 from ._shared import (
+    DATA_TIERING_METRIC,
+    DATA_TIERING_METRICS,
     FLEET_DEADLINE_SECONDS,
     MAX_FLEET_FINDINGS,
     _error_code,
@@ -20,6 +22,7 @@ from ._shared import (
     _monotonic,
     _sorted_findings,
     finding,
+    is_data_tiered,
 )
 from .cost_rules import (  # noqa: F401
     _GRAVITON_FAMILY,
@@ -255,22 +258,40 @@ class _CostMixin(_MonitoringMixin):
             series: dict[str, dict[str, dict]] = {}
             if ids:
                 _, series, _ = self._collect_metrics(
-                    ids, ["DatabaseMemoryUsagePercentage"], minutes, 3600, None, False, rightsizing=False
+                    ids,
+                    ["DatabaseMemoryUsagePercentage"],
+                    minutes,
+                    3600,
+                    None,
+                    False,
+                    rightsizing=False,
+                    extra_names={
+                        m: DATA_TIERING_METRICS
+                        for g in groups
+                        if is_data_tiered(g)
+                        for m in members[str(g.get("ReplicationGroupId"))]
+                    },
                 )
 
-            def vals(node: str) -> list[float]:
-                return list((series.get(node, {}).get("DatabaseMemoryUsagePercentage") or {}).get("values", []))
+            def vals(node: str, metric: str = "DatabaseMemoryUsagePercentage") -> list[float]:
+                return list((series.get(node, {}).get(metric) or {}).get("values", []))
 
             rows: list[dict] = []
             findings: list[dict] = []
             for g in groups:
                 gid = str(g.get("ReplicationGroupId"))
                 nodes = [m for m in members[gid] if m in series]
+                tiered = is_data_tiered(g) and any(vals(m, DATA_TIERING_METRIC) for m in nodes)
                 row, found = _forecast_row(
                     gid,
                     "replication_group",
-                    {m: vals(m) for m in nodes},
-                    {"node_type": g.get("CacheNodeType"), "nodes": len(members[gid])},
+                    {m: vals(m, DATA_TIERING_METRIC if tiered else "DatabaseMemoryUsagePercentage") for m in nodes},
+                    {
+                        "node_type": g.get("CacheNodeType"),
+                        "nodes": len(members[gid]),
+                        **({"metric": DATA_TIERING_METRIC, "data_tiering": True} if tiered else {}),
+                    },
+                    "capacity (memory plus SSD)" if tiered else "memory",
                 )
                 rows.append(row)
                 findings += found

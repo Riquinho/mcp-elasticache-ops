@@ -13,7 +13,7 @@ from mcp_elasticache_ops import server
 
 SNAPSHOT = Path(__file__).with_name("tool_schemas.json")
 MAX_TOOLS_LIST_BYTES = (
-    51_200  # 61 tools in round 24 (was 50_500 with 60; 49_500 with 59); raise only with a reason in CHANGELOG
+    52_300  # 62 tools in round 26 (was 51_200 with 61, 50_500 with 60); raise only with a reason in CHANGELOG
 )
 
 

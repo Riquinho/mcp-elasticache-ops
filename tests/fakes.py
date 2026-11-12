@@ -293,6 +293,7 @@ def _audit_reply(args: tuple) -> Any:
         "CLUSTER NODES": {},
         "CLUSTER COUNTKEYSINSLOT": 0,
         "ROLE": ["master", 0, []],
+        "MEMORY": {"overhead.hashtable.main": 1024, "replication.backlog": 0},  # MEMORY STATS (args[1] unused here)
     }.get(key, 1)
 
 

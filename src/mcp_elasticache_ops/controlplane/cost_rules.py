@@ -8,8 +8,11 @@ from collections import Counter
 from typing import Any
 
 from ._shared import (
+    _STORAGE_UNIT,
     _jsonable,
+    _limits_view,
     _memory_trend,
+    _serverless_limit_findings,
     _snapshot_view,
     _version_tuple,
     finding,
@@ -23,6 +26,11 @@ COST_METRICS = ["DatabaseMemoryUsagePercentage", "EngineCPUUtilization", "GetTyp
 
 
 COST_SERVERLESS_METRICS = ["ElastiCacheProcessingUnits", "BytesUsedForCache"]
+
+# Serverless bills a minimum amount of stored data even when empty: 100 MB for Valkey, 1 GB for Redis OSS and
+# Memcached. Prices differ per region, so the hint reports GB-hours, never dollars.
+SERVERLESS_MIN_BILLED_GB = {"valkey": 0.1, "redis": 1.0, "memcached": 1.0}
+HOURS_PER_MONTH = 730
 
 
 FORECAST_CRITICAL_DAYS = 7.0  # projected time to a full cache below this is critical
@@ -290,6 +298,17 @@ def _valkey_savings_findings(
     ]
 
 
+def _serverless_billed_floor_gb(c: dict) -> float:
+    """Stored GB billed at zero usage: the engine minimum, or the configured DataStorage minimum if larger."""
+    engine = str(c.get("Engine") or "").lower()
+    floor = SERVERLESS_MIN_BILLED_GB.get(engine, 1.0)
+    storage = (c.get("CacheUsageLimits") or {}).get("DataStorage") or {}
+    minimum = storage.get("Minimum")
+    if minimum:
+        floor = max(floor, float(minimum) * _STORAGE_UNIT.get(storage.get("Unit", "GB"), 1024**3) / 1024**3)
+    return floor
+
+
 def _cost_serverless(c: dict, summary: dict[str, dict]) -> tuple[dict, list[dict]]:
     name = str(c.get("ServerlessCacheName"))
     limits = c.get("CacheUsageLimits") or {}
@@ -309,6 +328,23 @@ def _cost_serverless(c: dict, summary: dict[str, dict]) -> tuple[dict, list[dict
         )
     ecpu = summary.get("ElastiCacheProcessingUnits") or {}
     used = summary.get("BytesUsedForCache") or {}
+    out += _serverless_limit_findings(name, summary, c.get("CacheUsageLimits"), 3600)
+    view = _limits_view(c.get("CacheUsageLimits"), summary, 3600)
+    idle = bool(ecpu.get("points")) and ecpu.get("max") == 0
+    if idle:
+        floor = _serverless_billed_floor_gb(c)
+        out.append(
+            finding(
+                "warning",
+                f"serverless cache had zero ElastiCacheProcessingUnits for {COST_WINDOW_DAYS} days: it is idle but "
+                f"still billed for at least {floor:g} GB of stored data (about {floor * HOURS_PER_MONTH:.0f} "
+                "GB-hours a month); delete it or take a final snapshot and remove it",
+                resource=name,
+                category="cost",
+                hint="idle",
+                billed_floor_gb=floor,
+            )
+        )
     row = {
         "id": name,
         "engine": c.get("Engine"),
@@ -316,13 +352,16 @@ def _cost_serverless(c: dict, summary: dict[str, dict]) -> tuple[dict, list[dict
         "ecpu_per_second_max": ecpu_cap,
         "peak_bytes_used": used.get("max") if used.get("points") else None,
         "peak_ecpu_per_second": round(ecpu["max"] / 3600, 2) if ecpu.get("points") else None,
+        "ecpu_p95_pct": view.get("ecpu_p95_pct"),
+        "data_storage_p95_pct": view.get("data_storage_p95_pct"),
+        "idle": idle,
         "findings_total": len(out),
     }
     return row, out
 
 
 def _forecast_row(
-    rid: str, kind: str, series: dict[str, list[float]], extra: dict[str, Any]
+    rid: str, kind: str, series: dict[str, list[float]], extra: dict[str, Any], what: str = "memory"
 ) -> tuple[dict, list[dict]]:
     """Rank row and findings for one resource from its per-node memory percentage series.
 
@@ -350,7 +389,7 @@ def _forecast_row(
             findings.append(
                 finding(
                     "warning",
-                    f"{rid}: memory at {latest:.0f}% with no growth trend: no headroom for a spike",
+                    f"{rid}: {what} at {latest:.0f}% with no growth trend: no headroom for a spike",
                     resource=rid,
                     category="capacity",
                     hint="add memory (larger node type, more shards) before the next traffic increase",
@@ -371,7 +410,7 @@ def _forecast_row(
         findings.append(
             finding(
                 "critical" if days < FORECAST_CRITICAL_DAYS else "warning",
-                f"{rid}: memory projected full in about {days:g} days (now {latest:.0f}%, "
+                f"{rid}: {what} projected full in about {days:g} days (now {latest:.0f}%, "
                 f"{row['growth']['first_quarter_avg_pct']:g}% -> {row['growth']['last_quarter_avg_pct']:g}% "
                 f"over {COST_WINDOW_DAYS} days, rough linear estimate)",
                 resource=rid,

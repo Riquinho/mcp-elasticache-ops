@@ -41,6 +41,7 @@ from ._core import (
     engine_of,
     version_tuple,
 )
+from .memory_breakdown import memory_breakdown, memory_breakdown_findings
 
 
 def _fork_findings(info: dict) -> list[str]:
@@ -244,8 +245,12 @@ def memory_report(r: redis.Redis, serverless: bool = False) -> dict:
         frag_verdict = "normal"
 
     findings = _memory_findings(mem, stats, used, maxmemory, frag)
+    breakdown_findings = memory_breakdown_findings(mem, memory_stats)
+    findings += breakdown_findings
     return {
         "findings": findings,
+        "breakdown_findings": breakdown_findings,
+        "breakdown": memory_breakdown(mem, memory_stats),
         "used_memory": int(used),
         "used_memory_human": mem.get("used_memory_human"),
         "used_memory_rss": int(rss),
