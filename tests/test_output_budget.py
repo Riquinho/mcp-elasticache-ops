@@ -86,6 +86,7 @@ TOOL_ARGS: dict[str, dict[str, Any]] = {
     "aws_snapshot_restore_readiness": {"replication_group_id": "rg-1"},
     "aws_failover_readiness": {"replication_group_id": "rg-1"},
     "aws_scale_readiness": {"replication_group_id": "rg-1"},
+    "aws_upgrade_plan": {"replication_group_id": "rg-1"},
 }
 
 

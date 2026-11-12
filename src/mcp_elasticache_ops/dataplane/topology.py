@@ -465,3 +465,138 @@ def cluster_health(
         "per_node": results,
         "findings": findings or ["no skew, lag or coverage problems detected"],
     }
+
+
+# --------------------------------------------------------------------------- cross-node consistency
+
+# Parameters compared across shard primaries. All are on the CONFIG GET allowlist and none is a secret.
+CONSISTENCY_CONFIG: tuple[str, ...] = (
+    "maxmemory-policy",
+    "maxmemory",
+    "timeout",
+    "notify-keyspace-events",
+    "cluster-require-full-coverage",
+)
+MAX_CONSISTENCY_ACL_USERS = 200
+MAX_NAME_CHARS = 64
+
+
+def consistency_snapshot(r: redis.Redis) -> dict:
+    """What one node says about itself for the cross-node comparison; every probe fails on its own.
+
+    CONFIG GET is limited to ``CONSISTENCY_CONFIG``, the ACL users come from ``ACL USERS`` (names only; ``ACL
+    LIST`` carries password hashes and stays refused) and the engine version from ``INFO server``.
+    """
+    config: dict[str, str] = {}
+    unavailable: list[str] = []
+    for name in CONSISTENCY_CONFIG:
+        try:
+            got = r.config_get(name)
+        except Exception:
+            unavailable.append(name)
+            continue
+        if isinstance(got, dict) and name in {_s(k) for k in got}:
+            value = next(v for k, v in got.items() if _s(k) == name)
+            config[name] = _s(value)[:MAX_NAME_CHARS]
+    users: list[str] | None = None
+    try:
+        raw = r.execute_command("ACL", "USERS")
+        if isinstance(raw, (list, tuple)):
+            users = sorted({_s(u)[:MAX_NAME_CHARS] for u in raw})[:MAX_CONSISTENCY_ACL_USERS]
+    except Exception:
+        unavailable.append("acl-users")
+    version: str | None = None
+    try:
+        info = r.info("server")
+        if isinstance(info, dict):
+            raw_version = info.get("valkey_version") or info.get("redis_version")
+            if raw_version:
+                engine = "valkey" if info.get("valkey_version") else "redis"
+                version = f"{engine} {_s(raw_version)}"
+    except Exception:
+        unavailable.append("version")
+    return {"config": config, "acl_users": users, "version": version, "unavailable": unavailable}
+
+
+def _majority(values: dict[str, Any]) -> tuple[Any, int] | None:
+    """The value held by strictly more than half of the nodes that answered, with its count; None without one."""
+    if not values:
+        return None
+    ranked = Counter(repr(v) for v in values.values()).most_common()
+    top_repr, top = ranked[0]
+    if top * 2 <= len(values):
+        return None
+    value = next(v for v in values.values() if repr(v) == top_repr)
+    return value, top
+
+
+def _drift(name: str, values: dict[str, Any], shards: dict[str, str], describe: Callable[[Any], str]) -> dict | None:
+    if len(values) < 2 or len({repr(v) for v in values.values()}) == 1:
+        return None
+    maj = _majority(values)
+    if maj is None:
+        found = ", ".join(f"{ep}={describe(v)}" for ep, v in sorted(values.items()))
+        nodes = sorted(values)
+        message = f"{name} has no majority across {len(values)} nodes: {found}"
+    else:
+        value, count = maj
+        nodes = sorted(ep for ep, v in values.items() if repr(v) != repr(value))
+        found = ", ".join(f"{ep}={describe(values[ep])}" for ep in nodes)
+        message = f"{name} differs from the majority {describe(value)} ({count}/{len(values)} nodes): {found}"
+    return {
+        **_finding("warning", message, section="consistency"),
+        "category": "consistency",
+        "parameter": name,
+        "nodes": nodes,
+        "shards": [shards.get(ep, "?") for ep in nodes],
+        "count": len(nodes),
+    }
+
+
+def consistency_findings(snapshots: dict[str, dict], shards: dict[str, str], total_nodes: int) -> dict:
+    """Compare per-node snapshots and return ``{"reached", "findings", "parameters"}``.
+
+    ``snapshots`` maps ``host:port`` to ``consistency_snapshot`` output for the nodes that answered;
+    ``total_nodes`` is how many were asked, so the result states how far the comparison reached.
+    """
+    findings: list[dict] = []
+    parameters: dict[str, dict] = {}
+    for name in CONSISTENCY_CONFIG:
+        values = {ep: s["config"][name] for ep, s in snapshots.items() if name in s["config"]}
+        parameters[name] = {"nodes_compared": len(values), "distinct_values": len({repr(v) for v in values.values()})}
+        found = _drift(name, values, shards, repr)
+        if found:
+            findings.append(found)
+    users = {ep: tuple(s["acl_users"]) for ep, s in snapshots.items() if s["acl_users"] is not None}
+    parameters["acl-users"] = {"nodes_compared": len(users), "distinct_values": len(set(users.values()))}
+
+    def users_text(value: tuple) -> str:
+        return "[" + ", ".join(value) + "]"
+
+    found = _drift("ACL user names", users, shards, users_text)
+    if found:
+        maj = _majority(users)
+        if maj is not None:
+            ref = set(maj[0])
+            gaps = []
+            for ep in found["nodes"]:
+                mine = set(users[ep])
+                gaps.append(f"{ep} missing {sorted(ref - mine) or '-'} extra {sorted(mine - ref) or '-'}")
+            found["message"] = f"ACL user names differ from the majority ({maj[1]}/{len(users)} nodes): " + "; ".join(
+                gaps
+            )
+        findings.append(found)
+    versions = {ep: s["version"] for ep, s in snapshots.items() if s["version"]}
+    parameters["engine-version"] = {"nodes_compared": len(versions), "distinct_values": len(set(versions.values()))}
+    found = _drift("engine version", versions, shards, str)
+    if found:
+        found["message"] += " (rolling upgrade in progress or a stuck update)"
+        findings.append(found)
+    answered = sum(1 for s in snapshots.values() if s["config"] or s["acl_users"] is not None or s["version"])
+    return {
+        "reached": f"compared {answered}/{total_nodes} nodes",
+        "nodes_compared": answered,
+        "nodes_total": total_nodes,
+        "findings": findings,
+        "parameters": parameters,
+    }

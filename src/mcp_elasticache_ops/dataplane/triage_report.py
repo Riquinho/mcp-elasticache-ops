@@ -44,6 +44,7 @@ from .health import (
 from .replication import (
     replication,
 )
+from .topology import consistency_findings, consistency_snapshot
 
 TRIAGE_MAX_FINDINGS = 30
 
@@ -256,7 +257,8 @@ def _node_triage_work(client: redis.Redis, budget: float, shards: int) -> dict:
     """One shard's on-call snapshot: the regular triage sections plus the pub/sub section."""
     snapshot = triage(client, None)
     pubsub = pubsub_report(client, 5)
-    return {"triage": snapshot, "pubsub": pubsub}
+    consistency, _ = _safe(consistency_snapshot, client)
+    return {"triage": snapshot, "pubsub": pubsub, "consistency": consistency}
 
 
 def cluster_triage(
@@ -285,6 +287,7 @@ def cluster_triage(
     shard_names = {s["primary"]: f"shard-{i + 1}" for i, s in enumerate(topo.get("shards", []))}
     per_node: dict[str, dict] = {}
     raw: list[dict] = []
+    snapshots: dict[str, dict] = {}
     for ep, o in outcomes.items():
         shard = shard_names.get(ep, "?")
         if o["status"] == "unreachable":
@@ -299,6 +302,8 @@ def cluster_triage(
             continue
         data = o["data"]
         snapshot, pubsub = data["triage"], data["pubsub"]
+        if data.get("consistency"):
+            snapshots[ep] = data["consistency"]
         found = [{**f, "node": ep} for f in snapshot["findings"] if f.get("section") != "triage"]
         found += [{**f, "section": "pubsub", "node": ep} for f in pubsub["findings"]]
         raw += [{**f, "shard": shard} for f in found]
@@ -336,6 +341,8 @@ def cluster_triage(
     for f in topo.get("topology_findings", []):
         if f.get("source") == "CLUSTER SHARDS":
             findings.append({**f, "section": "topology", "nodes": [f["node"]], "shards": [], "count": 1})
+    consistency = consistency_findings(snapshots, {ep: p["shard"] for ep, p in per_node.items()}, len(outcomes))
+    findings += consistency["findings"]
     findings.sort(key=severity_rank)
     total = len(findings)
     counts = _shard_counts(outcomes)
@@ -350,6 +357,7 @@ def cluster_triage(
         "partial_nodes": _partial_nodes(outcomes),
         **({"notes": topo["notes"]} if topo.get("notes") else {}),
         "elapsed_seconds": round(time.monotonic() - started, 3),
+        "consistency": {k: v for k, v in consistency.items() if k != "findings"},
         "worst_node": node_order[0] if node_order and tally[node_order[0]] != (0, 0) else None,
         "findings": findings[:CLUSTER_TRIAGE_MAX_FINDINGS],
         "findings_total": total,

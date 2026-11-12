@@ -58,3 +58,9 @@ def test_changelog_has_a_dated_section_for_the_current_version():
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     assert re.search(rf"^## {re.escape(__version__)}( |$)", changelog, flags=re.MULTILINE), __version__
     assert "## Unreleased" not in changelog, "cut the release: Unreleased was turned into the version heading"
+
+
+def test_changelog_has_a_single_heading_per_released_version():
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    headings = re.findall(r"^## (\d+\.\d+\.\d+)\b", changelog, flags=re.MULTILINE)
+    assert len(headings) == len(set(headings)), f"duplicate version headings: {headings}"

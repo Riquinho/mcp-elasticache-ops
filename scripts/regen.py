@@ -25,6 +25,20 @@ def main() -> int:
     surface.SNAPSHOT.write_text(
         json.dumps(surface._schemas(tools), indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n"
     )
+    env2 = {**os.environ, "UPDATE_IAM_PIN": "1"}
+    cmd2 = [
+        sys.executable,
+        "-I",
+        "-m",
+        "pytest",
+        "-q",
+        "--no-cov",
+        "-p",
+        "no:cacheprovider",
+        "tests/test_surface_pin.py",
+    ]
+    if subprocess.run(cmd2, cwd=ROOT, env=env2, check=False).returncode not in (0, 1):
+        return 1
     print(f"regenerated docs/iam-matrix.md and {surface.SNAPSHOT.relative_to(ROOT)}")
     return 0
 

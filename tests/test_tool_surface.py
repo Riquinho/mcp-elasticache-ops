@@ -12,7 +12,7 @@ from pathlib import Path
 from mcp_elasticache_ops import server
 
 SNAPSHOT = Path(__file__).with_name("tool_schemas.json")
-MAX_TOOLS_LIST_BYTES = 48_500  # 57 tools in round 20 (was 47_000 with 55); raise only with a reason in CHANGELOG
+MAX_TOOLS_LIST_BYTES = 49_500  # 58 tools in round 21 (was 48_500 with 57); raise only with a reason in CHANGELOG
 
 
 async def _dumped() -> list[dict]:

@@ -279,6 +279,7 @@ def _audit_reply(args: tuple) -> Any:
         "SLOWLOG LEN": 0,
         "CLIENT LIST": [],
         "ACL LOG": [],
+        "ACL USERS": ["default"],
         "LATENCY LATEST": [],
         "LATENCY HISTORY": [],
         "LATENCY DOCTOR": "Dave, no latency spikes.",

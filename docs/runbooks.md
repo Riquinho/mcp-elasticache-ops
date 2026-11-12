@@ -77,6 +77,10 @@ Conclude: responsible client, churn or leak, distance to maxclients, fix (pool, 
 4. `aws_maintenance` for updates past their apply-by date that will force a failover on their own.
 5. `aws_snapshots` or `aws_serverless_snapshots` for the raw snapshot list behind the findings.
 6. `aws_alarms` to confirm replication lag and memory alarms exist before the window.
+7. `aws_upgrade_plan` when the change is an engine upgrade (Redis OSS to a newer Redis, or to Valkey): one read-only call
+   that returns `go` or `no-go` with the blockers first. It folds in steps 1 and 2 as gates and adds the version path,
+   the parameter group family of the target (a custom group must exist in that family), pending service updates and
+   the maintenance window. A gate it could not read counts as a blocker: grant the missing Describe action and rerun.
 
 Conclude: recovery risk, newest restorable snapshot and its age, and the gaps to close before the change.
 

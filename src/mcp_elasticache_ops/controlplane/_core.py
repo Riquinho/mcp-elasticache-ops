@@ -39,6 +39,11 @@ SUM_STAT_METRICS = {
     *AUTH_FAILURE_METRICS,
     "ElastiCacheProcessingUnits",
     "GetTypeCmds",
+    # Counts per period: an Average of a counter hides the volume.
+    "GetHits",
+    "GetMisses",
+    "CacheHits",
+    "CacheMisses",
 }
 
 

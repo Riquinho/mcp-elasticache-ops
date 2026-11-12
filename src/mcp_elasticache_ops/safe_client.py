@@ -23,6 +23,7 @@ READ_ONLY_COMMANDS: frozenset[str] = frozenset(
         "INFO",
         # ACL visibility without password hashes: ACL LIST/GETUSER stay refused
         "ACL LOG",
+        "ACL USERS",
         "ACL WHOAMI",
         "ROLE",
         "DBSIZE",

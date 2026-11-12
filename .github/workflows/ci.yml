@@ -85,7 +85,9 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: uv sync --locked
       # Runs unit and integration tests, including the live Memcached test (MEMCACHED_TEST_HOST is set).
-      - run: uv run pytest -q --cov=mcp_elasticache_ops --cov-fail-under=93
+      - run: uv run pytest -q --cov=mcp_elasticache_ops --cov-fail-under=93 --junitxml=junit.xml
+      - name: Pass count is not below the recorded floor (tests/pass_floor.txt)
+        run: uv run python -I scripts/check-pass-floor.py junit.xml
 
   cluster:
     # always on push, schedule and dispatch; on a pull request only with the `integration` label

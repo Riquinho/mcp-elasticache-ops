@@ -377,6 +377,7 @@ _OK_ARGS = [
     ("ACL", "WHOAMI"),
     ("ACL", "LOG"),
     ("ACL", "LOG", "10"),
+    ("ACL", "USERS"),
     ("acl", "log", "0"),
 ]
 

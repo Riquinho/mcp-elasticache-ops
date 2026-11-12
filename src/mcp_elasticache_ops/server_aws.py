@@ -273,6 +273,22 @@ def aws_scale_readiness(
 
 
 @server.read_tool
+def aws_upgrade_plan(
+    replication_group_id: Annotated[str, Field(description="ReplicationGroupId to check")],
+    target_engine: Annotated[
+        Literal["redis", "valkey"] | None, Field(description="Default: the current engine")
+    ] = None,
+    target_version: Annotated[str | None, Field(description="Exact or major.minor prefix; default newest")] = None,
+    snapshot_max_age_hours: Annotated[int, Field(ge=1, le=720, description="Newest snapshot must be younger")] = 24,
+    region: Region = None,
+) -> dict:
+    """Engine upgrade pre-flight, verdict first: go or no-go plus blockers (version path, Redis to Valkey,
+    parameter group family, group status, failover readiness, snapshot freshness), then caveats (ACL/TLS,
+    quirks, pending service updates, maintenance window). A gate that cannot be read blocks. Describe calls only."""
+    return server._cp(region).upgrade_plan(replication_group_id, target_engine, target_version, snapshot_max_age_hours)
+
+
+@server.read_tool
 def aws_alarms(
     replication_group_id: Annotated[
         str | None,

@@ -969,6 +969,68 @@
   ],
   "type": "object"
  },
+ "aws_upgrade_plan": {
+  "additionalProperties": false,
+  "properties": {
+   "region": {
+    "anyOf": [
+     {
+      "maxLength": 32,
+      "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$",
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "AWS region; defaults to AWS_REGION"
+   },
+   "replication_group_id": {
+    "description": "ReplicationGroupId to check",
+    "type": "string"
+   },
+   "snapshot_max_age_hours": {
+    "default": 24,
+    "description": "Newest snapshot must be younger",
+    "maximum": 720,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "target_engine": {
+    "anyOf": [
+     {
+      "enum": [
+       "redis",
+       "valkey"
+      ],
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "Default: the current engine"
+   },
+   "target_version": {
+    "anyOf": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "null"
+     }
+    ],
+    "default": null,
+    "description": "Exact or major.minor prefix; default newest"
+   }
+  },
+  "required": [
+   "replication_group_id"
+  ],
+  "type": "object"
+ },
  "aws_user_groups": {
   "additionalProperties": false,
   "properties": {

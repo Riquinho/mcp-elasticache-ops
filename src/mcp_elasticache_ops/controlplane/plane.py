@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from .scale_view import _ScaleMixin
+from .upgrade import _UpgradeMixin
 
 
-class ControlPlane(_ScaleMixin):
+class ControlPlane(_UpgradeMixin):
     """Read-only ElastiCache and CloudWatch views; see the mixins for the individual tools."""

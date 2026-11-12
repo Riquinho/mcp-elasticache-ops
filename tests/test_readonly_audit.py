@@ -25,6 +25,7 @@ AUDITED_MODULES = {
     "controlplane/failover.py",
     "controlplane/inventory.py",
     "controlplane/inventory_views.py",
+    "controlplane/upgrade.py",
     "controlplane/monitoring.py",
     "controlplane/plane.py",
     "controlplane/restore.py",
