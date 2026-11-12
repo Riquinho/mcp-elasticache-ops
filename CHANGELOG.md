@@ -3,6 +3,20 @@
 ## Unreleased (round 05)
 
 ### Added
+- `aws_reserved_nodes`: expiring reservations report how many matching nodes still run; a failing
+  `DescribeCacheClusters` degrades to `partial` with a note instead of dropping the reservation list.
+- `release-check.sh` also fails when an environment variable read in `config.py` is missing from the README; CI fails when
+  `*.pyc`, `.coverage` or `.env*` files are tracked.
+- `aws_engine_versions` (available versions, upgrade targets) and `aws_parameter_groups` (usage, unused custom groups,
+  family mismatch); Describe calls only, no IAM change. Tool count is now 39.
+- Cluster fan-out (`node_cluster_keyspace_sample`, `node_cluster_slowlog`, `node_cluster_memory`): one shared deadline
+  (a shard that only gets a worker after the deadline never starts, and gets only the remaining budget otherwise),
+  per-shard rows capped before merging, and a top-level `partial_nodes` list (node, status, reason).
+- Replication group / standalone cluster findings for missing or failing slow-log and engine-log delivery, transit
+  encryption mode `preferred` and AUTH tokens older than 365 days; views expose `data_tiering`, `network_type`,
+  `ip_discovery`, `transit_encryption_mode`, `log_delivery` and `auth_token_age_days` (no new AWS calls).
+- AWS calls are bounded by a botocore `Config`: `AWS_CALL_TIMEOUT_SECONDS` (default 10, connect and read) and
+  `AWS_MAX_ATTEMPTS` (default 3, `standard` retry mode); user agent suffix `mcp-elasticache-ops`.
 - Data-plane findings: `noeviction` at >= 85% of maxmemory (critical), failed RDB/AOF persistence, client input/output
   buffer peaks >= 16 MiB, average eviction rate since start; `node_memory` gains `findings`. Thresholds are listed in the
   README ("Finding thresholds"). `persistence` is part of the per-section `INFO` fallback.

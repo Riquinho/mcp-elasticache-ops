@@ -1075,3 +1075,83 @@ def test_memory_report_findings_cover_policy_fragmentation_and_evictions():
     assert "mem_fragmentation_ratio 1.70 > 1.5" in messages(run(mem={"mem_fragmentation_ratio": 1.7}))
     assert "mem_fragmentation_ratio 0.50 < 1" in messages(run(mem={"mem_fragmentation_ratio": 0.5}))
     assert "42 keys evicted since restart" in messages(run(stats={"evicted_keys": 42}))
+
+
+# ------------------------------------------- round 06: shared fan-out budget, partial_nodes
+
+
+class _EndlessScan(FakeRedis):
+    """A node whose SCAN never reaches cursor 0 and takes ``delay`` seconds per call; records call times."""
+
+    def __init__(self, delay: float, **kw):
+        super().__init__(infos={"memory": _mem_info()}, data=_shard_data("slow", 50, 100), **kw)
+        self.delay = delay
+        self.scan_times: list[float] = []
+
+    def scan(self, cursor=0, match=None, count=10):
+        self.scan_times.append(time.monotonic())
+        time.sleep(self.delay)
+        return 1 + cursor % 7, []  # never 0, never enough keys to stop on sample_size
+
+
+def test_cluster_keyspace_sample_endless_scan_node_is_partial_and_within_budget():
+    slow = _EndlessScan(delay=0.05)
+    clients = {"10.0.0.1:6379": _shard_client("a"), "10.0.0.2:6379": lambda: slow, "10.0.0.3:6379": _shard_client("c")}
+    factory, _ = _fan_factory(clients)
+    start = time.monotonic()
+    out = dataplane.cluster_keyspace_sample(
+        _seed(), factory, sample_size=60, max_seconds=0.5, per_node_timeout=0.3, scan_count=5
+    )
+    wall = time.monotonic() - start
+    assert wall < 0.5 + 0.3 + 0.5  # overall budget + grace + slack
+    assert [n["node"] for n in out["partial_nodes"]] == ["10.0.0.2:6379"]
+    assert out["partial_nodes"][0]["status"] == "partial"
+    assert out["partial"] is True
+    assert any("10.0.0.2:6379" in f["message"] and "partial" in f["message"] for f in out["findings"])
+    assert slow.scan_times and max(slow.scan_times) - slow.scan_times[0] < 0.5 + 0.1
+
+
+def test_cluster_keyspace_sample_hung_node_is_listed_and_stops_scanning_after_the_deadline():
+    hung = _EndlessScan(delay=1.0)
+    clients = {"10.0.0.1:6379": _shard_client("a"), "10.0.0.2:6379": lambda: hung, "10.0.0.3:6379": _shard_client("c")}
+    factory, _ = _fan_factory(clients)
+    start = time.monotonic()
+    out = dataplane.cluster_keyspace_sample(
+        _seed(), factory, sample_size=60, max_seconds=0.3, per_node_timeout=0.2, scan_count=5
+    )
+    returned = time.monotonic()
+    assert returned - start < 0.3 + 0.2 + 0.4
+    node = next(n for n in out["partial_nodes"] if n["node"] == "10.0.0.2:6379")
+    assert node["status"] == "unreachable"
+    assert any(f["severity"] == "critical" and f.get("shard") == "10.0.0.2:6379" for f in out["findings"])
+    assert (out["shards_ok"], out["shards_unreachable"]) == (2, 1)
+    time.sleep(1.3)  # let the straggler's in-flight SCAN return
+    assert len(hung.scan_times) == 1, "straggler kept issuing SCAN after the deadline"
+    assert hung.scan_times[0] < start + 0.3
+
+
+def test_fan_out_late_shard_gets_the_remaining_budget_or_never_starts():
+    # one worker, three shards: the first hangs past the shared deadline, so the others must not start scanning
+    hung = _EndlessScan(delay=0.8)
+    others = [_shard_client("b"), _shard_client("c")]
+    clients = {"10.0.0.1:6379": lambda: hung, "10.0.0.2:6379": others[0], "10.0.0.3:6379": others[1]}
+    factory, _ = _fan_factory(clients)
+    start = time.monotonic()
+    out = dataplane.cluster_keyspace_sample(
+        _seed(), factory, sample_size=60, max_seconds=0.3, per_node_timeout=0.1, max_workers=1, scan_count=5
+    )
+    assert time.monotonic() - start < 0.3 + 0.1 + 0.4
+    assert {n["node"] for n in out["partial_nodes"]} == {"10.0.0.1:6379", "10.0.0.2:6379", "10.0.0.3:6379"}
+    time.sleep(1.0)
+    assert others[0].scan_calls == 0 and others[1].scan_calls == 0
+
+
+def test_cluster_slowlog_and_memory_report_partial_nodes_for_dead_shards():
+    clients = {
+        "10.0.0.1:6379": _shard_client("a"),
+        "10.0.0.2:6379": redis.ConnectionError("refused"),
+        "10.0.0.3:6379": _shard_client("c"),
+    }
+    factory, _ = _fan_factory(clients)
+    for out in (dataplane.cluster_slowlog(_seed(), factory), dataplane.cluster_memory(_seed(), factory)):
+        assert [n["node"] for n in out["partial_nodes"]] == ["10.0.0.2:6379"]

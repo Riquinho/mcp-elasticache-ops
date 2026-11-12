@@ -278,3 +278,32 @@ def test_max_output_chars_invalid(monkeypatch, raw):
     monkeypatch.setenv("MCP_MAX_OUTPUT_CHARS", raw)
     with pytest.raises(ConfigError, match="MCP_MAX_OUTPUT_CHARS"):
         max_output_chars()
+
+
+# ------------------------------------------------------- AWS call bounds
+
+
+def test_aws_call_bounds_from_env(monkeypatch):
+    cfg = ControlPlaneConfig.from_env()
+    assert cfg.call_timeout == 10.0 and cfg.max_attempts == 3
+    monkeypatch.setenv("AWS_CALL_TIMEOUT_SECONDS", "2.5")
+    monkeypatch.setenv("AWS_MAX_ATTEMPTS", "5")
+    cfg = ControlPlaneConfig.from_env()
+    assert cfg.call_timeout == 2.5 and cfg.max_attempts == 5
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("AWS_CALL_TIMEOUT_SECONDS", "0"),
+        ("AWS_CALL_TIMEOUT_SECONDS", "121"),
+        ("AWS_CALL_TIMEOUT_SECONDS", "abc"),
+        ("AWS_MAX_ATTEMPTS", "0"),
+        ("AWS_MAX_ATTEMPTS", "11"),
+        ("AWS_MAX_ATTEMPTS", "x"),
+    ],
+)
+def test_aws_call_bounds_reject_bad_values(monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ConfigError):
+        ControlPlaneConfig.from_env()

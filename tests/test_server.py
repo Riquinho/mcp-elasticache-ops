@@ -31,7 +31,7 @@ async def test_all_tools_read_only():
     async with Client(server.mcp) as c:
         tools = await c.list_tools()
     names = {t.name for t in tools}
-    assert len(tools) == 37
+    assert len(tools) == 39
     assert {
         "node_health",
         "node_info",
@@ -71,6 +71,7 @@ async def test_all_tools_read_only():
         "aws_cluster_overview",
     } <= names  # round 03
     assert {"node_triage", "aws_alarms", "memcached_cluster_stats"} <= names  # round 04
+    assert {"aws_engine_versions", "aws_parameter_groups"} <= names  # round 06
     for t in tools:
         assert t.annotations.read_only_hint is True, t.name
         assert t.annotations.destructive_hint is False, t.name
@@ -115,7 +116,7 @@ async def test_node_config_end_to_end(env):
 
 async def test_every_registered_tool_is_wrapped_with_the_output_cap():
     tools = await server.mcp.list_tools()
-    assert len(tools) == 37
+    assert len(tools) == 39
     unwrapped = [t.name for t in tools if not getattr(t.fn, "__capped__", False)]
     assert unwrapped == []
 

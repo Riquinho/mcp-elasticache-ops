@@ -18,6 +18,7 @@ from collections.abc import Callable
 from typing import Any
 
 import boto3
+from botocore.config import Config as BotocoreConfig
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError, NoRegionError
 
 from .config import ControlPlaneConfig
@@ -203,13 +204,24 @@ class ControlPlane:
         self._clients: dict[str, Any] = {}
 
     # ------------------------------------------------------------ plumbing
+    def botocore_config(self) -> BotocoreConfig:
+        """Bounded timeouts and standard-mode retries so a stalled endpoint cannot hang a tool."""
+        return BotocoreConfig(
+            connect_timeout=self.config.call_timeout,
+            read_timeout=self.config.call_timeout,
+            retries={"mode": "standard", "max_attempts": self.config.max_attempts},
+            user_agent_extra="mcp-elasticache-ops",
+        )
+
     def client(self, service: str):
         if service not in self._clients:
             if self._session_factory:
                 session = self._session_factory()
             else:
                 session = boto3.Session(profile_name=self.config.profile, region_name=self.config.region)
-            self._clients[service] = session.client(service, region_name=self.config.region)
+            self._clients[service] = session.client(
+                service, region_name=self.config.region, config=self.botocore_config()
+            )
         return self._clients[service]
 
     def _guard(self, fn: Callable[[], dict]) -> dict:
@@ -615,12 +627,24 @@ class ControlPlane:
     def reserved_nodes(self, expiring_days: int = 60) -> dict:
         def run() -> dict:
             reserved = self._paginate("describe_reserved_cache_nodes", "ReservedCacheNodes")
-            clusters = self._paginate("describe_cache_clusters", "CacheClusters")
+            notes = [
+                "Matching is by exact node type and engine; size-flexible matching within a family is not "
+                "modelled. Serverless caches cannot be reserved."
+            ]
+            clusters: list[dict] | None
+            try:
+                clusters = self._paginate("describe_cache_clusters", "CacheClusters")
+            except (BotoCoreError, ClientError) as exc:
+                clusters = None
+                notes.append(
+                    f"running-fleet comparison skipped: DescribeCacheClusters failed ({_error_code(exc)}); "
+                    "only the reservation list is shown"
+                )
             now = self._clock()
             views = [_reserved_view(r) for r in reserved]
             active = [v for v in views if v["state"] == "active"]
             running: Counter[tuple[str, str]] = Counter()
-            for c in clusters:
+            for c in clusters or []:
                 if str(c.get("CacheClusterStatus", "")).lower() in {"deleting", "deleted"}:
                     continue
                 running[(str(c.get("CacheNodeType")), str(c.get("Engine", "")).lower())] += int(
@@ -631,7 +655,7 @@ class ControlPlane:
                 held[(str(v["node_type"]), str(v["product"]).lower())] += int(v["count"] or 0)
             coverage = []
             findings = []
-            for key in sorted(set(running) | set(held)):
+            for key in sorted(set(running) | set(held)) if clusters is not None else []:
                 node_type, product = key
                 run_n, res_n = running[key], held[key]
                 row = {
@@ -659,16 +683,126 @@ class ControlPlane:
                     )
             for v in active:
                 if v["end_time"] and dt.datetime.fromisoformat(v["end_time"]) - now < dt.timedelta(days=expiring_days):
-                    findings.append(finding("warning", f"reservation {v['id']} ends {v['end_time']}", resource=v["id"]))
+                    days = (dt.datetime.fromisoformat(v["end_time"]) - now).days
+                    still = running[(str(v["node_type"]), str(v["product"]).lower())]
+                    tail = (
+                        f"; {still} {v['node_type']} {v['product']} node(s) still running"
+                        if still
+                        else ""
+                        if clusters is None
+                        else "; no matching running nodes"
+                    )
+                    findings.append(
+                        finding(
+                            "warning",
+                            f"reservation {v['id']} ends {v['end_time']} (in {days} days){tail}",
+                            resource=v["id"],
+                        )
+                    )
             return {
                 "count": len(views),
                 "findings": _sorted_findings(findings),
                 "coverage": coverage,
                 "reserved_cache_nodes": views,
-                "note": (
-                    "Matching is by exact node type and engine; size-flexible matching within a family is not "
-                    "modelled. Serverless caches cannot be reserved."
-                ),
+                "note": notes[0],
+                **({"partial": True, "notes": notes[1:]} if clusters is None else {}),
+            }
+
+        return self._guard(run)
+
+    # ------------------------------------------------- engine versions, parameter groups
+    def engine_versions(self, engine: str, version_prefix: str | None = None) -> dict:
+        def run() -> dict:
+            items = self._paginate("describe_cache_engine_versions", "CacheEngineVersions", Engine=engine)
+            views = _engine_version_views(items, version_prefix)
+            notes: list[str] = []
+            targets = _latest_per_major(views, engine)
+            findings: list[dict] = []
+            if engine == "redis":
+                try:
+                    valkey = _engine_version_views(
+                        self._paginate("describe_cache_engine_versions", "CacheEngineVersions", Engine="valkey"), None
+                    )
+                except (BotoCoreError, ClientError) as exc:
+                    valkey = []
+                    notes.append(f"Valkey versions unavailable: {_error_code(exc)}")
+                if valkey:
+                    newest = valkey[0]
+                    targets.append(
+                        {**newest, "engine": "valkey", "reason": "latest Valkey; supported upgrade path from Redis OSS"}
+                    )
+                    findings.append(
+                        finding(
+                            "info",
+                            f"Valkey {newest['version']} (family {newest['family']}) is available as an upgrade target",
+                        )
+                    )
+            return {
+                "engine": engine,
+                "version_prefix": version_prefix,
+                "count": len(views),
+                "findings": _sorted_findings(findings),
+                "upgrade_targets": targets,
+                "versions": views,
+                **({"notes": notes} if notes else {}),
+            }
+
+        return self._guard(run)
+
+    def parameter_groups(self) -> dict:
+        def run() -> dict:
+            groups = self._paginate("describe_cache_parameter_groups", "CacheParameterGroups")
+            notes: list[str] = []
+            try:
+                clusters = self._paginate("describe_cache_clusters", "CacheClusters")
+            except (BotoCoreError, ClientError) as exc:
+                clusters = None
+                notes.append(f"cluster listing unavailable ({_error_code(exc)}); in-use detection skipped")
+            users: dict[str, list[str]] = defaultdict(list)
+            running: dict[str, set[tuple[str, str]]] = defaultdict(set)
+            for c in clusters or []:
+                name = (c.get("CacheParameterGroup") or {}).get("CacheParameterGroupName")
+                if name:
+                    users[str(name)].append(str(c.get("CacheClusterId")))
+                    running[str(name)].add((str(c.get("Engine", "")).lower(), str(c.get("EngineVersion", ""))))
+            ctx = self._engine_context({e for pairs in running.values() for e, _ in pairs}, False)
+            views, findings = [], []
+            for g in groups:
+                name = str(g.get("CacheParameterGroupName"))
+                family = g.get("CacheParameterGroupFamily")
+                custom = not name.startswith("default.")
+                members = sorted(users.get(name, []))
+                views.append(
+                    {
+                        "name": name,
+                        "family": family,
+                        "description": g.get("Description"),
+                        "custom": custom,
+                        "in_use": bool(members) if clusters is not None else None,
+                        "used_by": members,
+                    }
+                )
+                if clusters is not None and custom and not members:
+                    findings.append(
+                        finding(
+                            "info", f"custom parameter group {name} is not used by any cache cluster", resource=name
+                        )
+                    )
+                for engine, version in sorted(running.get(name, ())):
+                    expected = ctx["family_of"].get((engine, version))
+                    if family and expected and family != expected:
+                        findings.append(
+                            finding(
+                                "warning",
+                                f"parameter group {name} is family {family} but {engine} {version} expects {expected}",
+                                resource=name,
+                            )
+                        )
+            return {
+                "count": len(views),
+                "findings": _sorted_findings(findings),
+                "parameter_groups": views,
+                **({"partial": True, "notes": notes} if notes else {}),
             }
 
         return self._guard(run)
@@ -900,7 +1034,12 @@ class ControlPlane:
                 for g in groups
                 if g.get("CacheParameterGroupFamily")
             }
-        return {"versions": versions, "family_of": family_of, "parameter_group_family": parameter_group_family}
+        return {
+            "versions": versions,
+            "family_of": family_of,
+            "parameter_group_family": parameter_group_family,
+            "now": self._clock(),
+        }
 
     def parameter_drift(self, group_a: str, group_b: str) -> dict:
         """Diff two parameter groups: only parameters whose values differ and that one side modified."""
@@ -1540,6 +1679,7 @@ def _cluster_findings(c: dict, ctx: dict[str, Any] | None) -> list[dict]:
             out.append(finding("critical", "no authentication: AUTH token is not enabled on this standalone cluster"))
         if c.get("AutoMinorVersionUpgrade") is False:
             out.append(finding("info", "auto minor version upgrade is off"))
+        out += _hardening_findings(c, engine, ctx)
     return out
 
 
@@ -1789,9 +1929,103 @@ def _reserved_view(r: dict) -> dict:
     }
 
 
+def _error_code(exc: Exception) -> str:
+    return str(getattr(exc, "response", {}).get("Error", {}).get("Code") or type(exc).__name__)
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", version))
+
+
+def _engine_version_views(items: list[dict], prefix: str | None) -> list[dict]:
+    views = [
+        {
+            "version": str(i.get("EngineVersion", "")),
+            "family": i.get("CacheParameterGroupFamily"),
+            "description": i.get("CacheEngineVersionDescription"),
+        }
+        for i in items
+        if not prefix or str(i.get("EngineVersion", "")).startswith(prefix)
+    ]
+    return sorted(views, key=lambda v: _version_key(v["version"]), reverse=True)
+
+
+def _latest_per_major(views: list[dict], engine: str) -> list[dict]:
+    """Newest listed version of each major (views are sorted newest first)."""
+    seen: set[int] = set()
+    out: list[dict] = []
+    for v in views:
+        key = _version_key(v["version"])
+        major = key[0] if key else -1
+        if major not in seen:
+            seen.add(major)
+            out.append({**v, "engine": engine, "reason": f"latest minor in major {major}"})
+    return out
+
+
 def _major_minor(version: str) -> tuple[int, int]:
     nums = [int(x) for x in re.findall(r"\d+", version)[:2]]
     return (nums[0] if nums else 0, nums[1] if len(nums) > 1 else 0)
+
+
+AUTH_TOKEN_MAX_AGE_DAYS = 365
+
+
+def _log_delivery_view(obj: dict) -> list[dict]:
+    return [
+        {
+            "log_type": d.get("LogType"),
+            "destination_type": d.get("DestinationType"),
+            "log_format": d.get("LogFormat"),
+            "status": d.get("Status"),
+            "message": d.get("Message"),
+        }
+        for d in obj.get("LogDeliveryConfigurations") or []
+    ]
+
+
+def _auth_token_age_days(obj: dict, ctx: dict[str, Any] | None) -> int | None:
+    modified = obj.get("AuthTokenLastModifiedDate")
+    now = (ctx or {}).get("now")
+    if not isinstance(modified, dt.datetime) or not isinstance(now, dt.datetime):
+        return None
+    if modified.tzinfo is None:
+        modified = modified.replace(tzinfo=dt.UTC)
+    return max((now - modified).days, 0)
+
+
+def _hardening_findings(obj: dict, engine: str, ctx: dict[str, Any] | None) -> list[dict]:
+    """Log delivery, transit-encryption mode and AUTH token age; shared by replication groups and standalone clusters."""
+    out: list[dict] = []
+    if engine in {"redis", "valkey"}:
+        configs = obj.get("LogDeliveryConfigurations") or []
+        live = {"active", "enabling", "modifying"}
+        for log_type in ("slow-log", "engine-log"):
+            if not any(d.get("LogType") == log_type and d.get("Status") in live for d in configs):
+                if log_type == "slow-log":
+                    out.append(
+                        finding(
+                            "warning",
+                            "slow-log delivery is not enabled; slow commands leave no trace in CloudWatch/Firehose",
+                        )
+                    )
+                else:
+                    out.append(finding("info", "engine-log delivery is not enabled"))
+        for d in configs:
+            if d.get("Status") in {"error", "disabling"}:
+                detail = f": {d['Message']}" if d.get("Message") else ""
+                out.append(finding("warning", f"{d.get('LogType')} delivery status is {d.get('Status')}{detail}"))
+    if obj.get("TransitEncryptionEnabled") is True and obj.get("TransitEncryptionMode") == "preferred":
+        out.append(
+            finding(
+                "warning",
+                "transit encryption mode is 'preferred': plaintext connections are still accepted; finish the migration and set 'required'",
+            )
+        )
+    age = _auth_token_age_days(obj, ctx)
+    if obj.get("AuthTokenEnabled") and age is not None and age > AUTH_TOKEN_MAX_AGE_DAYS:
+        out.append(finding("info", f"AUTH token was last rotated {age} days ago (> {AUTH_TOKEN_MAX_AGE_DAYS})"))
+    return out
 
 
 def _rg_findings(g: dict, engine_version: tuple[str, str] | None, ctx: dict[str, Any] | None = None) -> list[dict]:
@@ -1827,6 +2061,8 @@ def _rg_findings(g: dict, engine_version: tuple[str, str] | None, ctx: dict[str,
                     f"node group {ng.get('NodeGroupId')}: primary and replicas all sit in {next(iter(azs))}; an AZ outage takes the whole shard",
                 )
             )
+    rg_engine = str(g.get("Engine") or (engine_version[0] if engine_version else "")).lower()
+    out += _hardening_findings(g, rg_engine, ctx)
     if g.get("PendingModifiedValues"):
         out.append(finding("info", "has pending modified values"))
     return out
@@ -1845,7 +2081,13 @@ def _rg_view(g: dict, engine_version: tuple[str, str] | None = None, ctx: dict[s
         "automatic_failover": g.get("AutomaticFailover"),
         "transit_encryption": g.get("TransitEncryptionEnabled"),
         "at_rest_encryption": g.get("AtRestEncryptionEnabled"),
+        "transit_encryption_mode": g.get("TransitEncryptionMode"),
         "auth_token_enabled": g.get("AuthTokenEnabled"),
+        "auth_token_age_days": _auth_token_age_days(g, ctx),
+        "data_tiering": g.get("DataTiering"),
+        "network_type": g.get("NetworkType"),
+        "ip_discovery": g.get("IpDiscovery"),
+        "log_delivery": _log_delivery_view(g),
         "auto_minor_version_upgrade": g.get("AutoMinorVersionUpgrade"),
         "member_clusters": g.get("MemberClusters", []),
         "configuration_endpoint": _jsonable(g.get("ConfigurationEndpoint")),
@@ -1887,6 +2129,11 @@ def _cluster_view(c: dict, ctx: dict[str, Any] | None = None) -> dict:
         "parameter_group": (c.get("CacheParameterGroup") or {}).get("CacheParameterGroupName"),
         "parameter_apply_status": (c.get("CacheParameterGroup") or {}).get("ParameterApplyStatus"),
         "maintenance_window": c.get("PreferredMaintenanceWindow"),
+        "transit_encryption_mode": c.get("TransitEncryptionMode"),
+        "auth_token_age_days": _auth_token_age_days(c, ctx),
+        "network_type": c.get("NetworkType"),
+        "ip_discovery": c.get("IpDiscovery"),
+        "log_delivery": _log_delivery_view(c),
         "auto_minor_version_upgrade": c.get("AutoMinorVersionUpgrade"),
         "pending_modified_values": _jsonable(c.get("PendingModifiedValues") or {}),
         "nodes": [

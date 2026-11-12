@@ -61,7 +61,7 @@ def plane(ec: Fake, cw: Fake | None = None) -> ControlPlane:
     cw = cw or Fake()
 
     class Session:
-        def client(self, service, region_name=None):
+        def client(self, service, region_name=None, config=None):
             return {"elasticache": ec, "cloudwatch": cw}[service]
 
     return ControlPlane(ControlPlaneConfig(region=REGION), session_factory=Session, clock=lambda: NOW)
@@ -339,6 +339,10 @@ def test_cache_cluster_findings_survive_describe_failures_and_stay_quiet_when_cl
         TransitEncryptionEnabled=True,
         AuthTokenEnabled=True,
         AutoMinorVersionUpgrade=True,
+        LogDeliveryConfigurations=[
+            {"LogType": "slow-log", "Status": "active"},
+            {"LogType": "engine-log", "Status": "active"},
+        ],
         CacheParameterGroup={"CacheParameterGroupName": "default.valkey8", "ParameterApplyStatus": "in-sync"},
     )
     ec = Fake(
@@ -511,7 +515,7 @@ def test_real_botocore_operations_are_all_read_only():
         c.meta.events.register("before-call.*.*", before_call)
 
     class Session:
-        def client(self, service, region_name=None):
+        def client(self, service, region_name=None, config=None):
             return clients[service]
 
     cp = ControlPlane(ControlPlaneConfig(region=REGION), session_factory=Session, clock=lambda: NOW)

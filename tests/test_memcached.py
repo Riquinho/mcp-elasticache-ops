@@ -329,7 +329,7 @@ def _control_plane(cluster, versions):
     stub.add_response("describe_cache_parameter_groups", {"CacheParameterGroups": []})
 
     class Session:
-        def client(self, service, region_name=None):
+        def client(self, service, region_name=None, config=None):
             return ec
 
     cp = ControlPlane(

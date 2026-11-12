@@ -10,7 +10,7 @@ written from scratch for ElastiCache.
 
 ## Tools
 
-All 37 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
+All 39 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 
 **Data plane** (redis-py, talks to the node endpoint)
 
@@ -51,12 +51,14 @@ All 37 tools are annotated `readOnlyHint=true`, `destructiveHint=false`.
 | `aws_users` | `DescribeUsers` (RBAC): `~* +@all` access strings and users without a password; no secret material is returned |
 | `aws_user_groups` | `DescribeUserGroups`: unattached groups, non-active status |
 | `aws_global_replication_groups` | `DescribeGlobalReplicationGroups`: members per region, status, missing secondary |
-| `aws_reserved_nodes` | `DescribeReservedCacheNodes` vs running nodes: coverage, unused and expiring reservations |
+| `aws_reserved_nodes` | `DescribeReservedCacheNodes` vs running nodes: coverage by exact node type and engine, unused reservations, reservations expiring with nodes still running; a failing cluster listing degrades to `partial` with the reservation list intact |
 | `aws_service_updates` | `DescribeServiceUpdates`: pending updates, past or near apply-by dates |
 | `aws_subnet_groups` | `DescribeCacheSubnetGroups`: AZ spread (Multi-AZ needs 2+) |
 | `aws_triage` | One call per replication group: status/Multi-AZ/failover, last 6h events, CloudWatch peaks per member (EngineCPU, memory %, Evictions, ReplicationLag, CurrConnections), pending service updates, newest snapshot. Worst-first findings (max 30); a failing section is reported `unavailable` |
 | `aws_cluster_overview` | One findings-first call per replication group: shards, replicas per shard, AZ spread, failover, engine version joined with per-node CloudWatch (EngineCPU, memory %, ReplicationLag, Evictions, CurrConnections, NewConnections). Flags nodes above 1.5x the peer median, reader endpoint gaps and right-sizing (memory p95 < 30% and CPU p95 < 20%; data tiering for r6gd). Worst-first, bounded; `GetMetricData` denied gives `status: partial` |
 | `aws_alarms` | `DescribeAlarms` (AWS/ElastiCache, paginated, optional `replication_group_id`): alarms in ALARM, INSUFFICIENT_DATA or with actions disabled, and members with no alarm on EngineCPUUtilization, DatabaseMemoryUsagePercentage, Evictions, ReplicationLag, CurrConnections, SwapUsage (plus ThrottledCmds on Serverless). Denied `DescribeAlarms` gives `partial: true` |
+| `aws_engine_versions` | `DescribeCacheEngineVersions` for `redis`, `valkey` or `memcached` (optional `version_prefix`): versions with parameter group family and upgrade targets (latest minor of each major, latest Valkey for Redis OSS) |
+| `aws_parameter_groups` | `DescribeCacheParameterGroups` joined with running clusters: family, users of each group, unused custom groups (info), family differing from the running engine (warning) |
 | `aws_parameter_drift` | Diff of two parameter groups: only modified parameters whose values differ, family mismatch, important parameters flagged |
 
 `aws_replication_groups` also returns per-group findings (Multi-AZ, failover, encryption, auth, snapshots, old Redis OSS,
@@ -89,6 +91,9 @@ and `node_memory` emit:
 | Memcached evictions, low hit ratio | evictions > 0, hit ratio < 80% over at least 100 gets | warning |
 | Memcached evictions below limit | evictions > 0 while `bytes` < 70% of `limit_maxbytes` | warning |
 | Memcached huge items | node >= 90% full with an average item of 256 KiB or more | info |
+| Log delivery | Redis/Valkey without an active `slow-log` delivery (warning) or `engine-log` (info); a delivery in `error` or `disabling` (warning) | warning / info |
+| Transit encryption mode | `TransitEncryptionEnabled` with `TransitEncryptionMode` `preferred` (plaintext still accepted) | warning |
+| AUTH token age | `AuthTokenLastModifiedDate` older than 365 days | info |
 | Engine version | Redis OSS <= 6.x, Memcached < 1.6 (end-of-life), a Memcached version missing from `DescribeCacheEngineVersions` (retired) | warning |
 
 ## Safety model
@@ -177,7 +182,9 @@ Generated from `safe_client.py`; the tests fail if this drifts from the code.
 | `MEMCACHED_HOST` / `MEMCACHED_PORT` | / `11211` | For `memcached_stats` |
 | `MEMCACHED_NODES` | | Comma-separated `host:port` list (max 64, IPv6 as `[::1]:11211`) for `memcached_cluster_stats`; invalid entries stop startup |
 | `MCP_MAX_OUTPUT_CHARS` | `60000` | Cap on any tool result (JSON characters, 1000 to 5000000). Longer lists are cut to their head; `findings`, `summary`, `notes` and counts stay; the result gets `truncated=true`, `omitted` and a hint |
-| `AWS_REGION`, `AWS_PROFILE` | | Standard boto3 credential chain |
+| `AWS_REGION` (or `AWS_DEFAULT_REGION`), `AWS_PROFILE` | | Standard boto3 credential chain |
+| `AWS_CALL_TIMEOUT_SECONDS` | `10` | Connect and read timeout for every AWS API call (greater than 0, at most 120) |
+| `AWS_MAX_ATTEMPTS` | `3` | Attempts per AWS call, botocore `standard` retry mode (1 to 10) |
 | `ELASTICACHE_CONTROL_PLANE` | `true` | `false` disables all `aws_*` calls |
 
 Invalid values (non-numeric or out-of-range port, timeout <= 0, missing CA file, incomplete IAM settings) stop startup

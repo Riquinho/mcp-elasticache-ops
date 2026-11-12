@@ -16,6 +16,11 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
+      - name: No build artifacts or env files tracked
+        shell: bash
+        run: |
+          bad=$(git ls-files | grep -E '\.pyc$|(^|/)\.coverage|(^|/)\.env' || true)
+          if [ -n "$bad" ]; then echo "tracked files that must not be committed:" >&2; echo "$bad" >&2; exit 1; fi
       - run: uv sync --locked
       - name: Lockfile is current
         run: uv lock --check

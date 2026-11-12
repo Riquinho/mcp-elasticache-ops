@@ -33,7 +33,7 @@ def aws():
     cw = boto3.client("cloudwatch", region_name=REGION)
 
     class Session:
-        def client(self, service, region_name=None):
+        def client(self, service, region_name=None, config=None):
             return {"elasticache": ec, "cloudwatch": cw}[service]
 
     cp = ControlPlane(ControlPlaneConfig(region=REGION), session_factory=Session, clock=lambda: NOW)
@@ -358,6 +358,10 @@ def test_replication_group_findings_and_engine_version(aws):
                     "AtRestEncryptionEnabled": True,
                     "TransitEncryptionEnabled": True,
                     "AuthTokenEnabled": True,
+                    "LogDeliveryConfigurations": [
+                        {"LogType": "slow-log", "Status": "active"},
+                        {"LogType": "engine-log", "Status": "active"},
+                    ],
                 },
             ]
         },
@@ -584,7 +588,7 @@ def test_every_tool_only_calls_describe_list_or_get_metric_data():
     rec = Recorder()
 
     class Session:
-        def client(self, service, region_name=None):
+        def client(self, service, region_name=None, config=None):
             return rec
 
     cp = ControlPlane(ControlPlaneConfig(region=REGION), session_factory=Session, clock=lambda: NOW)
@@ -813,7 +817,8 @@ class _AlwaysFails:
 
 
 def _example_args(tool) -> dict:
-    args = dict.fromkeys(tool.input_schema.get("required", []), "x")
+    props = tool.input_schema.get("properties", {})
+    args = {name: props.get(name, {}).get("enum", ["x"])[0] for name in tool.input_schema.get("required", [])}
     if tool.name == "aws_metrics":  # needs one of two optional ids
         args["cache_cluster_id"] = "x"
     return args
@@ -843,14 +848,14 @@ async def test_every_aws_tool_returns_a_structured_failure_with_a_hint(monkeypat
     make = _boto_failures()[failure]
 
     class Session:
-        def client(self, service, region_name=None):
+        def client(self, service, region_name=None, config=None):
             return _AlwaysFails(make)
 
     plane = ControlPlane(ControlPlaneConfig(region=REGION), session_factory=Session, clock=lambda: NOW)
     monkeypatch.setattr(server, "control_plane", lambda: plane)
     async with Client(server.mcp) as client:
         tools = [t for t in await client.list_tools() if t.name.startswith("aws_")]
-        assert len(tools) >= 17
+        assert len(tools) >= 19
         for tool in tools:
             result = await client.call_tool(tool.name, _example_args(tool), raise_on_error=False)
             assert not result.is_error, f"{tool.name} raised: {result.content}"
@@ -864,7 +869,7 @@ async def test_every_aws_tool_returns_a_structured_failure_with_a_hint(monkeypat
 @pytest.mark.parametrize("failure", ["AccessDenied", "ThrottlingException", "ConnectTimeout"])
 def test_guarded_aws_errors_carry_a_specific_hint(failure):
     class Session:
-        def client(self, service, region_name=None):
+        def client(self, service, region_name=None, config=None):
             return _AlwaysFails(_boto_failures()[failure])
 
     plane = ControlPlane(ControlPlaneConfig(region=REGION), session_factory=Session, clock=lambda: NOW)
@@ -872,3 +877,336 @@ def test_guarded_aws_errors_carry_a_specific_hint(failure):
     assert out["error"] and out["message"]
     expected = {"AccessDenied": "IAM", "ThrottlingException": "throttled", "ConnectTimeout": "did not answer"}
     assert expected[failure] in out["hint"]
+
+
+def test_client_receives_bounded_botocore_config():
+    seen: dict = {}
+
+    class Session:
+        def client(self, service, region_name=None, config=None):
+            seen.update(service=service, region=region_name, config=config)
+            return object()
+
+    cp = ControlPlane(
+        ControlPlaneConfig(region=REGION, call_timeout=4.0, max_attempts=2),
+        session_factory=Session,
+    )
+    cp.client("elasticache")
+    cfg = seen["config"]
+    assert seen["region"] == REGION
+    assert cfg.connect_timeout == 4.0 and cfg.read_timeout == 4.0
+    assert cfg.retries["mode"] == "standard" and cfg.retries["max_attempts"] == 2
+    assert cfg.user_agent_extra == "mcp-elasticache-ops"
+
+
+# ------------------------------------------- log delivery, transit mode, token age
+
+
+def _hardening_rg(**extra):
+    base = {
+        "ReplicationGroupId": "hx",
+        "Status": "available",
+        "Engine": "valkey",
+        "MultiAZ": "enabled",
+        "AutomaticFailover": "enabled",
+        "TransitEncryptionEnabled": True,
+        "AuthTokenEnabled": True,
+    }
+    return {"ReplicationGroups": [{**base, **extra}]}
+
+
+def _messages(out, severity):
+    return [f["message"] for f in out["findings"] if f["severity"] == severity]
+
+
+def test_rg_without_log_delivery_warns_slow_log_and_infos_engine_log(aws):
+    cp, ec, _ = aws
+    ec.add_response("describe_replication_groups", _hardening_rg(), {})
+    ec.add_response("describe_cache_clusters", {"CacheClusters": []}, {})
+    out = cp.replication_groups()
+    assert any("slow-log delivery is not enabled" in m for m in _messages(out, "warning"))
+    assert any("engine-log delivery is not enabled" in m for m in _messages(out, "info"))
+    assert out["replication_groups"][0]["log_delivery"] == []
+
+
+def test_rg_log_delivery_error_and_only_slow_log_on(aws):
+    cp, ec, _ = aws
+    logs = [
+        {"LogType": "slow-log", "DestinationType": "cloudwatch-logs", "Status": "active"},
+        {"LogType": "engine-log", "Status": "error", "Message": "log group missing"},
+    ]
+    ec.add_response("describe_replication_groups", _hardening_rg(LogDeliveryConfigurations=logs), {})
+    ec.add_response("describe_cache_clusters", {"CacheClusters": []}, {})
+    out = cp.replication_groups()
+    warnings = _messages(out, "warning")
+    assert not any("slow-log delivery is not enabled" in m for m in warnings)
+    assert any("engine-log delivery status is error: log group missing" in m for m in warnings)
+    assert any("engine-log delivery is not enabled" in m for m in _messages(out, "info"))
+    assert out["replication_groups"][0]["log_delivery"][0]["destination_type"] == "cloudwatch-logs"
+
+
+def test_rg_preferred_transit_mode_and_new_view_fields(aws):
+    cp, ec, _ = aws
+    ec.add_response(
+        "describe_replication_groups",
+        _hardening_rg(
+            TransitEncryptionMode="preferred",
+            DataTiering="enabled",
+            NetworkType="dual_stack",
+            IpDiscovery="ipv4",
+            AuthTokenLastModifiedDate=NOW - dt.timedelta(days=400),
+            LogDeliveryConfigurations=[
+                {"LogType": "slow-log", "Status": "active"},
+                {"LogType": "engine-log", "Status": "active"},
+            ],
+        ),
+        {},
+    )
+    ec.add_response("describe_cache_clusters", {"CacheClusters": []}, {})
+    out = cp.replication_groups()
+    assert any("transit encryption mode is 'preferred'" in m for m in _messages(out, "warning"))
+    assert any("AUTH token was last rotated 400 days ago" in m for m in _messages(out, "info"))
+    view = out["replication_groups"][0]
+    assert view["transit_encryption_mode"] == "preferred"
+    assert view["data_tiering"] == "enabled"
+    assert view["network_type"] == "dual_stack"
+    assert view["ip_discovery"] == "ipv4"
+    assert view["auth_token_age_days"] == 400
+
+
+def test_rg_recent_token_required_mode_and_unknown_engine_stay_quiet(aws):
+    cp, ec, _ = aws
+    ec.add_response(
+        "describe_replication_groups",
+        _hardening_rg(
+            Engine="memcached",
+            TransitEncryptionMode="required",
+            AuthTokenLastModifiedDate=NOW - dt.timedelta(days=30),
+        ),
+        {},
+    )
+    ec.add_response("describe_cache_clusters", {"CacheClusters": []}, {})
+    out = cp.replication_groups()
+    assert out["findings"] == []
+    assert out["replication_groups"][0]["auth_token_age_days"] == 30
+
+
+# ------------------------------------------- engine versions and parameter groups
+
+
+def _ev(version, family, engine="redis", desc=None):
+    return {
+        "Engine": engine,
+        "EngineVersion": version,
+        "CacheParameterGroupFamily": family,
+        "CacheEngineVersionDescription": desc or f"{engine} {version}",
+    }
+
+
+def test_engine_versions_lists_upgrade_targets_including_latest_valkey(aws):
+    cp, ec, _ = aws
+    ec.add_response(
+        "describe_cache_engine_versions",
+        {
+            "CacheEngineVersions": [
+                _ev("6.2.6", "redis6.x"),
+                _ev("7.0.7", "redis7"),
+                _ev("7.1", "redis7"),
+                _ev("6.0.5", "redis6.x"),
+            ]
+        },
+        {"Engine": "redis"},
+    )
+    ec.add_response(
+        "describe_cache_engine_versions",
+        {"CacheEngineVersions": [_ev("7.2", "valkey7", "valkey"), _ev("8.0", "valkey8", "valkey")]},
+        {"Engine": "valkey"},
+    )
+    out = cp.engine_versions("redis")
+    assert [v["version"] for v in out["versions"]] == ["7.1", "7.0.7", "6.2.6", "6.0.5"]
+    targets = {(t.get("engine", "valkey"), t["version"]) for t in out["upgrade_targets"]}
+    assert ("redis", "7.1") in targets and ("redis", "6.2.6") in targets and ("valkey", "8.0") in targets
+    assert any("Valkey 8.0" in f["message"] for f in out["findings"])
+
+
+def test_engine_versions_prefix_filter_and_valkey_failure_degrades(aws):
+    cp, ec, _ = aws
+    ec.add_response(
+        "describe_cache_engine_versions",
+        {"CacheEngineVersions": [_ev("7.0.7", "redis7"), _ev("6.2.6", "redis6.x")]},
+        {"Engine": "redis"},
+    )
+    ec.add_client_error("describe_cache_engine_versions", service_error_code="AccessDenied", http_status_code=403)
+    out = cp.engine_versions("redis", version_prefix="7.")
+    assert [v["version"] for v in out["versions"]] == ["7.0.7"]
+    assert "AccessDenied" in out["notes"][0]
+
+
+def test_engine_versions_memcached_has_no_valkey_lookup(aws):
+    cp, ec, _ = aws
+    ec.add_response(
+        "describe_cache_engine_versions",
+        {"CacheEngineVersions": [_ev("1.6.22", "memcached1.6", "memcached")]},
+        {"Engine": "memcached"},
+    )
+    out = cp.engine_versions("memcached")
+    assert out["upgrade_targets"][0]["version"] == "1.6.22" and out["findings"] == []
+
+
+def test_parameter_groups_flags_unused_custom_and_family_mismatch(aws):
+    cp, ec, _ = aws
+    ec.add_response(
+        "describe_cache_parameter_groups",
+        {
+            "CacheParameterGroups": [
+                {"CacheParameterGroupName": "default.redis7", "CacheParameterGroupFamily": "redis7"},
+                {"CacheParameterGroupName": "orphan", "CacheParameterGroupFamily": "redis7"},
+                {"CacheParameterGroupName": "stale", "CacheParameterGroupFamily": "redis6.x"},
+                {"CacheParameterGroupName": "ok", "CacheParameterGroupFamily": "redis7"},
+            ]
+        },
+        {},
+    )
+    ec.add_response(
+        "describe_cache_clusters",
+        {
+            "CacheClusters": [
+                {
+                    "CacheClusterId": "a-001",
+                    "Engine": "redis",
+                    "EngineVersion": "7.0.7",
+                    "CacheParameterGroup": {"CacheParameterGroupName": "stale"},
+                },
+                {
+                    "CacheClusterId": "b-001",
+                    "Engine": "redis",
+                    "EngineVersion": "7.0.7",
+                    "CacheParameterGroup": {"CacheParameterGroupName": "ok"},
+                },
+            ]
+        },
+        {},
+    )
+    ec.add_response(
+        "describe_cache_engine_versions", {"CacheEngineVersions": [_ev("7.0.7", "redis7")]}, {"Engine": "redis"}
+    )
+    out = cp.parameter_groups()
+    by_name = {g["name"]: g for g in out["parameter_groups"]}
+    assert by_name["ok"]["in_use"] is True and by_name["ok"]["used_by"] == ["b-001"]
+    assert by_name["orphan"]["in_use"] is False and by_name["default.redis7"]["custom"] is False
+    msgs = {(f["severity"], f["resource"]): f["message"] for f in out["findings"]}
+    assert ("info", "orphan") in msgs and "not used" in msgs[("info", "orphan")]
+    assert (
+        ("warning", "stale") in msgs
+        and "redis6.x" in msgs[("warning", "stale")]
+        and "redis7" in msgs[("warning", "stale")]
+    )
+    assert not any(r in ("ok", "default.redis7") for _, r in msgs)
+    assert out["findings"][0]["severity"] == "warning"
+
+
+def test_parameter_groups_without_cluster_listing_skips_unused_findings(aws):
+    cp, ec, _ = aws
+    ec.add_response(
+        "describe_cache_parameter_groups",
+        {"CacheParameterGroups": [{"CacheParameterGroupName": "orphan", "CacheParameterGroupFamily": "redis7"}]},
+        {},
+    )
+    ec.add_client_error("describe_cache_clusters", service_error_code="AccessDenied", http_status_code=403)
+    out = cp.parameter_groups()
+    assert out["partial"] is True and out["findings"] == []
+    assert out["parameter_groups"][0]["in_use"] is None
+
+
+# ------------------------------------------- reserved nodes vs the running fleet
+
+
+def _reservation(rid, node_type, product, count, days_left=300):
+    return {
+        "ReservedCacheNodeId": rid,
+        "CacheNodeType": node_type,
+        "ProductDescription": product,
+        "CacheNodeCount": count,
+        "State": "active",
+        "StartTime": NOW - dt.timedelta(days=365 - days_left),
+        "Duration": 365 * 24 * 3600,
+    }
+
+
+def _cc(cid, node_type, engine, n=1):
+    return {"CacheClusterId": cid, "CacheNodeType": node_type, "Engine": engine, "NumCacheNodes": n}
+
+
+def test_reserved_nodes_fully_covered_fleet_has_no_cost_findings(aws):
+    cp, ec, _ = aws
+    ec.add_response(
+        "describe_reserved_cache_nodes", {"ReservedCacheNodes": [_reservation("r1", "cache.r6g.large", "redis", 2)]}, {}
+    )
+    ec.add_response("describe_cache_clusters", {"CacheClusters": [_cc("c1", "cache.r6g.large", "redis", 2)]}, {})
+    out = cp.reserved_nodes()
+    assert out["findings"] == []
+    row = out["coverage"][0]
+    assert (row["running_nodes"], row["reserved_nodes"], row["on_demand_nodes"], row["unused_reservations"]) == (
+        2,
+        2,
+        0,
+        0,
+    )
+
+
+def test_reserved_nodes_uncovered_and_orphaned_and_wrong_size(aws):
+    cp, ec, _ = aws
+    ec.add_response(
+        "describe_reserved_cache_nodes",
+        {
+            "ReservedCacheNodes": [
+                _reservation("big", "cache.r6g.xlarge", "redis", 1),
+                _reservation("gone", "cache.m6g.large", "valkey", 2),
+            ]
+        },
+        {},
+    )
+    ec.add_response(
+        "describe_cache_clusters",
+        {"CacheClusters": [_cc("c1", "cache.r6g.large", "redis", 3), _cc("c2", "cache.r6g.xlarge", "redis", 1)]},
+        {},
+    )
+    out = cp.reserved_nodes()
+    by_sev = {(f["severity"], f["message"]) for f in out["findings"]}
+    assert (
+        "info",
+        "3 on-demand cache.r6g.large redis node(s) not covered by a reservation",
+    ) in by_sev  # no size flexibility
+    assert ("warning", "2 reserved cache.m6g.large valkey node(s) have no running match") in by_sev
+    assert not any("xlarge" in m for _, m in by_sev)
+
+
+def test_reserved_nodes_expiring_with_nodes_still_running(aws):
+    cp, ec, _ = aws
+    ec.add_response(
+        "describe_reserved_cache_nodes",
+        {"ReservedCacheNodes": [_reservation("r1", "cache.r6g.large", "redis", 2, days_left=20)]},
+        {},
+    )
+    ec.add_response("describe_cache_clusters", {"CacheClusters": [_cc("c1", "cache.r6g.large", "redis", 2)]}, {})
+    out = cp.reserved_nodes()
+    msg = next(f["message"] for f in out["findings"] if f["severity"] == "warning")
+    assert (
+        "reservation r1 ends" in msg and "in 20 days" in msg and "2 cache.r6g.large redis node(s) still running" in msg
+    )
+
+
+def test_reserved_nodes_cluster_listing_denied_keeps_the_reservations(aws):
+    cp, ec, _ = aws
+    ec.add_response(
+        "describe_reserved_cache_nodes",
+        {"ReservedCacheNodes": [_reservation("r1", "cache.r6g.large", "redis", 2, days_left=10)]},
+        {},
+    )
+    ec.add_client_error("describe_cache_clusters", service_error_code="AccessDenied", http_status_code=403)
+    out = cp.reserved_nodes()
+    assert out["count"] == 1 and out["reserved_cache_nodes"][0]["id"] == "r1"
+    assert out["partial"] is True and "AccessDenied" in out["notes"][0]
+    assert out["coverage"] == []
+    assert any("reservation r1 ends" in f["message"] for f in out["findings"])
+    assert not any("on-demand" in f["message"] or "no running match" in f["message"] for f in out["findings"])

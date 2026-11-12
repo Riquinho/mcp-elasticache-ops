@@ -1403,13 +1403,19 @@ def _fan_out_primaries(
     primaries = [n for n in topo["nodes"] if n["role"] == "primary" and n["port"]]
     workers = max(1, min(int(max_workers), 32, len(primaries) or 1))
     shard_budget = total_seconds / math.ceil(len(primaries) / workers) if primaries else total_seconds
-    hard_deadline = time.monotonic() + total_seconds + per_node_timeout
+    deadline = time.monotonic() + total_seconds
+    hard_deadline = deadline + per_node_timeout
     outcomes: dict[str, dict] = {}
 
     def run(node: dict) -> dict:
+        # A shard that only gets a worker after earlier shards stalled must not outlive the shared deadline:
+        # it gets what is left of it, or never starts.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("not started before the overall time budget ran out")
         client = client_factory(node.get("hostname") or node["ip"], node["port"])
         try:
-            return work(client, shard_budget, len(primaries))
+            return work(client, min(shard_budget, remaining), len(primaries))
         finally:
             close = getattr(client, "close", None)
             if close:
@@ -1443,6 +1449,22 @@ def _shard_counts(outcomes: dict[str, dict]) -> dict[str, int]:
         "shards_partial": sum(1 for o in outcomes.values() if o["status"] == "partial"),
         "shards_unreachable": sum(1 for o in outcomes.values() if o["status"] == "unreachable"),
     }
+
+
+MAX_MERGED_ROWS = 5_000  # rows kept from all shards together before the final top-N cut
+
+
+def _partial_nodes(outcomes: dict[str, dict]) -> list[dict]:
+    """Nodes whose answer is incomplete (budget ran out, hung, failed), for a top-level ``partial_nodes`` list."""
+    out: list[dict] = []
+    for ep, o in outcomes.items():
+        if o["status"] == "unreachable":
+            out.append({"node": ep, "status": "unreachable", "reason": o["error"]})
+        elif o["status"] == "partial":
+            data = o.get("data") or {}
+            reason = data.get("partial_reason") or (data.get("notes") or ["incomplete answer"])[0]
+            out.append({"node": ep, "status": "partial", "reason": reason})
+    return out
 
 
 def _unreachable_findings(outcomes: dict[str, dict]) -> list[dict]:
@@ -1536,7 +1558,7 @@ def cluster_keyspace_sample(
         if d["usage_of_maxmemory"] is not None:
             usage = max(usage or 0.0, d["usage_of_maxmemory"])
         for name in ("big_keys_by_bytes", "big_keys_by_length", "hot_keys_by_lfu", "coldest_keys_by_idle"):
-            merged[name] += _labelled(d.get(name, []), ep)
+            merged[name] += _labelled(d.get(name, [])[:top], ep)[: max(0, MAX_MERGED_ROWS - len(merged[name]))]
         for t, v in d["by_type"].items():
             by_type[t]["keys"] += v["keys"]
             by_type[t]["bytes"] += v["bytes"]
@@ -1563,6 +1585,7 @@ def cluster_keyspace_sample(
         "scope": "all shard primaries",
         **counts,
         "partial": counts["shards_total"] != counts["shards_ok"],
+        "partial_nodes": _partial_nodes(outcomes),
         "max_seconds": max_seconds,
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "maxmemory_policy": policy,
@@ -1619,7 +1642,7 @@ def cluster_slowlog(
         if d.get("notes"):
             o["status"] = "partial"
             findings.append(_finding("warning", f"shard {ep} slowlog unavailable: {d['notes'][0]}", shard=ep))
-        entries += _labelled(d["entries"], ep)
+        entries += _labelled(d["entries"][:count], ep)[: max(0, MAX_MERGED_ROWS - len(entries))]
         for row in d["by_command"]:
             agg = by_cmd[row["command"]]
             agg["count"] += row["count"]
@@ -1648,6 +1671,7 @@ def cluster_slowlog(
         "scope": "all shard primaries",
         **counts,
         "partial": counts["shards_total"] != counts["shards_ok"],
+        "partial_nodes": _partial_nodes(outcomes),
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "returned": min(len(entries), count),
         "by_command": by_command,
@@ -1720,6 +1744,7 @@ def cluster_memory(
         "scope": "all shard primaries",
         **counts,
         "partial": counts["shards_total"] != counts["shards_ok"],
+        "partial_nodes": _partial_nodes(outcomes),
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "total_used_memory": int(sum(used.values())),
         "max_shard_used_memory": int(max(used.values())) if used else 0,

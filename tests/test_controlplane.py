@@ -28,7 +28,7 @@ def stubbed():
     ec = boto3.client("elasticache", region_name=REGION)
 
     class Session:
-        def client(self, service, region_name=None):
+        def client(self, service, region_name=None, config=None):
             assert service == "elasticache"
             return ec
 

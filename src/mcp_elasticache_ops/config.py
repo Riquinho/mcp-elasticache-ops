@@ -131,6 +131,8 @@ class ControlPlaneConfig:
     region: str | None = None
     profile: str | None = None
     enabled: bool = True
+    call_timeout: float = 10.0
+    max_attempts: int = 3
 
     @classmethod
     def from_env(cls) -> ControlPlaneConfig:
@@ -138,6 +140,8 @@ class ControlPlaneConfig:
             region=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or None,
             profile=os.getenv("AWS_PROFILE") or None,
             enabled=_bool(os.getenv("ELASTICACHE_CONTROL_PLANE"), default=True),
+            call_timeout=_float("AWS_CALL_TIMEOUT_SECONDS", 10.0, 0, 120),
+            max_attempts=_int("AWS_MAX_ATTEMPTS", 3, 1, 10),
         )
 
 

@@ -502,6 +502,25 @@ def aws_reserved_nodes() -> dict:
 
 
 @read_tool
+def aws_engine_versions(
+    engine: Annotated[Literal["redis", "valkey", "memcached"], Field(description="Cache engine")],
+    version_prefix: Annotated[
+        str | None, Field(description="Only versions starting with this, e.g. '7.')", max_length=16)
+    ] = None,
+) -> dict:
+    """DescribeCacheEngineVersions: available versions with parameter group family, plus upgrade
+    targets (latest minor of each major; latest Valkey when asking about Redis OSS)."""
+    return control_plane().engine_versions(engine, version_prefix)
+
+
+@read_tool
+def aws_parameter_groups() -> dict:
+    """DescribeCacheParameterGroups joined with running clusters: family, which clusters use each
+    group, unused custom groups (info) and groups whose family differs from the running engine (warning)."""
+    return control_plane().parameter_groups()
+
+
+@read_tool
 def aws_service_updates(
     status: Annotated[Literal["available", "cancelled", "expired"], Field(description="Update status")] = "available",
 ) -> dict:
