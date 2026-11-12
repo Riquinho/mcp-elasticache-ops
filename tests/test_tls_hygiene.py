@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import gzip
+import json
 import os
 
-import botocore.session
+import botocore
 import pytest
+from botocore.model import ServiceModel
 
 from mcp_elasticache_ops.controlplane.monitoring import _transport_hygiene_findings
 from tests.test_controlplane_findings import NOW, Fake, plane
@@ -67,11 +70,14 @@ def test_maintenance_reports_both_rules_from_describe_cache_clusters():
 
 
 def test_field_names_used_exist_in_the_botocore_describe_shapes():
-    # Load from the botocore package's own data dir: an earlier test (or AWS_DATA_PATH) must not hide the model.
-    data = os.path.join(os.path.dirname(botocore.__file__), "data")
-    session = botocore.session.get_session()
-    session.get_component("data_loader").search_paths[:] = [data]
-    model = session.get_service_model("elasticache")
+    # Read the shipped model file directly: no loader, so env vars or earlier tests cannot hide it.
+    base = os.path.join(os.path.dirname(botocore.__file__), "data", "elasticache")
+    path = max(
+        (os.path.join(root, f) for root, _, files in os.walk(base) for f in files if f.startswith("service-2.json")),
+    )
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as fh:
+        model = ServiceModel(json.load(fh), service_name="elasticache")
     for shape in ("CacheCluster", "ReplicationGroup"):
         members = model.shape_for(shape).members
         for field in ("TransitEncryptionEnabled", "AuthTokenEnabled", "AuthTokenLastModifiedDate"):

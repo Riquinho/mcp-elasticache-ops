@@ -196,8 +196,10 @@ def big_payloads(seeded):
     try:
         saved = {n: admin.config_get(n).get(n) for n in names}
     except redis.ResponseError:
+        saved = {}
+    if not saved or any(v is None for v in saved.values()):  # Redis 7 returns {} for unknown names
         admin.close()
-        pytest.skip("COMMANDLOG size thresholds are not configurable on this server")
+        pytest.skip("COMMANDLOG size thresholds are not configurable on this server (needs Valkey 8+)")
     for n in names:
         admin.config_set(n, "10000")
     admin.set("commandlog:payload", "z" * 200_000)
