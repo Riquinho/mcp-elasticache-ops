@@ -575,7 +575,8 @@ async def test_every_tool_is_annotated_and_readme_count_matches():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     m = re.search(r"All (\d+) tools are annotated", readme)
     assert m and int(m.group(1)) == len(tools)
-    documented = set(re.findall(r"^\| `((?:node|aws|memcached)_[a-z_]+)` \|", readme, flags=re.M))
+    catalogue = (ROOT / "docs" / "tools.md").read_text(encoding="utf-8")
+    documented = set(re.findall(r"^\| `((?:node|aws|memcached)_[a-z_]+)` \|", catalogue, flags=re.M))
     assert documented == {t.name for t in tools}
 
 

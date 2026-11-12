@@ -23,7 +23,7 @@ from pathlib import Path
 from mcp_elasticache_ops.server import mcp
 
 registered = {t.name for t in asyncio.run(mcp.list_tools())}
-readme = Path("README.md").read_text(encoding="utf-8")
+readme = Path("README.md").read_text(encoding="utf-8") + "\n" + Path("docs/tools.md").read_text(encoding="utf-8")
 claimed = re.search(r"All (\d+) tools are annotated", readme)
 documented = set(re.findall(r"^\| `([a-z_]+)` \|", readme, flags=re.MULTILINE))
 problems = []

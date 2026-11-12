@@ -67,7 +67,11 @@ async def test_every_aws_tool_has_a_pinned_nonempty_action_set():
 
 async def test_readme_and_changelog_tool_counts_match_the_registry():
     count = len(await _registry())
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = (
+        (ROOT / "README.md").read_text(encoding="utf-8")
+        + "\n"
+        + (ROOT / "docs" / "tools.md").read_text(encoding="utf-8")
+    )
     table_rows = len(re.findall(r"^\| `(?:aws|node|memcached)_[a-z_]+`", readme, flags=re.MULTILINE))
     assert table_rows == count, f"README table lists {table_rows} tools, registry has {count}"
     newest = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8").split("\n## ", 2)[1]

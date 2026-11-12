@@ -29,11 +29,23 @@ async def _registered() -> set[str]:
 
 
 async def test_readme_catalogue_matches_registry():
-    assert readme_problems((ROOT / "README.md").read_text(encoding="utf-8"), await _registered()) == []
+    assert (
+        readme_problems(
+            (ROOT / "README.md").read_text(encoding="utf-8")
+            + "\n"
+            + (ROOT / "docs" / "tools.md").read_text(encoding="utf-8"),
+            await _registered(),
+        )
+        == []
+    )
 
 
 async def test_removing_a_tool_from_the_readme_fails_the_check():
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = (
+        (ROOT / "README.md").read_text(encoding="utf-8")
+        + "\n"
+        + (ROOT / "docs" / "tools.md").read_text(encoding="utf-8")
+    )
     registered = await _registered()
     victim = sorted(registered)[0]
     without_row = "\n".join(line for line in readme.splitlines() if not line.startswith(f"| `{victim}` |"))
@@ -41,7 +53,11 @@ async def test_removing_a_tool_from_the_readme_fails_the_check():
 
 
 async def test_stale_tool_count_or_phantom_row_fails_the_check():
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = (
+        (ROOT / "README.md").read_text(encoding="utf-8")
+        + "\n"
+        + (ROOT / "docs" / "tools.md").read_text(encoding="utf-8")
+    )
     registered = await _registered()
     wrong_count = readme.replace(f"All {len(registered)} tools", f"All {len(registered) + 1} tools")
     assert any("claims" in p for p in readme_problems(wrong_count, registered))

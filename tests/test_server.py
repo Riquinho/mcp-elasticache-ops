@@ -195,7 +195,11 @@ def test_tool_wrapper_rejects_invalid_limit(monkeypatch):
 def _readme_text() -> str:
     from pathlib import Path
 
-    return (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    return (
+        (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+        + "\n"
+        + (Path(__file__).resolve().parent.parent / "docs" / "tools.md").read_text(encoding="utf-8")
+    )
 
 
 async def test_readme_tool_table_lists_exactly_the_registered_tools():
@@ -326,7 +330,11 @@ async def test_every_tool_has_a_short_docstring_and_readme_rows_match_registry()
     for t in tools:
         assert t.description and t.description.strip(), t.name
         assert len(t.description) < 400, f"{t.name}: description is {len(t.description)} chars"
-    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    readme = (
+        (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+        + "\n"
+        + (Path(__file__).resolve().parent.parent / "docs" / "tools.md").read_text(encoding="utf-8")
+    )
     rows = re.findall(r"^\| `((?:node|aws|memcached)_[a-z_]+)` \|", readme, flags=re.M)
     assert len(rows) == len(set(rows)), "duplicate README tool rows"
     assert set(rows) == {t.name for t in tools}
