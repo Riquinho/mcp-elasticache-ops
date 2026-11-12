@@ -1,5 +1,52 @@
 # Changelog
 
+## Round 26 additions to 0.3.0
+
+Round 26. 62 tools (one new tool, `aws_backup_audit`).
+
+### Added
+- `aws_backup_audit` (`controlplane/restore.py`, `inventory.py`): fleet-wide backup hygiene from
+  `DescribeReplicationGroups`, `DescribeCacheClusters` and `DescribeSnapshots` (no new IAM actions). Findings:
+  retention off, stale latest automatic snapshot, latest failed, old manual snapshots (aggregated, with size) and
+  orphan snapshots of deleted sources. Capped at 40 findings. Tests in `tests/test_backup_audit.py`.
+- Memory breakdown (`dataplane/memory_breakdown.py`): one `memory-breakdown` warning in `node_memory`, `node_doctor`,
+  `node_triage` and `node_cluster_triage` when allocator fragmentation, hashtable or client and replication buffers
+  are large (`MEMORY STATS`, `INFO` fallback; silent under 32 MiB). Tests in `tests/test_memory_breakdown.py`.
+- Serverless right-sizing in `aws_cost_overview`: ECPU and storage near-limit, over-limit, tight and over-provisioned
+  findings, and an `idle` cost hint stating the billed floor in GB-hours (not dollars). Same single `GetMetricData`
+  call. Tests in `tests/test_serverless_cost.py`.
+- `aws_security_audit` RBAC hygiene: non-default user with `+@all`, IAM-auth user on a cache without TLS in transit,
+  user in no group, group attached to no cache. Tests in `tests/test_security_rbac.py`.
+
+### Changed
+- `MAX_TOOLS_LIST_BYTES` raised from 51_200 to 52_300 in `tests/test_tool_surface.py`: the 62nd tool adds its schema
+  and description to `tools/list` (measured 52_253 before trimming the docstring).
+- `MEMORY STATS` was already on the SafeRedis allowlist; the audited fake now answers it with a dict.
+- Round 25 work and round 26 work share one working tree and are not committed yet.
+
+Integration: `scripts/integration.sh` ran with 5.2G free on `/c` (full mode): 1931 passed, 7 skipped. Own `prova-elasticache-*` containers removed; dangling volumes, untagged images and old build cache pruned (`fstrim` not available in the WSL distro).
+
+## Round 25 additions to 0.3.0
+
+Round 25. 61 tools (no new tool; existing tools gain findings).
+
+### Added
+- Data tiering (r6gd): `DatabaseCapacityUsagePercentage` is read for tiered groups in `aws_metrics`, `aws_triage` and
+  `aws_capacity_forecast`. Memory percentage understates fullness there (memory plus SSD); critical above 90, warning
+  above 80, plus a warning when memory max is under 50. Forecast falls back to memory when no capacity data exists.
+  Tests in `tests/test_data_tiering.py`.
+- `aws_alarms` quality audit (`controlplane/alarm_quality.py`): no actions, missing-data not breaching, threshold that
+  never fires, slow evaluation, host CPU instead of EngineCPU, wrong or missing dimension. Tests in
+  `tests/test_alarm_quality.py`.
+- `aws_shard_balance`: `replica-lag-outlier` finding from `ReplicationLag` (ratio 3x median and at least 1 s, at most 3
+  reported). Tests in `tests/test_shard_outliers.py`.
+- `aws_maintenance`: transport hygiene findings (TLS off, auth token age). No CA rule: the botocore model has no
+  certificate field. Tests in `tests/test_tls_hygiene.py`.
+
+### Changed
+- Tree hygiene: stale `__pycache__` removed locally (none tracked); tool-count consistency pinned by
+  `tests/test_surface_pin.py`.
+
 ## Round 24 additions to 0.3.0
 
 Round 24. 61 tools.

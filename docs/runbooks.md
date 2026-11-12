@@ -30,7 +30,9 @@ Conclude: sustained or spike, one node or all, top slow command, next step.
 2. `aws_capacity_forecast` for days until full across the fleet, soonest first.
 3. `aws_metrics` with DatabaseMemoryUsagePercentage, BytesUsedForCache, Evictions, CurrItems, CacheHitRate for 1440
    minutes. Evictions with a falling CacheHitRate hurt users now; high memory without evictions means noeviction.
-4. `node_memory` for fragmentation, maxmemory and policy; `node_cluster_memory` to compare shards.
+4. `node_memory` for fragmentation, maxmemory and policy; `node_cluster_memory` to compare shards. When allocator
+   fragmentation, the hashtable or client and replication buffers take a large share of used memory, `node_memory` and
+   `node_doctor` (and so `node_triage` and `node_cluster_triage`) carry one `memory-breakdown` line naming them.
 5. `node_keyspace_sample` (or `node_cluster_keyspace_sample`) for big keys and missing TTLs. Add `include_sizes` to
    list key prefixes whose lists, sets, hashes or streams exceed a threshold (unbounded-growth candidates; prefixes only).
 6. `aws_parameters` to confirm maxmemory-policy and reserved-memory-percent; `aws_parameter_groups` flags risky settings across all in-use custom groups.
@@ -77,7 +79,8 @@ Conclude: responsible client, churn or leak, distance to maxclients, fix (pool, 
 3. `aws_scale_readiness` when the window includes a node-type change: its node-type-change risk and reasons
    (Multi-AZ off, replica lag, pending modification, burstable credits).
 4. `aws_maintenance` for updates past their apply-by date that will force a failover on their own.
-5. `aws_snapshots` or `aws_serverless_snapshots` for the raw snapshot list behind the findings.
+5. `aws_snapshots` or `aws_serverless_snapshots` for the raw snapshot list behind the findings; `aws_backup_audit`
+   for the same questions across the whole fleet (retention off, stale or failed latest, old manual snapshots, orphans).
 6. `aws_alarms` to confirm replication lag and memory alarms exist before the window.
 7. `aws_upgrade_plan` when the change is an engine upgrade (Redis OSS to a newer Redis, or to Valkey): one read-only call
    that returns `go` or `no-go` with the blockers first. It folds in steps 1 and 2 as gates and adds the version path,
@@ -96,6 +99,8 @@ Conclude: recovery risk, newest restorable snapshot and its age, and the gaps to
    place first.
 4. `aws_metrics` with DatabaseMemoryUsagePercentage and EngineCPUUtilization over the same 7 days for the shape
    behind the projection.
+
+On data-tiered groups (r6gd) read DatabaseCapacityUsagePercentage, not memory percentage: it covers memory plus SSD.
 
 Conclude: safe or not to scale in, whether to scale out, the risk of the node-type change and what to fix first.
 
