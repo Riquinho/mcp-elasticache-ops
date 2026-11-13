@@ -121,8 +121,10 @@ def _tls_context(cfg: DataPlaneConfig, verify: bool) -> ssl.SSLContext:
     if verify and cfg.tls_verify:
         ctx = ssl.create_default_context(cafile=cfg.tls_ca_file)
         ctx.check_hostname = cfg.tls_check_hostname
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         return ctx
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     return ctx
